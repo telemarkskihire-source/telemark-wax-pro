@@ -225,15 +225,29 @@ def clear_sky_SW(lat, doy, hour_local):
     return SW_clear
 
 def downwelling_SW(lat, times, cloud, sunup):
-    # Ineichen-like very light reduction: SW_down ≈ SW_clear * (1 - 0.75*cloud^3)
+    # Convert to pandas datetime
     t = pd.to_datetime(times)
-    doy  = t.dayofyear.values
+
+    # Estraggo *correttamente* DOY e ora locale come array numpy
+    doy  = t.dt.dayofyear.values.astype(float)
     hour = t.dt.hour.values.astype(float)
-    SWc = clear_sky_SW(lat, doy, hour)
+
+    # Clear-sky approx base
+    latr = np.radians(lat)
+    decl = 23.44*np.pi/180*np.sin(2*np.pi*(284 + doy)/365.0)
+    h = (hour-12.0) * np.pi/12.0
+    mu = np.sin(latr)*np.sin(decl) + np.cos(latr)*np.cos(decl)*np.cos(h)
+    mu = np.clip(mu, 0.0, 1.0)
+    SW_clear = 950.0 * mu   # W/m2 approx midday clear sky
+
+    # Nuvolosità (cloud è già 0..1)
     cloud = np.clip(np.asarray(cloud, float), 0.0, 1.0)
-    SW = SWc * (1.0 - 0.75*(cloud**3))
-    SW *= (np.asarray(sunup, int) > 0)  # zero at night
-    return SW  # W/m2
+    SW = SW_clear * (1.0 - 0.75*(cloud**3))
+
+    # Applica day/night (sunup == 1 → giorno)
+    SW *= (np.asarray(sunup, int) > 0)
+
+    return SW
 
 def snow_age_hours(snowfall, times):
     # hours since last snowfall (>0) – robust & vectorized with a small loop (fast enough for <=168 rows)
