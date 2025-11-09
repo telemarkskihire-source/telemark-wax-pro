@@ -3,79 +3,42 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import requests, base64, math, datetime as dt
-import matplotlib.pyplot as plt
+from datetime import time, date
 from dateutil import tz
 from streamlit_searchbox import st_searchbox
+import matplotlib.pyplot as plt
 
-# =============== PAGE THEME (dark, colori vivi) ===============
-PRIMARY = "#10bfcf"   # turchese Telemark
-ACCENT  = "#22d3ee"   # azzurro vivo
-WARN    = "#f59e0b"   # giallo
-DANGER  = "#ef4444"   # rosso
-OK      = "#22c55e"   # verde
-BG      = "#0b1220"   # sfondo scuro
-CARD    = "#0f172a"   # card dark
-TEXT    = "#e5e7eb"   # testo chiaro
-
+# ------------------------ THEME (dark) ------------------------
+PRIMARY = "#10bfcf"; BG = "#0b1020"; CARD = "#0f172a"; TEXT = "#eaf2ff"
 st.set_page_config(page_title="Telemark · Pro Wax & Tune", page_icon="❄️", layout="wide")
 st.markdown(f"""
 <style>
-:root {{
-  --primary:{PRIMARY};
-  --accent:{ACCENT};
-  --bg:{BG};
-  --card:{CARD};
-  --text:{TEXT};
-}}
+:root {{ --primary:{PRIMARY}; --text:{TEXT}; --card:{CARD}; }}
 [data-testid="stAppViewContainer"] > .main {{
-  background: linear-gradient(180deg, {BG} 0%, #0a0f1a 100%);
+  background: radial-gradient(1200px 600px at 20% -10%, #0d1b2a 0%, {BG} 45%, #0a0f1c 100%);
 }}
-.block-container {{ padding-top: 0.6rem; padding-bottom: 2rem; }}
-
-h1,h2,h3,h4,h5, label, p, span, div {{ color:{TEXT}; }}
-hr {{ border:none; border-top:1px solid rgba(255,255,255,.08); }}
-
-.card {{
-  background:{CARD};
-  border:1px solid rgba(255,255,255,.10);
-  border-radius:16px;
-  padding:14px 16px;
-  box-shadow:0 10px 22px rgba(0,0,0,.35);
-}}
-.brand {{
-  display:flex; align-items:center; gap:.75rem;
-  background:rgba(255,255,255,.03);
-  border:1px solid rgba(255,255,255,.10);
-  border-radius:12px; padding:.5rem .75rem;
-}}
-.badge {{
-  display:inline-block; background:rgba(16,191,207,.15); color:{ACCENT};
-  border:1px solid rgba(16,191,207,.45);
-  padding:.25rem .6rem; border-radius:999px; font-size:.78rem
-}}
-.banner {{
-  background:rgba(255,255,255,.04);
-  border:1px solid rgba(255,255,255,.10);
-  border-radius:12px; padding:.6rem .8rem; margin:.4rem 0 .2rem 0;
-}}
-.kpi {{
-  display:flex; gap:10px; align-items:center;
-  background:rgba(16,191,207,.10);
-  border:1px dashed rgba(16,191,207,.45);
-  padding:.45rem .65rem; border-radius:12px; font-size:.9rem;
-}}
-.kpi .lab {{ color:#93c5fd; opacity:.9; }}
-.kpi .val {{ font-weight:800; }}
-
-.dataframe tbody tr:hover {{
-  background-color: rgba(255,255,255,.04) !important;
-}}
+.block-container {{ padding-top: 0.6rem; }}
+* {{ color:{TEXT}; }}
+h1,h2,h3,h4,h5,label {{ color:{TEXT}; }}
+.card {{ background:{CARD}; border:1px solid rgba(255,255,255,.1); border-radius:16px; padding:14px; box-shadow:0 8px 24px rgba(0,0,0,.35); }}
+.brand {{ display:flex; align-items:center; gap:.6rem; padding:.6rem .75rem; background:rgba(255,255,255,.04);
+         border:1px solid rgba(255,255,255,.08); border-radius:12px; }}
+.brand img {{ height:22px; }}
+.badge {{ display:inline-block; padding:.25rem .6rem; border-radius:999px; background:rgba(16,191,207,.18); border:1px solid rgba(16,191,207,.45);
+         font-size:.78rem }}
+.kpi {{ display:flex; gap:.6rem; align-items:center; background:rgba(16,191,207,.06); border:1px dashed rgba(16,191,207,.45);
+       padding:.5rem .7rem; border-radius:12px; }}
+.kpi .lab {{ font-size:.78rem; opacity:.8 }}
+.kpi .val {{ font-weight:800 }}
+.hr {{ height:1px; background:linear-gradient(90deg, transparent, rgba(255,255,255,.2), transparent); margin:.8rem 0; }}
+.cond {{ background:rgba(255,255,255,.04); border:1px solid rgba(255,255,255,.12); border-radius:12px; padding:.6rem .8rem; }}
+.small {{ opacity:.8; font-size:.86rem }}
 </style>
 """, unsafe_allow_html=True)
 
 st.markdown("## Telemark · Pro Wax & Tune")
 
-# =============== UTILS ===============
+# ------------------------ UTILS ------------------------
 def flag_emoji(country_code: str) -> str:
     try:
         cc = country_code.upper()
@@ -83,18 +46,22 @@ def flag_emoji(country_code: str) -> str:
     except Exception:
         return "🏳️"
 
-def concise_label_from_address(addr:dict, display:str)->str:
-    name = (addr.get("neighbourhood") or addr.get("hamlet") or addr.get("village")
-            or addr.get("town") or addr.get("city") or display.split(",")[0])
+# concise place label + country code
+def concise_label(addr:dict, fallback:str)->str:
+    name = (addr.get("neighbourhood") or addr.get("hamlet") or addr.get("village") or
+            addr.get("town") or addr.get("city") or addr.get("municipality") or "")
     admin1 = addr.get("state") or addr.get("region") or addr.get("county") or ""
+    if not name:  # fallback from display_name first comma piece
+        name = (fallback.split(",")[0] if fallback else "")
     cc = (addr.get("country_code") or "").upper()
     parts = [p for p in [name, admin1] if p]
-    short = ", ".join(parts)
-    if cc: short = f"{short} — {cc}"
+    short = ", ".join(parts) if parts else (fallback.split(",")[0] if fallback else "Località")
+    if cc: short += f" — {cc}"
     return short
 
 def nominatim_search(q:str):
-    if not q or len(q)<2: return []
+    if not q or len(q)<2: 
+        return []
     try:
         r = requests.get(
             "https://nominatim.openstreetmap.org/search",
@@ -107,12 +74,11 @@ def nominatim_search(q:str):
         out = []
         for item in r.json():
             addr = item.get("address",{}) or {}
-            label_short = concise_label_from_address(addr, item.get("display_name",""))
+            label_short = concise_label(addr, item.get("display_name",""))
             cc = addr.get("country_code","")
-            label = f"{flag_emoji(cc)}  {label_short}"
             lat = float(item.get("lat",0)); lon = float(item.get("lon",0))
-            key = f"{label}|||{lat:.6f},{lon:.6f}"
-            st.session_state._options[key] = {"lat":lat,"lon":lon,"label":label,"addr":addr}
+            key = f"{flag_emoji(cc)} {label_short}|||{lat:.6f},{lon:.6f}"
+            st.session_state._options[key] = {"lat":lat,"lon":lon,"addr":addr,"label":f"{flag_emoji(cc)} {label_short}"}
             out.append(key)
         return out
     except:
@@ -130,11 +96,54 @@ def get_elevation(lat:float, lon:float):
         pass
     return None
 
+# ------------------------ INPUTS: PLACE + DATE + WINDOWS ------------------------
+st.markdown("#### 1) Località & giorno")
+colp, cold = st.columns([2,1])
+with colp:
+    selected = st_searchbox(
+        nominatim_search,
+        key="place",
+        placeholder="Digita e scegli… (Champoluc, Plateau Rosa, Sestriere, Zermatt…) — suggerimenti live",
+        clear_on_submit=False,
+        default=None
+    )
+with cold:
+    day = st.date_input("Giorno previsioni", value=date.today(), min_value=date.today()-dt.timedelta(days=0),
+                        max_value=date.today()+dt.timedelta(days=6))
+
+if selected and "|||" in selected and "_options" in st.session_state:
+    info = st.session_state._options.get(selected)
+    if info:
+        st.session_state["sel_lat"] = info["lat"]
+        st.session_state["sel_lon"] = info["lon"]
+        st.session_state["sel_label"] = info["label"]
+lat = st.session_state.get("sel_lat", 45.831)
+lon = st.session_state.get("sel_lon", 7.730)
+place_label = st.session_state.get("sel_label","🇮🇹 Champoluc — IT")
+elev = get_elevation(lat, lon)
+alt_txt = f" · Altitudine **{int(elev)} m**" if elev is not None else ""
+st.markdown(f"<div class='kpi'><div class='lab'>Località</div><div class='val'>{place_label}</div><div class='lab'>{alt_txt}</div></div>", unsafe_allow_html=True)
+
+st.markdown("#### 2) Finestre orarie A · B · C (per il giorno selezionato)")
+c1,c2,c3 = st.columns(3)
+with c1:
+    A_start = st.time_input("Inizio A", time(9,0), key="A_s")
+    A_end   = st.time_input("Fine A",   time(11,0), key="A_e")
+with c2:
+    B_start = st.time_input("Inizio B", time(11,0), key="B_s")
+    B_end   = st.time_input("Fine B",   time(13,0), key="B_e")
+with c3:
+    C_start = st.time_input("Inizio C", time(13,0), key="C_s")
+    C_end   = st.time_input("Fine C",   time(16,0), key="C_e")
+
+hours = st.slider("Ore previsione (orizzonte)", 12, 168, 72, 12)
+
+# ------------------------ DATA PIPELINE ------------------------
 def fetch_open_meteo(lat, lon, timezone_str):
     url = "https://api.open-meteo.com/v1/forecast"
     params = {
         "latitude": lat, "longitude": lon, "timezone": timezone_str,
-        "hourly": "temperature_2m,dew_point_2m,precipitation,rain,snowfall,cloudcover,relative_humidity_2m,windspeed_10m,is_day,weathercode",
+        "hourly": "temperature_2m,dew_point_2m,relative_humidity_2m,precipitation,rain,snowfall,cloudcover,windspeed_10m,is_day,weathercode",
         "forecast_days": 7,
     }
     r = requests.get(url, params=params, timeout=30); r.raise_for_status()
@@ -157,85 +166,148 @@ def _prp_type(df):
 
 def build_df(js, hours):
     h = js["hourly"]; df = pd.DataFrame(h)
-    df["time"] = pd.to_datetime(df["time"])
+    df["time"] = pd.to_datetime(df["time"])  # naive local time (per timezone param)
     now0 = pd.Timestamp.now().floor("H")
+    # prendiamo dal “now” in poi, ma mostreremo solo il giorno scelto per i blocchi
     df = df[df["time"] >= now0].head(hours).reset_index(drop=True)
 
     out = pd.DataFrame()
-    out["time"]  = df["time"]
-    out["T2m"]   = df["temperature_2m"].astype(float)
-    out["td"]    = df["dew_point_2m"].astype(float)
-    # se l'API non restituisce RH usiamo formula da T e Td
-    if "relative_humidity_2m" in df.columns:
-        out["rh"] = df["relative_humidity_2m"].astype(float)
+    out["time"] = df["time"].dt.strftime("%Y-%m-%dT%H:%M:%S")
+    out["T2m"] = df["temperature_2m"].astype(float)
+    out["td"]  = df["dew_point_2m"].astype(float)
+    # relative humidity might be named 'relative_humidity_2m' or 'relativehumidity_2m' depending on API
+    rh_name = "relative_humidity_2m" if "relative_humidity_2m" in df.columns else "relativehumidity_2m"
+    if rh_name in df.columns:
+        out["RH"] = df[rh_name].astype(float)
     else:
-        # Magnus-Tetens
-        def rh_from_t_td(T, Td):
-            a,b = 17.625, 243.04
-            es = 6.1094*np.exp(a*T/(b+T))
-            e  = 6.1094*np.exp(a*Td/(b+Td))
-            return np.clip(100*e/es, 1, 100)
-        out["rh"] = rh_from_t_td(out["T2m"], out["td"])
+        # fallback approximate RH from T and Td
+        # RH ~ 100 * exp((17.625*Td/(243.04+Td)) - (17.625*T/(243.04+T)))
+        T = out["T2m"].clip(-40, 40); Td = out["td"].clip(-40, 40)
+        out["RH"] = 100*np.exp((17.625*Td/(243.04+Td)) - (17.625*T/(243.04+T)))
+
     out["cloud"] = (df["cloudcover"].astype(float)/100).clip(0,1)
-    out["wind"]  = (df["windspeed_10m"].astype(float)/3.6).round(3)  # m/s
+    out["wind"]  = (df["windspeed_10m"].astype(float)/3.6).clip(lower=0)  # m/s
     out["sunup"] = df["is_day"].astype(int)
     out["prp_mmph"] = df["precipitation"].astype(float)
     extra = df[["precipitation","rain","snowfall","weathercode"]].copy()
     out["prp_type"] = _prp_type(extra)
-    out["snowfall"] = extra["snowfall"].astype(float)
-    out["rain"]     = extra["rain"].astype(float)
+    out["snowfall"] = df["snowfall"].astype(float)
+    out["rain"]     = df["rain"].astype(float)
     return out
 
-# neve superficiale più realistica (evita 0 fisso)
+# --- Better snow surface/top few mm temperature heuristic ---
 def compute_snow_temperature(df, dt_hours=1.0):
     df = df.copy()
-    rain = df["prp_type"].str.lower().isin(["rain","mixed"])
-    snow = df["prp_type"].str.lower().eq("snow")
-    sunup = df["sunup"].astype(int) == 1
+    df["time"] = pd.to_datetime(df["time"])
+    T = df["T2m"].astype(float)
+    Td = df["td"].astype(float)
+    RH = df["RH"].clip(0,100)
+    cloud = df["cloud"]; wind = df["wind"]; sunup = df["sunup"].astype(int)==1
+    prp = df["prp_mmph"]; snow = df["snowfall"]; rain = df["rain"]
+    ptype = df["prp_type"].str.lower()
 
-    # quota "bagnato": funzione morbida di T>0, pioggia e RH
-    warm = (df["T2m"] > 0).astype(float)
-    wet_intensity = (df["rain"].fillna(0) + 0.5*df["prp_mmph"]).clip(0, 3)/3.0
-    rh_factor = (df["rh"].clip(60,100)-60)/40.0
-    wet_frac = np.clip(0.4*warm + 0.5*wet_intensity + 0.2*rh_factor + 0.2*(snow & df["T2m"].ge(-1)).astype(float), 0, 1)
+    # radiative-cooling factor (more when clear/dry/light wind/night)
+    rad_cool = (1.2 + 2.8*(1-cloud) + 0.6*(1 - RH/100)).clip(0.5, 4.6)
+    wind_term = (0.25*wind).clip(0, 1.8)
 
-    # radiazione/vento: raffredda la superficie a secco
-    clear = (1.0 - df["cloud"]).clip(0,1)
-    windc = df["wind"].clip(upper=6.0)
-    drad = (1.2 + 3.0*clear - 0.25*windc).clip(0.4, 4.0)
+    # baseline target surface temperature without phase-change effects
+    T_target = T - rad_cool + (sunup.astype(float))*0.7*cloud  # sun raises it modestly if cloudy low
 
-    # T_surf: mix tra 0°C (bagnato) e T2m - drad (secco)
-    T_dry = df["T2m"] - drad
-    T_wet = np.clip( -0.5 + 0.5*(1-wet_frac), -0.5, 0.0)   # tra -0.5 e 0.0
-    T_surf = (wet_frac*T_wet) + ((1-wet_frac)*T_dry)
-    # se molto freddo e soleggiato diurno, attenua l'eccesso di raffreddamento
-    sunny_cold = sunup & (df["T2m"].between(-12, -2))
-    T_surf[sunny_cold] = np.maximum(T_surf[sunny_cold], df["T2m"][sunny_cold] - 2.0)
+    # precipitation phase effects: push toward 0°C when liquid or near-melting snow
+    wet_mask = (rain>0.05) | ((snow>0) & (T>-2) & (Td>-4))
+    T_target = np.where(wet_mask, np.minimum(T_target, 0.0 + 0.2*(rain>0)), T_target)
 
-    # strato 0-5 mm con inerzia
-    T_top5 = pd.Series(index=df.index, dtype=float)
-    tau = pd.Series(6.0, index=df.index, dtype=float)  # ore
-    tau.loc[rain | snow | (df["wind"]>=6)] = 3.0
-    tau.loc[(~sunup) & (df["wind"]<2) & (df["cloud"]<0.3)] = 8.0
-    alpha = 1.0 - np.exp(-dt_hours / tau)
-    if len(df)>0:
-        T_top5.iloc[0] = min(df["T2m"].iloc[0], 0.0)  # base iniziale
-        for i in range(1, len(df)):
-            T_top5.iloc[i] = T_top5.iloc[i-1] + alpha.iloc[i]*(T_surf.iloc[i] - T_top5.iloc[i-1])
+    # relaxation to target with timescale depending on wind/precip/cloud
+    tau = np.full(len(df), 6.0)  # hours
+    tau = np.where((rain>0.05) | (snow>0.1) | (wind>6), 2.5, tau)
+    tau = np.where((~sunup) & (wind<2) & (cloud<0.3), 8.0, tau)
+    alpha = 1.0 - np.exp(-dt_hours / np.maximum(tau, 0.5))
+
+    # evolve surface (skin) and top-5mm (a little inertia)
+    T_surf = np.zeros(len(df)); T_top5 = np.zeros(len(df))
+    T_surf[0] = min(T.iloc[0], 0.0) if wet_mask.iloc[0] else T_target.iloc[0]
+    T_top5[0] = 0.6*T_surf[0] + 0.4*min(T.iloc[0], 0.0)
+
+    for i in range(1, len(df)):
+        T_surf[i] = T_surf[i-1] + alpha[i]*(T_target.iloc[i] - T_surf[i-1])
+        # if actively wet, clamp toward 0 but not fixed at 0
+        if wet_mask.iloc[i]:
+            T_surf[i] = min(T_surf[i], 0.0 + 0.1*(rain.iloc[i]>0))
+        # top 5 mm follows slower
+        alpha5 = min(0.6*alpha[i], 0.35)
+        T_top5[i] = T_top5[i-1] + alpha5*(T_surf[i] - T_top5[i-1])
 
     out = df.copy()
     out["T_surf"] = T_surf
     out["T_top5"] = T_top5
-    out["wet_frac"] = wet_frac
     return out
 
-def window_slice_by_date(res, tzname, day_date, s, e):
-    t = res["time"].dt.tz_localize(tz.gettz(tzname), nonexistent='shift_forward', ambiguous='NaT')
+def window_slice(res, tzname, day_sel: date, s, e):
+    t = pd.to_datetime(res["time"]).dt.tz_localize(tz.gettz(tzname), nonexistent='shift_forward', ambiguous='NaT')
     D = res.copy(); D["dt"] = t
-    W = D[(D["dt"].dt.date==day_date) & (D["dt"].dt.time>=s) & (D["dt"].dt.time<=e)]
-    return W
+    W = D[(D["dt"].dt.date==day_sel) & (D["dt"].dt.time>=s) & (D["dt"].dt.time<=e)]
+    return W if not W.empty else D[(D["dt"].dt.date==day_sel)].head(7)
 
-# =============== WAX BANDS & STRUTTURE (nomi) ===============
+# ------------------------ CLASSIFIERS ------------------------
+def snow_condition_row(row):
+    t = row["T_surf"]; rh = row["RH"]; prp = row["prp_mmph"]; snow = row["snowfall"]; rain = row["rain"]; cloud = row["cloud"]
+    # very simple but readable taxonomy
+    if snow > 0.2 and t < -1.0:
+        return "Neve nuova fredda"
+    if snow > 0.2 and t >= -1.0 and t <= 0.3:
+        return "Neve nuova umida"
+    if prp > 0.3 and rain > 0:
+        return "Bagnata / pioggia"
+    if t <= -7:
+        return "Molto fredda e secca"
+    if -7 < t <= -3:
+        return "Fredda e asciutta"
+    if -3 < t < -0.3:
+        return "Compatta / trasformata"
+    if -0.3 <= t <= 0.2:
+        return "Umida prossima a 0°"
+    if t > 0.2:
+        return "Molle / primaverile"
+    return "Variabile"
+
+def reliability_score(df_slice, horizon_hours):
+    # più affidabile: poco prp, poco vento, vicino nel tempo
+    if df_slice.empty: return 40
+    var_t = float(df_slice["T2m"].std() or 0)
+    var_p = float(df_slice["prp_mmph"].std() or 0)
+    wind_m = float(df_slice["wind"].mean() or 0)
+    prp_m = float(df_slice["prp_mmph"].mean() or 0)
+    base = 85
+    base -= min(var_t*6, 20)
+    base -= min(var_p*8, 20)
+    base -= min(wind_m*2.5, 15)
+    base -= min(max(horizon_hours-24,0)/2.0, 15)
+    base -= 10 if prp_m>0.5 else 0
+    return int(np.clip(base, 35, 95))
+
+def glide_index(df_slice):
+    # 0–100 (più alto = più scorrevole)
+    # euristica: migliore tra -9° e -1.5°, non bagnato, poco prp; penalizza vento alto, RH altissima con T>0
+    if df_slice.empty: return 50
+    t = float(df_slice["T_surf"].mean())
+    prp = float(df_slice["prp_mmph"].mean())
+    wind = float(df_slice["wind"].mean())
+    rh = float(df_slice["RH"].mean())
+
+    # temperature bell-shaped
+    peak = -4.5
+    width = 5.0
+    temp_score = 100*np.exp(-((t-peak)**2)/(2*width**2))
+    temp_score = np.clip(temp_score, 25, 100)
+
+    prp_pen = np.clip(prp*18, 0, 25)
+    wind_pen = np.clip((wind-4)*4, 0, 18)
+    wet_pen = 18 if (t>-0.2 and rh>92 and prp>0.1) else 0
+
+    score = temp_score - prp_pen - wind_pen - wet_pen
+    return int(np.clip(score, 5, 98))
+
+# ------------------------ WAX BANDS (8 brands) ------------------------
 SWIX = [("PS5 Turquoise", -18,-10), ("PS6 Blue",-12,-6), ("PS7 Violet",-8,-2), ("PS8 Red",-4,4), ("PS10 Yellow",0,10)]
 TOKO = [("Blue",-30,-9), ("Red",-12,-4), ("Yellow",-6,0)]
 VOLA = [("MX-E Blue",-25,-10), ("MX-E Violet",-12,-4), ("MX-E Red",-5,0), ("MX-E Yellow",-2,6)]
@@ -244,211 +316,121 @@ HOLM = [("UltraMix Blue",-20,-8), ("BetaMix Red",-14,-4), ("AlphaMix Yellow",-4,
 MAPL = [("Univ Cold",-12,-6), ("Univ Medium",-7,-2), ("Univ Soft",-5,0)]
 START= [("SG Blue",-12,-6), ("SG Purple",-8,-2), ("SG Red",-3,7)]
 SKIGO= [("Blue",-12,-6), ("Violet",-8,-2), ("Red",-3,2)]
-
-BRANDS = [
-    ("Swix", SWIX), ("Toko", TOKO), ("Vola", VOLA), ("Rode", RODE),
-    ("Holmenkol", HOLM), ("Maplus", MAPL), ("Start", START), ("Skigo", SKIGO),
+BRAND_BANDS = [
+    ("Swix"      ,"#ef4444", SWIX),
+    ("Toko"      ,"#f59e0b", TOKO),
+    ("Vola"      ,"#3b82f6", VOLA),
+    ("Rode"      ,"#22c55e", RODE),
+    ("Holmenkol" ,"#06b6d4", HOLM),
+    ("Maplus"    ,"#f97316", MAPL),
+    ("Start"     ,"#eab308", START),
+    ("Skigo"     ,"#a855f7", SKIGO),
 ]
-
 def pick(bands, t):
     for n,tmin,tmax in bands:
         if t>=tmin and t<=tmax: return n
     return bands[-1][0] if t>bands[-1][2] else bands[0][0]
 
-def structure_name_for(Tsurf):
-    # nomi fissi (niente immagini)
-    if Tsurf <= -10:
-        return "Linear Fine (freddo/secco)"
-    elif Tsurf <= -3:
-        return "Cross Hatch / Wave leggera (universale)"
+# ------------------------ STRUCTURE & EDGES (names only) ------------------------
+# Manteniamo i nomi chiesti: Linear Fine (S1) · Thumb Print (S2) · Wave (S2) · Cross Hatch (S1)
+def structure_for(t_surf):
+    if t_surf <= -10:   return "Linear Fine (S1)"
+    if t_surf <= -3:    return "Cross Hatch (S1) / Wave (S2) leggera"
+    if t_surf <= -0.5:  return "Wave (S2) / Thumb Print (S2) moderata"
+    if t_surf <= 0.5:   return "Thumb Print (S2)"
+    return "Thumb Print (S2) / Wave (S2) marcata"
+
+def edges_for(t_surf, discipline):
+    # SIDE angles requested: show 88.5/88/87.5/87 depending on discipline & temp
+    if t_surf <= -10:
+        base = 0.5; sides = {"SL":88.5,"GS":88.0,"SG":87.5,"DH":87.5}
+    elif t_surf <= -3:
+        base = 0.7; sides = {"SL":88.0,"GS":88.0,"SG":87.5,"DH":87.0}
     else:
-        return "Diagonal / V (umido/caldo)"
+        base = 0.8 if t_surf<=0.5 else 1.0
+        sides = {"SL":88.0,"GS":87.5,"SG":87.0,"DH":87.0}
+    return sides.get(discipline,88.0), base
 
-def angles_for(Tsurf, discipline):
-    # Angolo SIDE (espresso direttamente in °) e BASE
-    if Tsurf <= -10:
-        base = 0.5; side_map = {"SL":88.5, "GS":88.0, "SG":87.5, "DH":87.5}
-    elif Tsurf <= -3:
-        base = 0.7; side_map = {"SL":88.0, "GS":88.0, "SG":87.5, "DH":87.0}
-    else:
-        base = 0.8 if Tsurf <= 0.5 else 1.0
-        side_map = {"SL":88.0, "GS":87.5, "SG":87.0, "DH":87.0}
-    return side_map.get(discipline, 88.0), base
-
-# =============== CONDIZIONI + AFFIDABILITÀ + INDICE SCORREVOLEZZA ===============
-def classify_conditions(W: pd.DataFrame):
-    if W.empty:
-        return "Dati insufficienti", 0.35, 40
-    t = W["T_surf"].mean()
-    prp = W["prp_mmph"].mean()
-    typ = W["prp_type"].mode().iat[0] if not W["prp_type"].mode().empty else "none"
-    rh  = W["rh"].mean()
-    wind= W["wind"].mean()
-    snowf = W["snowfall"].sum()
-
-    # descrizione
-    if typ in ("rain","mixed") or t>-0.3:
-        desc = "Neve bagnata/calda"
-    elif snowf>0.6 and t<0:
-        desc = "Neve nuova"
-    elif t<=-8:
-        desc = "Neve molto fredda/secca"
-    elif (prp<0.2) and (rh<70) and (-6<=t<=-2):
-        desc = "Neve compatta/trasformata"
-    else:
-        desc = "Neve variabile"
-
-    # affidabilità (0-1): più alta se bassa nuvolosità/precipitazione e coerenza segnali
-    cloud = W["cloud"].mean()
-    wet_var = W["wet_frac"].std() if "wet_frac" in W else 0.15
-    base_rel = 0.85 - 0.35*cloud - 0.25*np.tanh(prp)
-    base_rel -= 0.15*min(1,wet_var*3)
-    base_rel = float(np.clip(base_rel, 0.2, 0.95))
-
-    # indice di scorrevolezza (0-100): meglio con T_surf tra -8 e -2, bassa prp, vento moderato
-    score = 55.0
-    # temperatura “ideale”
-    temp_bonus = 20.0 * np.exp(-((t+5.0)**2)/(2*2.5**2))  # gauss centrato a -5°C
-    score += temp_bonus
-    # penalità precipitazione
-    score -= 18.0 * np.tanh(prp)
-    # vento troppo alto peggiora
-    score -= 8.0 * max(0.0, (wind-5)/5.0)
-    # umidità molto alta o t vicino a 0 peggiora
-    score -= 10.0 * max(0.0, (rh-90)/10.0)
-    score -= 8.0 * max(0.0, t+0.5)
-    score = int(np.clip(score, 5, 95))
-
-    return desc, base_rel, score
-
-# =============== UI: RICERCA LOCALITÀ + DATA ===============
-st.markdown("### 1) Località e giorno")
-
-selected = st_searchbox(
-    nominatim_search,
-    key="place",
-    placeholder="Scrivi e scegli… (es. Champoluc, Plateau Rosa, Cervinia)",
-    clear_on_submit=False,
-    default=None
-)
-
-lat = st.session_state.get("lat", 45.831)
-lon = st.session_state.get("lon", 7.730)
-place_label = st.session_state.get("place_label","🇮🇹  Champoluc, Valle d’Aosta — IT")
-
-if selected and "|||" in selected and "_options" in st.session_state:
-    info = st.session_state._options.get(selected)
-    if info:
-        lat, lon, place_label = info["lat"], info["lon"], info["label"]
-        st.session_state["lat"] = lat; st.session_state["lon"] = lon
-        st.session_state["place_label"] = place_label
-
-elev = get_elevation(lat, lon)
-alt_txt = f" · Altitudine **{int(elev)} m**" if elev is not None else ""
-st.markdown(f"<div class='kpi'><span class='lab'>Località:</span> <span class='val'>{place_label}</span>{alt_txt}</div>", unsafe_allow_html=True)
-
-col_date, col_h = st.columns([1,1])
-with col_date:
-    day = st.date_input("Giorno", value=dt.date.today())
-with col_h:
-    hours = st.slider("Ore previsione", 12, 168, 72, 12)
-
-# =============== FINESTRE A/B/C ===============
-st.markdown("### 2) Finestre orarie (oggi o giorno selezionato)")
-c1,c2,c3 = st.columns(3)
-with c1:
-    A_start = st.time_input("Inizio A", dt.time(9,0), key="A_s")
-    A_end   = st.time_input("Fine A",   dt.time(11,0), key="A_e")
-with c2:
-    B_start = st.time_input("Inizio B", dt.time(11,0), key="B_s")
-    B_end   = st.time_input("Fine B",   dt.time(13,0), key="B_e")
-with c3:
-    C_start = st.time_input("Inizio C", dt.time(13,0), key="C_s")
-    C_end   = st.time_input("Fine C",   dt.time(16,0), key="C_e")
-
-# =============== RUN ===============
-st.markdown("### 3) Meteo & tuning")
-go = st.button("Scarica previsioni e calcola", type="primary")
+# ------------------------ RUN ------------------------
+st.markdown("#### 3) Dati meteo & calcolo")
+go = st.button("Scarica/aggiorna previsioni", type="primary")
 
 if go:
     try:
-        tzname = "Europe/Rome"
-        js = fetch_open_meteo(lat, lon, tzname)
+        js = fetch_open_meteo(lat, lon, "Europe/Rome")
         src = build_df(js, hours)
         res = compute_snow_temperature(src, dt_hours=1.0)
 
-        st.success(f"Dati per **{place_label}** caricati.")
-        # Tabella più chiara (campi essenziali, formattati)
-        df_show = res.copy()
-        df_show["Ora"] = df_show["time"].dt.tz_localize(tz.gettz(tzname)).dt.strftime("%d/%m %H:%M")
-        df_show = df_show[["Ora","T2m","td","rh","cloud","wind","prp_mmph","prp_type","T_surf","T_top5"]]
-        df_show = df_show.rename(columns={
-            "T2m":"T aria (°C)",
-            "td":"T rugiada (°C)",
-            "rh":"UR (%)",
-            "cloud":"Copertura",
-            "wind":"Vento (m/s)",
-            "prp_mmph":"Prec. (mm/h)",
-            "prp_type":"Tipo",
-            "T_surf":"T neve sup. (°C)",
-            "T_top5":"T top 5 mm (°C)"
+        # Vista tabellare pulita
+        show = res.copy()
+        show["time"] = pd.to_datetime(show["time"])
+        cols = ["time","T2m","td","RH","T_surf","T_top5","prp_mmph","snowfall","rain","cloud","wind","prp_type","sunup"]
+        show = show[cols]
+        show = show.rename(columns={
+            "time":"Ora locale","T2m":"T aria (°C)","td":"T rugiada (°C)","RH":"UR (%)",
+            "T_surf":"T superficie (°C)","T_top5":"T top 5mm (°C)","prp_mmph":"Prp (mm/h)",
+            "snowfall":"Neve (mm/h)","rain":"Pioggia (mm/h)","cloud":"Nuvolosità (0–1)","wind":"Vento 10m (m/s)",
+            "prp_type":"Tipo prp","sunup":"Giorno(1)/Notte(0)"
         })
-        st.dataframe(
-            df_show.style.format({
-                "T aria (°C)":"{:.1f}","T rugiada (°C)":"{:.1f}",
-                "UR (%)":"{:.0f}",
-                "Copertura":"{:.0%}",
-                "Vento (m/s)":"{:.1f}",
-                "Prec. (mm/h)":"{:.2f}",
-                "T neve sup. (°C)":"{:.1f}",
-                "T top 5 mm (°C)":"{:.1f}",
-            }),
-            use_container_width=True, height=360
-        )
+        st.markdown("<div class='card'>", unsafe_allow_html=True)
+        st.markdown("**Tabella previsioni (pulita)**")
+        st.dataframe(show, use_container_width=True, hide_index=True)
+        st.markdown("</div>", unsafe_allow_html=True)
 
-        # Grafici rapidi
-        t = res["time"]
-        fig1 = plt.figure(); plt.plot(t,res["T2m"],label="T aria"); plt.plot(t,res["T_surf"],label="T neve sup."); plt.plot(t,res["T_top5"],label="T top 5mm")
+        # Grafici essenziali
+        t = pd.to_datetime(res["time"])
+        fig1 = plt.figure(); plt.plot(t,res["T2m"],label="T aria"); plt.plot(t,res["T_surf"],label="T superficie"); plt.plot(t,res["T_top5"],label="T top 5mm")
         plt.legend(); plt.title("Temperature"); plt.xlabel("Ora"); plt.ylabel("°C"); st.pyplot(fig1)
         fig2 = plt.figure(); plt.bar(t,res["prp_mmph"]); plt.title("Precipitazione (mm/h)"); plt.xlabel("Ora"); plt.ylabel("mm/h"); st.pyplot(fig2)
-        st.download_button("Scarica CSV", data=res.to_csv(index=False), file_name="forecast_with_snowT.csv", mime="text/csv")
 
-        # Blocchi A/B/C per il giorno selezionato
-        for L,(s,e) in {"A":(A_start,A_end),"B":(B_start,B_end),"C":(C_start,C_end)}.items():
-            st.markdown(f"---\n### Blocco {L} — {day.strftime('%d/%m/%Y')}")
-            W = window_slice_by_date(res, tzname, day, s, e)
+        # Blocchi A/B/C con banner condizione + affidabilità + indice scorrevolezza
+        blocks = {"A":(A_start,A_end),"B":(B_start,B_end),"C":(C_start,C_end)}
+        for L,(s,e) in blocks.items():
+            st.markdown(f"### Blocco {L} — {day.strftime('%a %d %b')}")
+            W = window_slice(res, "Europe/Rome", day, s, e)
             if W.empty:
-                st.info("Nessun dato nella finestra selezionata per questo giorno.")
+                st.info("Nessun dato per la finestra scelta.")
                 continue
 
             t_med = float(W["T_surf"].mean())
-            desc, rel, glide = classify_conditions(W)
+            humidity = float(W["RH"].mean())
+            prp_m = float(W["prp_mmph"].mean())
+            cond = snow_condition_row(W.iloc[int(len(W)/2)])
+            rel = reliability_score(W, horizon_hours=(pd.to_datetime(W["time"]).max() - pd.Timestamp.now()).total_seconds()/3600.0)
+            glide = glide_index(W)
 
-            # Banner condizioni + KPI
-            st.markdown(f"<div class='banner'><b>Condizioni:</b> {desc} · <b>T neve media:</b> {t_med:.1f}°C</div>", unsafe_allow_html=True)
-            kc1, kc2 = st.columns(2)
-            with kc1:
-                st.markdown(f"<div class='kpi'><span class='lab'>Indice di scorrevolezza:</span> <span class='val' style='color:{OK if glide>=60 else (WARN if glide>=40 else DANGER)}'>{glide}/100</span></div>", unsafe_allow_html=True)
-            with kc2:
-                st.markdown(f"<div class='kpi'><span class='lab'>Affidabilità stima:</span> <span class='val'>{int(rel*100)}%</span></div>", unsafe_allow_html=True)
+            st.markdown(
+                f"<div class='cond'><b>Condizione:</b> {cond} · "
+                f"<b>T_surf medio:</b> {t_med:.1f}°C · <b>UR media:</b> {humidity:.0f}% · "
+                f"<b>Prp media:</b> {prp_m:.2f} mm/h · "
+                f"<b>Indice di scorrevolezza:</b> {glide}/100 · <b>Affidabilità:</b> {rel}%</div>",
+                unsafe_allow_html=True
+            )
 
-            # Scioline: 8 marchi
-            cols1 = st.columns(4); cols2 = st.columns(4)
-            for i,(name,bands) in enumerate(BRANDS[:4]):
+            # WAX (8 brands)
+            st.markdown("<div class='hr'></div>", unsafe_allow_html=True)
+            st.markdown("**Sciolina consigliata (per T_surf medio):**")
+            row1 = st.columns(4); row2 = st.columns(4)
+            for i,(brand,col,bands) in enumerate(BRAND_BANDS[:4]):
                 rec = pick(bands, t_med)
-                cols1[i].markdown(f"<div class='brand'><div style='font-weight:800;color:{ACCENT}'>{name}</div><div>{rec}</div></div>", unsafe_allow_html=True)
-            for i,(name,bands) in enumerate(BRANDS[4:]):
+                row1[i].markdown(f"<div class='brand'><div style='font-weight:800;color:{PRIMARY}'>{brand}</div><div>{rec}</div></div>", unsafe_allow_html=True)
+            for i,(brand,col,bands) in enumerate(BRAND_BANDS[4:]):
                 rec = pick(bands, t_med)
-                cols2[i].markdown(f"<div class='brand'><div style='font-weight:800;color:{ACCENT}'>{name}</div><div>{rec}</div></div>", unsafe_allow_html=True)
+                row2[i].markdown(f"<div class='brand'><div style='font-weight:800;color:{PRIMARY}'>{brand}</div><div>{rec}</div></div>", unsafe_allow_html=True)
 
-            # Struttura (solo nome) + Angoli per discipline
-            st.markdown(f"**Struttura consigliata (nome):** {structure_name_for(t_med)}")
-
+            # Struttura (names only) + Angoli per discipline
+            st.markdown("<div class='hr'></div>", unsafe_allow_html=True)
+            st.markdown(f"**Struttura consigliata:** {structure_for(t_med)}")
             rows=[]
             for d in ["SL","GS","SG","DH"]:
-                side, base = angles_for(t_med, d)
+                side, base = edges_for(t_med, d)
                 rows.append([d, f"{side:.1f}°", f"{base:.1f}°"])
-            st.table(pd.DataFrame(rows, columns=["Disciplina","Lamina SIDE (°)","Lamina BASE (°)"]))
+            df_edges = pd.DataFrame(rows, columns=["Disciplina","Lamina SIDE (°)","Lamina BASE (°)"])
+            st.dataframe(df_edges, use_container_width=True, hide_index=True)
+
+        # download CSV
+        st.download_button("Scarica CSV completo", data=res.to_csv(index=False),
+                           file_name="forecast_with_snowT.csv", mime="text/csv")
 
     except Exception as e:
         st.error(f"Errore: {e}")
