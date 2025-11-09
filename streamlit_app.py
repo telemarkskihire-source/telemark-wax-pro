@@ -96,6 +96,9 @@ with colNA:
     sel_country = st.selectbox("Nazione (prefiltro ricerca)", list(COUNTRIES.keys()), index=0)
     iso2 = COUNTRIES[sel_country]
 with colSB:
+    # --- NEW: tipo ricerca ---
+    search_mode = st.radio("Tipo ricerca", ["Località","Pista di sci"], horizontal=True)
+
     def nominatim_search(q:str):
         if not q or len(q)<2: return []
         try:
@@ -121,8 +124,46 @@ with colSB:
         except:
             return []
 
+    def overpass_search_slopes(q:str):
+        """Cerca piste di sci per nome (piste:name/name) filtrate per nazione, ritorna centro geometrico."""
+        if not q or len(q)<2: return []
+        try:
+            query = f"""
+            [out:json][timeout:12];
+            area["ISO3166-1"="{iso2}"]->.a;
+            (
+              way["piste:type"]["piste:name"~"{q}",i](area.a);
+              relation["piste:type"]["piste:name"~"{q}",i](area.a);
+              way["piste:type"]["name"~"{q}",i](area.a);
+              relation["piste:type"]["name"~"{q}",i](area.a);
+            );
+            out center 20;
+            """
+            r = requests.post("https://overpass-api.de/api/interpreter", data=query, timeout=15)
+            r.raise_for_status()
+            js = r.json()
+            st.session_state._options = {}
+            out=[]
+            for el in js.get("elements",[]):
+                tags = el.get("tags",{}) or {}
+                name = tags.get("piste:name") or tags.get("name")
+                if not name: continue
+                ptype = tags.get("piste:type","?")
+                diff  = tags.get("piste:difficulty","")
+                center = el.get("center") or {}
+                lat = center.get("lat"); lon = center.get("lon")
+                if lat is None or lon is None: continue
+                lab = f"🎿 {name} — {ptype}{(' · '+diff) if diff else ''} — {iso2}"
+                key = f"{lab}|||{lat:.6f},{lon:.6f}"
+                st.session_state._options[key] = {"lat":lat,"lon":lon,"label":lab,"addr":{}}
+                out.append(key)
+            return out
+        except:
+            return []
+
     selected = st_searchbox(
-        nominatim_search, key="place", placeholder="Cerca… es. Champoluc, Plateau Rosa",
+        overpass_search_slopes if search_mode=="Pista di sci" else nominatim_search,
+        key="place", placeholder="Cerca… es. 'Gran Pista', 'Champoluc, Plateau Rosa'",
         clear_on_submit=False, default=None
     )
 
@@ -615,7 +656,6 @@ if btn:
             st.markdown("**Scioline suggerite:**")
             ccols1 = st.columns(4); ccols2 = st.columns(4)
 
-            # prima riga di brand
             for i,(name,solid_bands,liquid_bands) in enumerate(BRANDS[:4]):
                 rec_solid  = pick_wax(solid_bands, t_med, rh_med)
                 topcoat = pick_liquid(liquid_bands, t_med, rh_med) if use_topcoat else "—"
@@ -629,7 +669,6 @@ if btn:
                     f"</div></div>", unsafe_allow_html=True
                 )
 
-            # seconda riga di brand
             for i,(name,solid_bands,liquid_bands) in enumerate(BRANDS[4:]):
                 rec_solid  = pick_wax(solid_bands, t_med, rh_med)
                 topcoat = pick_liquid(liquid_bands, t_med, rh_med) if use_topcoat else "—"
@@ -671,3 +710,4 @@ if btn:
 
     except Exception as e:
         st.error(f"Errore: {e}")
+```0
