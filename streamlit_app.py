@@ -1,4 +1,4 @@
-# telemark_pro_app.py
+¾# telemark_pro_app.py
 # Telemark · Pro Wax & Tune — dark, country-prefilter search, improved snow model + quick-wins, graphs, tuning tables
 
 import os, math, base64, requests, pandas as pd, numpy as np
@@ -710,4 +710,4 @@ if btn:
 
     except Exception as e:
         st.error(f"Errore: {e}")
-```0
+
