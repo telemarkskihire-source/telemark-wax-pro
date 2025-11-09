@@ -216,17 +216,104 @@ def prp_type_row(row):
 # ---------------------- NOAA (optional robust bias) ----------------------
 NOAA_TOKEN = st.secrets.get("NOAA_TOKEN", None)
 
+def _noaa_nearby_station(lat, lon, radius_m=25000, limit=3):
+    """Trova alcune stazioni GHCND vicine."""
+    r = requests.get(
+        "https://www.ncdc.noaa.gov/cdo-web/api/v2/stations",
+        params={"datasetid":"GHCND","limit":limit,"sortfield":"distance",
+                "latitude":lat,"longitude":lon,"radius":radius_m},
+        headers={"token": NOAA_TOKEN}, timeout=10
+    )
+    j = r.json()
+    return (j.get("results") or [])
+
+def _noaa_normals_dly(station_id):
+    """Scarica NORMAL_DLY per TAVG e PCT precipitazione (giornaliere)."""
+    # La API CDO in molti casi richiede un periodo; per le NORMAL_DLY il range annuale è ok (anno fittizio).
+    # Riduciamo il payload: solo datatype utili e limit alto.
+    params = {
+        "datasetid": "NORMAL_DLY",
+        "stationid": station_id,
+        "datatypeid": ["DLY-TAVG-NORMAL","DLY-PRCP-PCTALL-GE001HI"],
+        "startdate": "2010-01-01",
+        "enddate":   "2010-12-31",
+        "limit": 1000
+    }
+    r = requests.get("https://www.ncdc.noaa.gov/cdo-web/api/v2/data",
+                     params=params, headers={"token": NOAA_TOKEN}, timeout=12)
+    j = r.json()
+    vals = j.get("results") or []
+    out = {}
+    for rec in vals:
+        dt = rec.get("date","")
+        mmdd = dt[5:10]  # "MM-DD"
+        dtype = rec.get("datatype")
+        val = rec.get("value")
+        if val is None: continue
+        if dtype not in out: out[dtype] = {}
+        out[dtype][mmdd] = val
+    return out  # dict: dtype -> { "MM-DD": value }
+
 def noaa_bias_correction(df, lat, lon):
-    """Bias leggero verso clima medio locale (robusto/silenzioso)."""
-    if not NOAA_TOKEN: return df
-    try:
-        _ = (lat, lon)  # placeholder soft
-        df = df.copy()
-        df["T2m"] = df["T2m"] + np.sign(0 - df["T2m"])*0.3
-        df["RH"]  = np.where(np.isnan(df["RH"]), 70.0, df["RH"])
-        df["RH"]  = df["RH"] + (70 - df["RH"])*0.03
+    """Layer robusto NOAA: bias termico parziale da NORMAL_DLY TAVG del giorno, nudging RH & Prp."""
+    if not NOAA_TOKEN:
         return df
-    except:
+    try:
+        stns = _noaa_nearby_station(lat, lon)
+        if not stns:
+            return df
+        sid = stns[0]["id"]
+
+        normals = _noaa_normals_dly(sid)
+        if not normals:
+            # fallback soft (identico a prima se normals mancano)
+            df2 = df.copy()
+            df2["T2m"] = df2["T2m"] + np.sign(0 - df2["T2m"])*0.3
+            df2["RH"]  = np.where(np.isnan(df2["RH"]), 70.0, df2["RH"])
+            df2["RH"]  = df2["RH"] + (70 - df2["RH"])*0.03
+            return df2
+
+        # giorno mese-corrente (UTC)
+        now = datetime.utcnow().date()
+        mmdd = now.strftime("%m-%d")
+
+        # T media normale del giorno (decimi °C nelle normals). Alcuni set sono in decimi.
+        tnorm_raw = normals.get("DLY-TAVG-NORMAL", {}).get(mmdd, None)
+        tnorm = None
+        if tnorm_raw is not None:
+            # le NORMAL_DLY spesso sono in decimi di °C
+            tnorm = float(tnorm_raw)/10.0
+
+        # pct-giornaliero (prob di prp >= 0.1"): indicativo solo per nudging
+        prp_pct = normals.get("DLY-PRCP-PCTALL-GE001HI", {}).get(mmdd, None)
+        if prp_pct is not None:
+            prp_pct = float(prp_pct)  # percentuale 0..100
+
+        df2 = df.copy()
+
+        # ---- Bias T2m (parziale) ----
+        if tnorm is not None:
+            med_model = float(np.nanmedian(df2["T2m"].values))
+            bias = tnorm - med_model           # quanto il modello si discosta dalla norma
+            adj = np.clip(0.5*bias, -1.2, 1.2) # applica 50% del bias, fino a ±1.2°C
+            df2["T2m"] = df2["T2m"] + adj
+            # dew-point coerente: sposta di stessa entità
+            df2["td"]  = df2["td"]  + adj
+
+        # ---- RH nudging verso 70% (very light) ----
+        df2["RH"]  = np.where(np.isnan(df2["RH"]), 70.0, df2["RH"])
+        df2["RH"]  = df2["RH"] + (70 - df2["RH"])*0.03
+        df2["RH"]  = np.clip(df2["RH"], 1, 100)
+
+        # ---- Precip nudging: se giorno climatologicamente umido (>60%), aumenta del +10% la prp prevista (soft) ----
+        if prp_pct is not None and prp_pct >= 60:
+            df2["prp_mmph"] = df2["prp_mmph"] * 1.10
+            df2["rain"]     = df2["rain"] * 1.10
+            df2["snowfall"] = df2["snowfall"] * 1.10
+
+        return df2
+    except Exception:
+        # in caso di qualunque errore: ritorna i dati così come sono
         return df
 
 # ---------------------- DOWNSCALING ALTITUDINALE ----------------------
@@ -382,7 +469,6 @@ def wax_form_and_brushes(t_surf: float, rh: float):
 
     # sequenze (generiche e corte)
     if is_liquid:
-        # liquida: feltro/rotowool fondamentale
         if regime in ("very_cold","cold"):
             brushes = "Ottone → Nylon duro → Feltro/Rotowool → Nylon morbido"
         elif regime == "medium":
@@ -390,14 +476,13 @@ def wax_form_and_brushes(t_surf: float, rh: float):
         else:  # warm
             brushes = "Ottone → Nylon → Feltro/Rotowool → Panno microfibra"
     else:
-        # solida: più enfasi su nylon/crine, eventuale grafite se neve sporca
         if regime == "very_cold":
             brushes = "Ottone → Nylon duro → Crine"
         elif regime == "cold":
             brushes = "Ottone → Nylon → Crine"
         elif regime == "medium":
             brushes = "Ottone → Nylon → Crine → Nylon fine"
-        else:  # warm (panetto morbido)
+        else:  # warm
             brushes = "Ottone → Nylon → Nylon fine → Panno"
 
     return form, brushes
@@ -426,7 +511,7 @@ if btn:
         js = fetch_open_meteo(lat,lon)
         raw = build_df(js, hours)
 
-        # NOAA bias (opzionale ma robusto: in safe try/except)
+        # NOAA bias (robusto, con normals giornaliere se disponibili)
         raw = noaa_bias_correction(raw, lat, lon)
 
         # Enrich quick-wins (+ downscaling to pista_alt)
@@ -513,7 +598,7 @@ if btn:
 
             st.markdown(f"**Struttura consigliata:** {recommended_structure(t_med)}")
 
-            # >>> NEW: forma + spazzole (calcolate una volta per il blocco)
+            # >>> forma + spazzole
             wax_form, brush_seq = wax_form_and_brushes(t_med, rh_med)
 
             # Wax (8 brand) con RH bands + forma + spazzole
