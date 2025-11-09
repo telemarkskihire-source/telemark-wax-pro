@@ -26,7 +26,7 @@ hr {{ border:none; border-top:1px solid var(--line); margin:.75rem 0 }}
 .tbl table {{ border-collapse:collapse; width:100% }}
 .tbl th, .tbl td {{ border-bottom:1px solid var(--line); padding:.5rem .6rem }}
 .tbl th {{ color:#cbd5e1; font-weight:700; text-transform:uppercase; font-size:.78rem; letter-spacing:.06em }}
-.btn-primary button {{ background:{ACCENT} !important; color:#111 !important; font-weight:800 !important; }}
+.btn-primary button {{ background:{ACCENT} !important; color:{'#111'} !important; font-weight:800 !important; }}
 .slider-tip {{ color:var(--muted); font-size:.85rem }}
 a, .stMarkdown a {{ color:{PRIMARY} !important }}
 </style>
@@ -229,8 +229,6 @@ def _noaa_nearby_station(lat, lon, radius_m=25000, limit=3):
 
 def _noaa_normals_dly(station_id):
     """Scarica NORMAL_DLY per TAVG e PCT precipitazione (giornaliere)."""
-    # La API CDO in molti casi richiede un periodo; per le NORMAL_DLY il range annuale è ok (anno fittizio).
-    # Riduciamo il payload: solo datatype utili e limit alto.
     params = {
         "datasetid": "NORMAL_DLY",
         "stationid": station_id,
@@ -252,7 +250,7 @@ def _noaa_normals_dly(station_id):
         if val is None: continue
         if dtype not in out: out[dtype] = {}
         out[dtype][mmdd] = val
-    return out  # dict: dtype -> { "MM-DD": value }
+    return out
 
 def noaa_bias_correction(df, lat, lon):
     """Layer robusto NOAA: bias termico parziale da NORMAL_DLY TAVG del giorno, nudging RH & Prp."""
@@ -266,46 +264,34 @@ def noaa_bias_correction(df, lat, lon):
 
         normals = _noaa_normals_dly(sid)
         if not normals:
-            # fallback soft (identico a prima se normals mancano)
             df2 = df.copy()
             df2["T2m"] = df2["T2m"] + np.sign(0 - df2["T2m"])*0.3
             df2["RH"]  = np.where(np.isnan(df2["RH"]), 70.0, df2["RH"])
             df2["RH"]  = df2["RH"] + (70 - df2["RH"])*0.03
             return df2
 
-        # giorno mese-corrente (UTC)
         now = datetime.utcnow().date()
         mmdd = now.strftime("%m-%d")
 
-        # T media normale del giorno (decimi °C nelle normals). Alcuni set sono in decimi.
         tnorm_raw = normals.get("DLY-TAVG-NORMAL", {}).get(mmdd, None)
-        tnorm = None
-        if tnorm_raw is not None:
-            # le NORMAL_DLY spesso sono in decimi di °C
-            tnorm = float(tnorm_raw)/10.0
+        tnorm = float(tnorm_raw)/10.0 if tnorm_raw is not None else None
 
-        # pct-giornaliero (prob di prp >= 0.1"): indicativo solo per nudging
         prp_pct = normals.get("DLY-PRCP-PCTALL-GE001HI", {}).get(mmdd, None)
         if prp_pct is not None:
-            prp_pct = float(prp_pct)  # percentuale 0..100
+            prp_pct = float(prp_pct)
 
         df2 = df.copy()
 
-        # ---- Bias T2m (parziale) ----
         if tnorm is not None:
             med_model = float(np.nanmedian(df2["T2m"].values))
-            bias = tnorm - med_model           # quanto il modello si discosta dalla norma
-            adj = np.clip(0.5*bias, -1.2, 1.2) # applica 50% del bias, fino a ±1.2°C
+            bias = tnorm - med_model
+            adj = np.clip(0.5*bias, -1.2, 1.2)
             df2["T2m"] = df2["T2m"] + adj
-            # dew-point coerente: sposta di stessa entità
             df2["td"]  = df2["td"]  + adj
 
-        # ---- RH nudging verso 70% (very light) ----
         df2["RH"]  = np.where(np.isnan(df2["RH"]), 70.0, df2["RH"])
-        df2["RH"]  = df2["RH"] + (70 - df2["RH"])*0.03
-        df2["RH"]  = np.clip(df2["RH"], 1, 100)
+        df2["RH"]  = np.clip(df2["RH"] + (70 - df2["RH"])*0.03, 1, 100)
 
-        # ---- Precip nudging: se giorno climatologicamente umido (>60%), aumenta del +10% la prp prevista (soft) ----
         if prp_pct is not None and prp_pct >= 60:
             df2["prp_mmph"] = df2["prp_mmph"] * 1.10
             df2["rain"]     = df2["rain"] * 1.10
@@ -313,7 +299,6 @@ def noaa_bias_correction(df, lat, lon):
 
         return df2
     except Exception:
-        # in caso di qualunque errore: ritorna i dati così come sono
         return df
 
 # ---------------------- DOWNSCALING ALTITUDINALE ----------------------
@@ -423,7 +408,8 @@ def reliability(hours_ahead):
     if x<=120: return 50
     return 40
 
-# ---------------------- WAX BRANDS (with humidity hint) ----------------------
+# ---------------------- WAX BRANDS (SOLID + LIQUID) ----------------------
+# Solide (già presenti)
 SWIX = [("PS5 Turquoise",-18,-10),("PS6 Blue",-12,-6),("PS7 Violet",-8,-2),("PS8 Red",-4,4),("PS10 Yellow",0,10)]
 TOKO = [("Blue",-30,-9),("Red",-12,-4),("Yellow",-6,0)]
 VOLA = [("MX-E Blue",-25,-10),("MX-E Violet",-12,-4),("MX-E Red",-5,0),("MX-E Yellow",-2,6)]
@@ -432,9 +418,30 @@ HOLM = [("UltraMix Blue",-20,-8),("BetaMix Red",-14,-4),("AlphaMix Yellow",-4,5)
 MAPL = [("Univ Cold",-12,-6),("Univ Medium",-7,-2),("Univ Soft",-5,0)]
 START= [("SG Blue",-12,-6),("SG Purple",-8,-2),("SG Red",-3,7)]
 SKIGO= [("Blue",-12,-6),("Violet",-8,-2),("Red",-3,2)]
-BRANDS = [("Swix",SWIX),("Toko",TOKO),("Vola",VOLA),("Rode",RODE),("Holmenkol",HOLM),("Maplus",MAPL),("Start",START),("Skigo",SKIGO)]
+
+# Liquide/topcoat generiche per brand (range coerenti con solide)
+SWIX_LQ = [("HS Liquid Blue",-12,-6),("HS Liquid Violet",-8,-2),("HS Liquid Red",-4,4),("HS Liquid Yellow",0,10)]
+TOKO_LQ = [("LP Liquid Blue",-12,-6),("LP Liquid Red",-6,-2),("LP Liquid Yellow",-2,8)]
+VOLA_LQ = [("Liquid Blue",-12,-6),("Liquid Violet",-8,-2),("Liquid Red",-4,4),("Liquid Yellow",0,8)]
+RODE_LQ = [("RL Blue",-12,-6),("RL Violet",-8,-2),("RL Red",-4,3),("RL Yellow",0,8)]
+HOLM_LQ = [("Liquid Blue",-12,-6),("Liquid Red",-6,2),("Liquid Yellow",0,8)]
+MAPL_LQ = [("Liquid Cold",-12,-6),("Liquid Medium",-7,-1),("Liquid Soft",-2,8)]
+START_LQ= [("FHF Liquid Blue",-12,-6),("FHF Liquid Purple",-8,-2),("FHF Liquid Red",-3,6)]
+SKIGO_LQ= [("C110 Liquid Blue",-12,-6),("C22 Liquid Violet",-8,-2),("C44 Liquid Red",-3,6)]
+
+BRANDS = [
+    ("Swix",SWIX,SWIX_LQ),
+    ("Toko",TOKO,TOKO_LQ),
+    ("Vola",VOLA,VOLA_LQ),
+    ("Rode",RODE,RODE_LQ),
+    ("Holmenkol",HOLM,HOLM_LQ),
+    ("Maplus",MAPL,MAPL_LQ),
+    ("Start",START,START_LQ),
+    ("Skigo",SKIGO,SKIGO_LQ)
+]
 
 def pick_wax(bands, t, rh):
+    """Solida con tag umidità."""
     name = bands[0][0]
     for n,tmin,tmax in bands:
         if t>=tmin and t<=tmax:
@@ -442,20 +449,22 @@ def pick_wax(bands, t, rh):
     rh_tag = " (secco)" if rh<60 else " (medio)" if rh<80 else " (umido)"
     return name + rh_tag
 
-# >>> NEW: forma sciolina + sequenza spazzole (in base a T neve e UR) <<<
+def pick_liquid(liq_bands, t, rh):
+    """Topcoat liquida consigliata (senza tag RH nel nome)."""
+    name = liq_bands[0][0]
+    for n,tmin,tmax in liq_bands:
+        if t>=tmin and t<=tmax:
+            name = n; break
+    return name
+
+# >>> NEW: forma sciolina + sequenza spazzole + flag topcoat <<<
 def wax_form_and_brushes(t_surf: float, rh: float):
     """
-    Ritorna (form_str, brushes_str).
-    - Forma: 'Solida (panetto)' oppure 'Liquida (topcoat)' per condizioni calde/umide.
-    - Spazzole: sequenza consigliata generica (compatibile con la maggior parte dei brand).
+    Ritorna (form_str, brushes_str, use_topcoat_liquid_bool).
+    - Liquida/topcoat se caldo (>-1°C) o UR≥80%.
+    - Sequenza spazzole adattata al caso.
     """
-    # forma
-    if (t_surf > -1.0) or (rh >= 80):
-        form = "Liquida (topcoat) su base solida"
-        is_liquid = True
-    else:
-        form = "Solida (panetto)"
-        is_liquid = False
+    use_liquid = (t_surf > -1.0) or (rh >= 80)
 
     # regime termico
     if t_surf <= -12:
@@ -467,25 +476,26 @@ def wax_form_and_brushes(t_surf: float, rh: float):
     else:
         regime = "warm"
 
-    # sequenze (generiche e corte)
-    if is_liquid:
+    if use_liquid:
+        form = "Liquida (topcoat) su base solida"
         if regime in ("very_cold","cold"):
             brushes = "Ottone → Nylon duro → Feltro/Rotowool → Nylon morbido"
         elif regime == "medium":
             brushes = "Ottone → Nylon → Feltro/Rotowool → Crine"
-        else:  # warm
+        else:
             brushes = "Ottone → Nylon → Feltro/Rotowool → Panno microfibra"
     else:
+        form = "Solida (panetto)"
         if regime == "very_cold":
             brushes = "Ottone → Nylon duro → Crine"
         elif regime == "cold":
             brushes = "Ottone → Nylon → Crine"
         elif regime == "medium":
             brushes = "Ottone → Nylon → Crine → Nylon fine"
-        else:  # warm
+        else:
             brushes = "Ottone → Nylon → Nylon fine → Panno"
 
-    return form, brushes
+    return form, brushes, use_liquid
 
 def recommended_structure(Tsurf):
     if Tsurf <= -10: return "Linear Fine (freddo/secco)"
@@ -598,27 +608,37 @@ if btn:
 
             st.markdown(f"**Struttura consigliata:** {recommended_structure(t_med)}")
 
-            # >>> forma + spazzole
-            wax_form, brush_seq = wax_form_and_brushes(t_med, rh_med)
+            # >>> forma + spazzole + flag topcoat
+            wax_form, brush_seq, use_topcoat = wax_form_and_brushes(t_med, rh_med)
 
-            # Wax (8 brand) con RH bands + forma + spazzole
+            # Wax (8 brand) — solida + (se serve) topcoat liquida
             st.markdown("**Scioline suggerite:**")
             ccols1 = st.columns(4); ccols2 = st.columns(4)
-            for i,(name,bands) in enumerate(BRANDS[:4]):
-                rec = pick_wax(bands, t_med, rh_med)
+
+            # prima riga di brand
+            for i,(name,solid_bands,liquid_bands) in enumerate(BRANDS[:4]):
+                rec_solid  = pick_wax(solid_bands, t_med, rh_med)
+                topcoat = pick_liquid(liquid_bands, t_med, rh_med) if use_topcoat else "—"
+                extra_liq = f"<div style='color:#93b2c6;font-size:.85rem'>Topcoat: {topcoat if use_topcoat else 'non necessario'}</div>"
                 ccols1[i].markdown(
                     f"<div class='brand'><div><b>{name}</b>"
-                    f"<div style='color:#a9bacb'>{rec}</div>"
+                    f"<div style='color:#a9bacb'>Base: {rec_solid}</div>"
                     f"<div style='color:#93b2c6;font-size:.85rem'>Forma: {wax_form}</div>"
+                    f"{extra_liq}"
                     f"<div style='color:#93b2c6;font-size:.85rem'>Spazzole: {brush_seq}</div>"
                     f"</div></div>", unsafe_allow_html=True
                 )
-            for i,(name,bands) in enumerate(BRANDS[4:]):
-                rec = pick_wax(bands, t_med, rh_med)
+
+            # seconda riga di brand
+            for i,(name,solid_bands,liquid_bands) in enumerate(BRANDS[4:]):
+                rec_solid  = pick_wax(solid_bands, t_med, rh_med)
+                topcoat = pick_liquid(liquid_bands, t_med, rh_med) if use_topcoat else "—"
+                extra_liq = f"<div style='color:#93b2c6;font-size:.85rem'>Topcoat: {topcoat if use_topcoat else 'non necessario'}</div>"
                 ccols2[i].markdown(
                     f"<div class='brand'><div><b>{name}</b>"
-                    f"<div style='color:#a9bacb'>{rec}</div>"
+                    f"<div style='color:#a9bacb'>Base: {rec_solid}</div>"
                     f"<div style='color:#93b2c6;font-size:.85rem'>Forma: {wax_form}</div>"
+                    f"{extra_liq}"
                     f"<div style='color:#93b2c6;font-size:.85rem'>Spazzole: {brush_seq}</div>"
                     f"</div></div>", unsafe_allow_html=True
                 )
