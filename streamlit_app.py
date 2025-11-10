@@ -1,7 +1,7 @@
 # telemark_pro_app.py
 # Telemark · Pro Wax & Tune — dark, country-prefilter search, improved snow model + quick-wins, graphs, tuning tables
 
-import os, math, base64, requests, pandas as pd, numpy as np
+import os, math, base64, requests, pandas as pd, numpy as np, io
 import streamlit as st
 from datetime import datetime, date, time, timedelta
 from dateutil import tz
@@ -96,9 +96,6 @@ with colNA:
     sel_country = st.selectbox("Nazione (prefiltro ricerca)", list(COUNTRIES.keys()), index=0)
     iso2 = COUNTRIES[sel_country]
 with colSB:
-    # Tipo di ricerca
-    search_mode = st.radio("Tipo ricerca", ["Località","Pista di sci"], horizontal=True)
-
     def nominatim_search(q:str):
         if not q or len(q)<2: return []
         try:
@@ -124,96 +121,13 @@ with colSB:
         except:
             return []
 
-    def _escape_overpass_regex(s:str)->str:
-        """Escape minimo per regex Overpass."""
-        if not s: return ""
-        for ch in ['\\','"','[',']','(',')','+','?','|','.','^','$','{','}']:
-            s = s.replace(ch, '\\'+ch)
-        return s.strip()
-
-    def _overpass_call(query:str):
-        """Chiama Overpass con più endpoint di fallback."""
-        endpoints = [
-            "https://overpass.kumi.systems/api/interpreter",
-            "https://overpass-api.nextzen.org/api/interpreter",
-            "https://overpass-api.de/api/interpreter"
-        ]
-        last_exc = None
-        for url in endpoints:
-            try:
-                r = requests.post(url, data=query, timeout=18, headers={"User-Agent":"telemark-wax-pro/1.0"})
-                r.raise_for_status()
-                return r.json()
-            except Exception as e:
-                last_exc = e
-                continue
-        if last_exc: raise last_exc
-
-    def overpass_search_slopes(q:str):
-        """
-        Cerca piste di sci per nome all'interno della nazione scelta.
-        Considera ways/relations con tag piste:type e name/piste:name.
-        Ritorna il centroide (lat,lon).
-        """
-        if not q or len(q)<2: return []
-        try:
-            pat = _escape_overpass_regex(q)
-            # Query con filtro area su ISO3166 e fallback senza area se vuota
-            def _build_query(with_area=True):
-                area_block = f'area["ISO3166-1"="{iso2}"]->.a;' if with_area else ''
-                in_area    = "(area.a)" if with_area else ""
-                return f"""
-                [out:json][timeout:25];
-                {area_block}
-                (
-                  way["piste:type"]["piste:name"~"{pat}",i]{in_area};
-                  relation["piste:type"]["piste:name"~"{pat}",i]{in_area};
-                  way["piste:type"]["name"~"{pat}",i]{in_area};
-                  relation["piste:type"]["name"~"{pat}",i]{in_area};
-                );
-                out center 50;
-                """
-            js = _overpass_call(_build_query(with_area=True))
-            elems = js.get("elements",[])
-            if not elems:
-                js = _overpass_call(_build_query(with_area=False))
-                elems = js.get("elements",[])
-
-            st.session_state._options = {}
-            out=[]
-            for el in elems:
-                tags = el.get("tags",{}) or {}
-                name = tags.get("piste:name") or tags.get("name")
-                if not name: continue
-                ptype = tags.get("piste:type","?")
-                diff  = tags.get("piste:difficulty","")
-                center = el.get("center") or {}
-                lat = center.get("lat"); lon = center.get("lon")
-                if lat is None or lon is None: continue
-                # Etichetta compatta
-                suffix = f" · {diff}" if diff else ""
-                lab = f"🎿 {name} — {ptype}{suffix} — {iso2}"
-                key = f"{lab}|||{lat:.6f},{lon:.6f}"
-                st.session_state._options[key] = {"lat":lat,"lon":lon,"label":lab,"addr":{}}
-                out.append(key)
-
-            # Dedup (alcune relations/ways hanno stesso centro)
-            seen=set(); dedup=[]
-            for k in out:
-                if k in seen: continue
-                seen.add(k); dedup.append(k)
-
-            return dedup[:20]
-        except:
-            return []
-
     selected = st_searchbox(
-        overpass_search_slopes if search_mode=="Pista di sci" else nominatim_search,
-        key="place", placeholder="Cerca… es. 'Gran Pista', 'Streif', 'Champoluc'",
+        nominatim_search, key="place", placeholder="Cerca… es. Champoluc, Plateau Rosa",
         clear_on_submit=False, default=None
     )
-```0
 
+# ---------------------- CACHED HELPERS ----------------------
+@st.cache_data(ttl=600)
 def get_elev(lat,lon):
     try:
         rr = requests.get("https://api.open-meteo.com/v1/elevation",
@@ -238,7 +152,26 @@ cdate, calt = st.columns([1,1])
 with cdate:
     target_day: date = st.date_input("Giorno di riferimento", value=date.today())
 with calt:
-    pista_alt = st.number_input("Altitudine pista/garà (m)", min_value=0, max_value=5000, value=int(elev or 1800), step=50)
+    lock_alt = st.checkbox("Usa altitudine da mappa (OSM)", value=True if elev is not None else False)
+    default_alt = int(elev or 1800)
+    pista_alt = st.number_input("Altitudine pista/garà (m)", min_value=0, max_value=5000,
+                                value=default_alt if lock_alt else st.session_state.get("pista_alt", default_alt),
+                                step=50, disabled=lock_alt)
+    if lock_alt:
+        st.session_state["pista_alt"] = default_alt
+    else:
+        st.session_state["pista_alt"] = pista_alt
+
+# --- PRESET FINESTRE (prima dei time_input) ---
+preset = st.selectbox("Preset finestre", ["—","SL (09–11 · 11–13 · 13–16)","GS mattino (09–10 · 10–12 · 13–16)","Allenamento (08–10 · 10–12 · 12–15)"], index=0)
+def _set(tk, hh, mm): st.session_state[tk] = time(hh,mm)
+if preset != "—":
+    if preset.startswith("SL"):
+        _set("A_s",9,0); _set("A_e",11,0); _set("B_s",11,0); _set("B_e",13,0); _set("C_s",13,0); _set("C_e",16,0)
+    elif preset.startswith("GS"):
+        _set("A_s",9,0); _set("A_e",10,0); _set("B_s",10,0); _set("B_e",12,0); _set("C_s",13,0); _set("C_e",16,0)
+    else:
+        _set("A_s",8,0); _set("A_e",10,0); _set("B_s",10,0); _set("B_e",12,0); _set("C_s",12,0); _set("C_e",15,0)
 
 st.subheader("1) Finestre orarie A · B · C")
 c1,c2,c3 = st.columns(3)
@@ -258,6 +191,7 @@ hours = st.slider("Ore previsione (da ora)", 12, 168, 72, 12)
 st.markdown("<div class='slider-tip'>Suggerimento: < 48h → stime più affidabili</div>", unsafe_allow_html=True)
 
 # ---------------------- METEO (Open-Meteo) ----------------------
+@st.cache_data(ttl=600, show_spinner=False)
 def fetch_open_meteo(lat, lon):
     r = requests.get(
         "https://api.open-meteo.com/v1/forecast",
@@ -643,6 +577,13 @@ if btn:
         plt.legend(); plt.title("Radiazione stimata & Umidità"); plt.grid(alpha=0.2)
         st.pyplot(fig3)
 
+        # --- DOWNLOAD PNG dei grafici ---
+        buf1, buf2, buf3 = io.BytesIO(), io.BytesIO(), io.BytesIO()
+        fig1.savefig(buf1, format="png", dpi=200); fig2.savefig(buf2, format="png", dpi=200); fig3.savefig(buf3, format="png", dpi=200)
+        st.download_button("Scarica grafico Temperature (PNG)", data=buf1.getvalue(), file_name="grafico_temperature.png", mime="image/png")
+        st.download_button("Scarica grafico Precipitazione (PNG)", data=buf2.getvalue(), file_name="grafico_precipitazione.png", mime="image/png")
+        st.download_button("Scarica grafico Radiazione&UR (PNG)", data=buf3.getvalue(), file_name="grafico_radiazione_umidita.png", mime="image/png")
+
         # --------- TABLE (clean) ----------
         show = pd.DataFrame({
             "Ora":    res["time_local"].dt.strftime("%Y-%m-%d %H:%M"),
@@ -703,6 +644,7 @@ if btn:
             st.markdown("**Scioline suggerite:**")
             ccols1 = st.columns(4); ccols2 = st.columns(4)
 
+            # prima riga di brand
             for i,(name,solid_bands,liquid_bands) in enumerate(BRANDS[:4]):
                 rec_solid  = pick_wax(solid_bands, t_med, rh_med)
                 topcoat = pick_liquid(liquid_bands, t_med, rh_med) if use_topcoat else "—"
@@ -716,6 +658,7 @@ if btn:
                     f"</div></div>", unsafe_allow_html=True
                 )
 
+            # seconda riga di brand
             for i,(name,solid_bands,liquid_bands) in enumerate(BRANDS[4:]):
                 rec_solid  = pick_wax(solid_bands, t_med, rh_med)
                 topcoat = pick_liquid(liquid_bands, t_med, rh_med) if use_topcoat else "—"
@@ -740,7 +683,7 @@ if btn:
             })
             st.dataframe(mini, use_container_width=True, hide_index=True)
 
-            # Tuning per discipline (tabella ripristinata)
+            # Tuning per disciplina (tabella ripristinata)
             st.markdown("**Tuning per disciplina (SIDE/BASE):**")
             rows=[]
             for d in ["SL","GS","SG","DH"]:
@@ -755,6 +698,8 @@ if btn:
         st.download_button("Scarica CSV completo", data=csv.to_csv(index=False),
                            file_name="forecast_snow_telemark.csv", mime="text/csv")
 
+        # Timestamp aggiornamento
+        st.caption(f"Dati aggiornati: {datetime.utcnow():%Y-%m-%d %H:%M} UTC")
+
     except Exception as e:
         st.error(f"Errore: {e}")
-
