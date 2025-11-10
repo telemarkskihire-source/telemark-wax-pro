@@ -97,7 +97,7 @@ L = {
         "struct":"Recommended structure:",
         "waxes":"Suggested waxes:",
         "nodata":"No data in selected window.",
-        "t_air":"Air T (°C)","td":"Td (°C)","rh":"RH (%)","tw":"Tw (°C)",
+        "t_air":"Air T (°C)","td":"Td (°C)","rh":"RH (%)","tw":"Wet-bulb (°C)",
         "we":"Eff. wind (m/s)","cloud":"Cloudiness (%)","sw":"SW↓ (W/m²)",
         "prp":"Prp (mm/h)","ptype":"Prp type",
         "t_surf":"Snow T surf (°C)","t_top5":"Top 5mm (°C)","lw":"Liquid water (%)",
@@ -595,13 +595,36 @@ def reverse_geocode(lat, lon):
     except:
         return f"{lat:.5f}, {lon:.5f}"
 
+# --- Mappa interattiva se disponibile (folium); altrimenti fallback statico ---
+HAS_FOLIUM = False
 try:
-    tile = osm_tile(lat,lon, z=9)
-    st.image(tile, caption=T["map"], width=220)
-except:
-    pass
+    from streamlit_folium import st_folium
+    import folium
+    HAS_FOLIUM = True
+except Exception:
+    HAS_FOLIUM = False
 
-# --- Piccolo pannello opzionale: posizionamento manuale preciso ---
+if HAS_FOLIUM:
+    with st.expander(T["map"] + " — clicca per scegliere", expanded=True):
+        m = folium.Map(location=[lat, lon], zoom_start=12, tiles="CartoDB positron")
+        folium.Marker([lat, lon], tooltip=place_label).add_to(m)
+        out = st_folium(m, height=360, width=None, returned_objects=[])
+        if out and out.get("last_clicked"):
+            new_lat = float(out["last_clicked"]["lat"])
+            new_lon = float(out["last_clicked"]["lng"])
+            st.session_state["lat"] = new_lat
+            st.session_state["lon"] = new_lon
+            st.session_state["place_label"] = reverse_geocode(new_lat, new_lon)
+            st.success(f"Posizione aggiornata: {st.session_state['place_label']}")
+            st.rerun()
+else:
+    try:
+        tile = osm_tile(lat,lon, z=9)
+        st.image(tile, caption=T["map"], width=220)
+    except:
+        pass
+
+# --- Pannello opzionale: posizionamento manuale preciso ---
 with st.expander("➕ Imposta coordinate manuali / Set precise coordinates", expanded=False):
     c_lat, c_lon = st.columns(2)
     new_lat = c_lat.number_input("Lat", value=float(lat), format="%.6f")
