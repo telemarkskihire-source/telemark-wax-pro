@@ -1,7 +1,11 @@
-streamlit==1.39.0
-pandas==2.2.2
-requests
-python-dateutil
-matplotlib
-streamlit-searchbox
+streamlit
+pandas
 numpy
+requests
+matplotlib
+python-dateutil
+streamlit-searchbox
+pytz
+tzdata
+folium
+streamlit-folium
