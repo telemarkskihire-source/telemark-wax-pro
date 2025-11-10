@@ -6,6 +6,8 @@ import streamlit as st
 from datetime import datetime, date, time as dtime, timedelta
 from dateutil import tz
 from streamlit_searchbox import st_searchbox
+import matplotlib
+matplotlib.use("Agg")  # <-- backend sicuro per Streamlit
 import matplotlib.pyplot as plt
 
 # ---------------------- THEME (dark) ----------------------
@@ -74,7 +76,8 @@ L = {
         "lang":"Lingua","unit":"Unità","unit_c":"°C / m/s","unit_f":"°F / km/h",
         "map":"Mappa (selezione)",
         "base_solid":"Base solida",
-        "topcoat_lbl":"Topcoat"
+        "topcoat_lbl":"Topcoat",
+        "debug":"Mostra debug"
     },
     "en": {
         "country":"Country (search prefilter)",
@@ -111,7 +114,8 @@ L = {
         "lang":"Language","unit":"Units","unit_c":"°C / m/s","unit_f":"°F / km/h",
         "map":"Map (selection)",
         "base_solid":"Base solid",
-        "topcoat_lbl":"Topcoat"
+        "topcoat_lbl":"Topcoat",
+        "debug":"Show debug"
     }
 }
 
@@ -121,6 +125,7 @@ lang = st.sidebar.selectbox(L["it"]["lang"]+" / "+L["en"]["lang"], ["IT","EN"], 
 T = L["it"] if lang=="IT" else L["en"]
 units = st.sidebar.radio(T["unit"], [T["unit_c"], T["unit_f"]], index=0, horizontal=False)
 use_fahrenheit = (units==T["unit_f"])
+show_debug = st.sidebar.checkbox(T["debug"], value=False)
 
 # ---------------------- UTILS ----------------------
 def flag(cc:str)->str:
@@ -180,15 +185,12 @@ def _retry(func, attempts=2, sleep=0.8):
     for i in range(attempts):
         try:
             return func()
-        except Exception as e:
+        except Exception:
             if i==attempts-1: raise
             time.sleep(sleep*(1.5**i))
 
 # ---------------------- SEARCH with COUNTRY prefilter ----------------------
-COUNTRIES = {
-    "Italia":"IT","Svizzera":"CH","Francia":"FR","Austria":"AT",
-    "Germania":"DE","Spagna":"ES","Norvegia":"NO","Svezia":"SE"
-}
+COUNTRIES = {"Italia":"IT","Svizzera":"CH","Francia":"FR","Austria":"AT","Germania":"DE","Spagna":"ES","Norvegia":"NO","Svezia":"SE"}
 col_top = st.columns([2,1,1,1])
 with col_top[1]:
     sel_country = st.selectbox(T["country"], list(COUNTRIES.keys()), index=0, key="country_sel")
@@ -197,7 +199,7 @@ with col_top[2]:
     offset = st.slider(T["offset"], -1.5, 1.5, 0.0, 0.1, key="cal_offset")
 with col_top[3]:
     if st.button(T["reset"], use_container_width=True):
-        for k in ["A_s","A_e","B_s","B_e","C_s","C_e","place","lat","lon","place_label","hours","country_sel","cal_offset"]:
+        for k in ["A_s","A_e","B_s","B_e","C_s","C_e","place","lat","lon","place_label","hours","country_sel","cal_offset","ref_day","alt_m"]:
             if k in st.session_state: del st.session_state[k]
         st.rerun()
 
@@ -227,10 +229,7 @@ with col_top[0]:
         except:
             return []
 
-    selected = st_searchbox(
-        nominatim_search, key="place", placeholder=T["search_ph"],
-        clear_on_submit=False, default=None
-    )
+    selected = st_searchbox(nominatim_search, key="place", placeholder=T["search_ph"], clear_on_submit=False, default=None)
 
 # ---------------------- Cached services ----------------------
 @st.cache_data(ttl=60*10, show_spinner=False)
@@ -249,16 +248,13 @@ def fetch_open_meteo(lat, lon):
 
 @st.cache_data(ttl=24*3600, show_spinner=False)
 def get_elev(lat,lon):
-    rr = requests.get("https://api.open-meteo.com/v1/elevation",
-                      params={"latitude":lat, "longitude":lon}, headers=UA, timeout=8)
+    rr = requests.get("https://api.open-meteo.com/v1/elevation", params={"latitude":lat, "longitude":lon}, headers=UA, timeout=8)
     rr.raise_for_status(); js = rr.json()
     return float(js["elevation"][0]) if js and "elevation" in js else None
 
 @st.cache_data(ttl=12*3600, show_spinner=False)
 def detect_timezone(lat, lon):
-    r = requests.get("https://api.open-meteo.com/v1/forecast",
-                     params={"latitude":lat,"longitude":lon,"hourly":"temperature_2m","forecast_days":1,"timezone":"auto"},
-                     headers=UA, timeout=10)
+    r = requests.get("https://api.open-meteo.com/v1/forecast", params={"latitude":lat,"longitude":lon,"hourly":"temperature_2m","forecast_days":1,"timezone":"auto"}, headers=UA, timeout=10)
     r.raise_for_status()
     return r.json().get("timezone","Europe/Rome")
 
@@ -268,42 +264,29 @@ NOAA_TOKEN = st.secrets.get("NOAA_TOKEN", None)
 @st.cache_data(ttl=24*3600, show_spinner=False)
 def _noaa_nearby_station(lat, lon, radius_m=25000, limit=3):
     if not NOAA_TOKEN: return []
-    r = requests.get(
-        "https://www.ncdc.noaa.gov/cdo-web/api/v2/stations",
-        params={"datasetid":"GHCND","limit":limit,"sortfield":"distance",
-                "latitude":lat,"longitude":lon,"radius":radius_m},
-        headers={"token": NOAA_TOKEN, **UA}, timeout=10
-    )
+    r = requests.get("https://www.ncdc.noaa.gov/cdo-web/api/v2/stations",
+        params={"datasetid":"GHCND","limit":limit,"sortfield":"distance","latitude":lat,"longitude":lon,"radius":radius_m},
+        headers={"token": NOAA_TOKEN, **UA}, timeout=10)
     j = r.json()
     return (j.get("results") or [])
 
 @st.cache_data(ttl=24*3600, show_spinner=False)
 def _noaa_normals_dly(station_id):
     if not NOAA_TOKEN: return {}
-    params = {
-        "datasetid": "NORMAL_DLY",
-        "stationid": station_id,
-        "datatypeid": ["DLY-TAVG-NORMAL","DLY-PRCP-PCTALL-GE001HI"],
-        "startdate": "2010-01-01",
-        "enddate":   "2010-12-31",
-        "limit": 1000
-    }
-    r = requests.get("https://www.ncdc.noaa.gov/cdo-web/api/v2/data",
-                     params=params, headers={"token": NOAA_TOKEN, **UA}, timeout=12)
+    params = {"datasetid":"NORMAL_DLY","stationid":station_id,"datatypeid":["DLY-TAVG-NORMAL","DLY-PRCP-PCTALL-GE001HI"],"startdate":"2010-01-01","enddate":"2010-12-31","limit":1000}
+    r = requests.get("https://www.ncdc.noaa.gov/cdo-web/api/v2/data", params=params, headers={"token": NOAA_TOKEN, **UA}, timeout=12)
     j = r.json()
     vals = j.get("results") or []
     out = {}
     for rec in vals:
-        dt = rec.get("date","")
-        mmdd = dt[5:10]
+        dt = rec.get("date",""); mmdd = dt[5:10]
         dtype = rec.get("datatype"); val = rec.get("value")
         if val is None: continue
         out.setdefault(dtype, {})[mmdd] = val
     return out
 
 def noaa_bias_correction(df, lat, lon):
-    if not NOAA_TOKEN:
-        return df
+    if not NOAA_TOKEN: return df
     try:
         stns = _noaa_nearby_station(lat, lon)
         if not stns: return df
@@ -340,17 +323,12 @@ def noaa_bias_correction(df, lat, lon):
 def build_df(js, hours):
     h = js["hourly"]; df = pd.DataFrame(h)
     df["time"] = pd.to_datetime(df["time"], utc=True)  # tz-aware UTC
-
-    # >>> FIX 1: now0 tz-aware in UTC <<<
     now0 = pd.Timestamp.now(tz="UTC").floor("H")
-
     df = df[df["time"] >= now0].head(int(hours)).reset_index(drop=True)
 
     out = pd.DataFrame()
     out["time_utc"] = df["time"]
     out["T2m"] = df["temperature_2m"].astype(float)
-
-    # >>> FIX 2: safe column access without scalar .astype on defaults <<<
     out["RH"] = df["relative_humidity_2m"].astype(float) if "relative_humidity_2m" in df else np.full(len(df), np.nan)
     out["td"] = (df["dew_point_2m"].astype(float) if "dew_point_2m" in df else out["T2m"].astype(float))
     out["cloud"] = (df["cloudcover"].astype(float)/100).clip(0,1) if "cloudcover" in df else np.zeros(len(df))
@@ -360,8 +338,6 @@ def build_df(js, hours):
     out["rain"] = df["rain"].astype(float) if "rain" in df else np.zeros(len(df))
     out["snowfall"] = df["snowfall"].astype(float) if "snowfall" in df else np.zeros(len(df))
     out["wcode"] = df["weathercode"].astype(int) if "weathercode" in df else np.zeros(len(df), dtype=int)
-
-    # lead time (h)
     out["lead_h"] = ((out["time_utc"] - now0).dt.total_seconds()/3600.0).round(1)
     return out
 
@@ -411,12 +387,9 @@ def enrich_meteo_quickwins(df, lat, lon, base_alt, target_alt):
 def snow_temperature_model(X: pd.DataFrame, dt_hours=1.0):
     X = X.copy()
     X["ptyp"] = X.apply(prp_type_row, axis=1)
-    wet = (
-        (X["ptyp"].isin(["rain","mixed"])) |
-        ( (X["ptyp"]=="snow") & (X["T2m"]>-0.5) & (X["RH"]>90) ) |
-        ( (X["SW_down"]>250) & (X["T2m"]>-1.0) ) |
-        (X["T2m"]>0.5)
-    )
+    wet = ((X["ptyp"].isin(["rain","mixed"])) |
+           ( (X["ptyp"]=="snow") & (X["T2m"]>-0.5) & (X["RH"]>90) ) |
+           ( (X["SW_down"]>250) & (X["T2m"]>-1.0) ) | (X["T2m"]>0.5))
     conv = 0.20 * X["wind_eff"]
     rad_cool = (0.8 * (1.0 - X["cloud"]))
     sw_gain = (X["SW_down"] * (1 - X["albedo"])) / 200.0
@@ -484,16 +457,8 @@ MAPL_LQ = [("Liquid Cold",-12,-6),("Liquid Medium",-7,-1),("Liquid Soft",-2,8)]
 START_LQ= [("FHF Liquid Blue",-12,-6),("FHF Liquid Purple",-8,-2),("FHF Liquid Red",-3,6)]
 SKIGO_LQ= [("C110 Liquid Blue",-12,-6),("C22 Liquid Violet",-8,-2),("C44 Liquid Red",-3,6)]
 
-BRANDS = [
-    ("Swix",SWIX,SWIX_LQ),
-    ("Toko",TOKO,TOKO_LQ),
-    ("Vola",VOLA,VOLA_LQ),
-    ("Rode",RODE,RODE_LQ),
-    ("Holmenkol",HOLM,HOLM_LQ),
-    ("Maplus",MAPL,MAPL_LQ),
-    ("Start",START,START_LQ),
-    ("Skigo",SKIGO,SKIGO_LQ)
-]
+BRANDS = [("Swix",SWIX,SWIX_LQ),("Toko",TOKO,TOKO_LQ),("Vola",VOLA,VOLA_LQ),("Rode",RODE,RODE_LQ),
+          ("Holmenkol",HOLM,HOLM_LQ),("Maplus",MAPL,MAPL_LQ),("Start",START,START_LQ),("Skigo",SKIGO,SKIGO_LQ)]
 
 # ---------------------- LOGHI BRAND ----------------------
 BRAND_LOGO_FILES = {
@@ -507,6 +472,13 @@ BRAND_LOGO_FILES = {
     "Skigo": "skigo.png",
 }
 
+def _try_paths(filename: str):
+    for root in ["logos", "assets/logos", "."]:
+        path = os.path.join(root, filename)
+        if os.path.exists(path):
+            return path
+    return None
+
 @st.cache_data(show_spinner=False)
 def _logo_b64(path: str):
     try:
@@ -518,8 +490,8 @@ def _logo_b64(path: str):
 def get_brand_logo_b64(brand_name: str):
     fname = BRAND_LOGO_FILES.get(brand_name)
     if not fname: return None
-    path = os.path.join("logos", fname)  # cartella 'logos' a progetto
-    return _logo_b64(path)
+    p = _try_paths(fname)
+    return _logo_b64(p) if p else None
 
 def pick_wax(bands, t, rh):
     name = bands[0][0]
@@ -653,7 +625,7 @@ def build_pdf_report(res, place_label, t_med_map, wax_cards_html):
     ax0 = fig.add_subplot(gs[0,0]); ax1 = fig.add_subplot(gs[1:3,0]); ax2 = fig.add_subplot(gs[3:4,0]); ax3 = fig.add_subplot(gs[4:5,0])
     ax4 = fig.add_subplot(gs[5:6,0]); ax5 = fig.add_subplot(gs[6:7,0])
     fig.suptitle(f"Telemark · Pro Wax & Tune — {place_label}", fontsize=12, y=0.995)
-    tloc = res["time_local"]
+    tloc = res["time_local"].dt.tz_localize(None)  # <-- naive per il PDF
     ax1.plot(tloc, res["T2m"], label="T aria"); ax1.plot(tloc, res["T_surf"], label="T neve"); ax1.plot(tloc, res["T_top5"], label="Top 5mm")
     ax1.set_title("Temperature"); ax1.grid(alpha=.2); ax1.legend(fontsize=8)
     ax2.bar(tloc, res["prp_mmph"], width=0.03); ax2.set_title("Precipitazione (mm/h)"); ax2.grid(alpha=.2)
@@ -668,9 +640,9 @@ def build_pdf_report(res, place_label, t_med_map, wax_cards_html):
 
 def plot_speed_mini(res):
     fig = plt.figure(figsize=(6,2.2))
-    plt.plot(res["time_local"], res["speed_index"])
+    plt.plot(res["time_local"].dt.tz_localize(None), res["speed_index"])  # <-- naive
     plt.title(T["speed_chart"]); plt.grid(alpha=.2)
-    st.pyplot(fig)
+    st.pyplot(fig); plt.close(fig)
 
 def brand_card_html(name, base_solid, form, topcoat, brushes, logo_b64):
     logo_html = f"<div class='logo'><img src='data:image/png;base64,{logo_b64}'/></div>" if logo_b64 else "<div class='logo'></div>"
@@ -694,6 +666,10 @@ if btn:
                 with st.spinner("Open-Meteo…"):
                     js = _retry(lambda: fetch_open_meteo(lat,lon))
                 raw = build_df(js, hours)
+                if raw.empty:
+                    st.error("Nessun dato meteo disponibile dalla fonte in questo momento.")
+                    status.update(label="Sorgente vuota", state="error", expanded=True)
+                    st.stop()
                 raw = noaa_bias_correction(raw, lat, lon)
                 base_alt = elev or pista_alt
                 X = enrich_meteo_quickwins(raw, lat, lon, base_alt, pista_alt)
@@ -717,38 +693,38 @@ if btn:
                 if use_fahrenheit:
                     for col in ["T2m","td","Tw","T_surf","T_top5"]:
                         disp[col] = c_to_f(disp[col])
-                    Tair_lbl = T["t_air"].replace("°C","°F")
-                    Td_lbl   = T["td"].replace("°C","°F")
-                    Tw_lbl   = T["tw"].replace("°C","°F")
-                    Tsurf_lbl= T["t_surf"].replace("°C","°F")
+                    Tair_lbl = T["t_air"].replace("°C","°F"); Td_lbl = T["td"].replace("°C","°F")
+                    Tw_lbl   = T["tw"].replace("°C","°F"); Tsurf_lbl= T["t_surf"].replace("°C","°F")
                     Ttop_lbl = T["t_top5"].replace("°C","°F")
                 else:
                     Tair_lbl, Td_lbl, Tw_lbl, Tsurf_lbl, Ttop_lbl = T["t_air"], T["td"], T["tw"], T["t_surf"], T["t_top5"]
 
-                wind_eff_disp = disp["wind_eff"] if not use_fahrenheit else ms_to_kmh(disp["wind_eff"])
                 wind_unit_lbl = "m/s" if not use_fahrenheit else "km/h"
 
-                # --- Charts ---
-                tloc = disp["time_local"]
+                # --- Charts (timezone-naive per robustezza plotting) ---
+                tloc = disp["time_local"].dt.tz_localize(None)
                 fig1 = plt.figure(figsize=(10,3))
                 plt.plot(tloc, disp["T2m"], label=Tair_lbl)
                 plt.plot(tloc, disp["T_surf"], label=Tsurf_lbl)
                 plt.plot(tloc, disp["T_top5"], label=Ttop_lbl)
                 plt.legend(); plt.title(T["temp"]); plt.xlabel(T["hour"]); plt.ylabel("°F" if use_fahrenheit else "°C"); plt.grid(alpha=0.2)
-                st.pyplot(fig1)
+                st.pyplot(fig1); plt.close(fig1)
 
                 fig2 = plt.figure(figsize=(10,2.6))
-                plt.bar(tloc, disp["prp_mmph"], width=0.03, align="center")
+                plt.bar(tloc, disp["prp_mmph"], width=0.025)
                 plt.title(T["prec"]); plt.xlabel(T["hour"]); plt.ylabel("mm/h"); plt.grid(alpha=0.2)
-                st.pyplot(fig2)
+                st.pyplot(fig2); plt.close(fig2)
 
                 fig3 = plt.figure(figsize=(10,2.6))
                 plt.plot(tloc, disp["SW_down"], label="SW↓")
                 plt.plot(tloc, disp["RH"], label=T["rh"])
                 plt.legend(); plt.title(T["radhum"]); plt.grid(alpha=0.2)
-                st.pyplot(fig3)
+                st.pyplot(fig3); plt.close(fig3)
 
                 plot_speed_mini(disp)
+
+                if show_debug:
+                    st.info(f"Rows: {len(disp)} · time_local: {disp['time_local'].min()} → {disp['time_local'].max()}")
 
                 # --- Blocchi & Cards brand (con loghi) ---
                 blocks = {"A":(A_start,A_end),"B":(B_start,B_end),"C":(C_start,C_end)}
@@ -772,11 +748,12 @@ if btn:
                         st.markdown(f"<div class='badge-red'>⚠ {T['alert'].format(lbl=L)}</div>", unsafe_allow_html=True)
                     k = classify_snow(W.iloc[0])
                     rel = reliability((W.index[0] if not W.empty else 0) + 1)
+                    v_eff = (W["wind"] if not use_fahrenheit else ms_to_kmh(W["wind"])).mean()
                     st.markdown(
                         f"<div class='banner'><b>{T['cond']}</b> {k} · "
                         f"<b>T_neve med</b> {t_med:.1f}{'°F' if use_fahrenheit else '°C'} · <b>H₂O liquida</b> {float(W['liq_water_pct'].mean()):.1f}% · "
                         f"<b>Affidabilità</b> ≈ {rel}% · "
-                        f"<b>V eff</b> {((W['wind'] if not use_fahrenheit else ms_to_kmh(W['wind'])).mean()):.1f} {wind_unit_lbl}</div>",
+                        f"<b>V eff</b> {v_eff:.1f} {wind_unit_lbl}</div>",
                         unsafe_allow_html=True
                     )
                     t_for_struct = t_med if not use_fahrenheit else (t_med-32)*5/9
@@ -804,12 +781,10 @@ if btn:
                 csv = disp.copy()
                 csv["time_local"] = csv["time_local"].dt.strftime("%Y-%m-%d %H:%M")
                 csv = csv.drop(columns=["time_utc"])
-                st.download_button(T["download_csv"], data=csv.to_csv(index=False),
-                                   file_name="forecast_snow_telemark.csv", mime="text/csv")
+                st.download_button(T["download_csv"], data=csv.to_csv(index=False), file_name="forecast_snow_telemark.csv", mime="text/csv")
 
                 pdf_bytes = build_pdf_report(disp, place_label, t_med_map, "")
-                st.download_button("Scarica report PDF (1 pagina)",
-                                   data=pdf_bytes, file_name="report_telemark.pdf", mime="application/pdf")
+                st.download_button("Scarica report PDF (1 pagina)", data=pdf_bytes, file_name="report_telemark.pdf", mime="application/pdf")
 
                 status.update(label=f"{T['last_upd']}: {datetime.now().strftime('%H:%M')}", state="complete", expanded=False)
 
