@@ -26,6 +26,8 @@ hr {{ border:none; border-top:1px solid var(--line); margin:.75rem 0 }}
 .brand h4 {{ margin:0 0 .25rem 0; font-size:1rem; color:#fff }}
 .brand .muted {{ color:#a9bacb }}
 .brand .sub {{ color:#93b2c6; font-size:.85rem }}
+.brand .logo {{ flex:0 0 auto; display:flex; align-items:center; justify-content:center; width:54px; height:54px; background:#0b121a; border:1px solid #1e2a3a; border-radius:10px; overflow:hidden }}
+.brand .logo img {{ max-width:52px; max-height:52px; display:block }}
 .grid {{ display:grid; grid-template-columns: repeat(4, minmax(0,1fr)); gap:.6rem; }}
 .tune ul {{ margin:.5rem 0 0 1rem; padding:0; }}
 .small {{ font-size:.85rem; color:#cbd5e1 }}
@@ -493,6 +495,32 @@ BRANDS = [
     ("Skigo",SKIGO,SKIGO_LQ)
 ]
 
+# ---------------------- LOGHI BRAND ----------------------
+BRAND_LOGO_FILES = {
+    "Swix": "swix.png",
+    "Toko": "toko.png",
+    "Vola": "vola.png",
+    "Rode": "rode.png",
+    "Holmenkol": "holmenkol.png",
+    "Maplus": "maplus.png",
+    "Start": "start.png",
+    "Skigo": "skigo.png",
+}
+
+@st.cache_data(show_spinner=False)
+def _logo_b64(path: str):
+    try:
+        with open(path, "rb") as f:
+            return base64.b64encode(f.read()).decode("ascii")
+    except Exception:
+        return None
+
+def get_brand_logo_b64(brand_name: str):
+    fname = BRAND_LOGO_FILES.get(brand_name)
+    if not fname: return None
+    path = os.path.join("logos", fname)  # cartella 'logos' a progetto
+    return _logo_b64(path)
+
 def pick_wax(bands, t, rh):
     name = bands[0][0]
     for n,tmin,tmax in bands:
@@ -644,9 +672,11 @@ def plot_speed_mini(res):
     plt.title(T["speed_chart"]); plt.grid(alpha=.2)
     st.pyplot(fig)
 
-def brand_card_html(name, base_solid, form, topcoat, brushes):
+def brand_card_html(name, base_solid, form, topcoat, brushes, logo_b64):
+    logo_html = f"<div class='logo'><img src='data:image/png;base64,{logo_b64}'/></div>" if logo_b64 else "<div class='logo'></div>"
     return f"""
     <div class='brand'>
+      {logo_html}
       <div style='flex:1'>
         <h4>{name}</h4>
         <div class='muted'>{T['base_solid']}: <b>{base_solid}</b></div>
@@ -698,7 +728,7 @@ if btn:
                 wind_eff_disp = disp["wind_eff"] if not use_fahrenheit else ms_to_kmh(disp["wind_eff"])
                 wind_unit_lbl = "m/s" if not use_fahrenheit else "km/h"
 
-                # --- Charts (restano) ---
+                # --- Charts ---
                 tloc = disp["time_local"]
                 fig1 = plt.figure(figsize=(10,3))
                 plt.plot(tloc, disp["T2m"], label=Tair_lbl)
@@ -720,8 +750,7 @@ if btn:
 
                 plot_speed_mini(disp)
 
-                # >>> RIMOSSA LA TABELLA "show" — tutto passa in card <<<
-
+                # --- Blocchi & Cards brand (con loghi) ---
                 blocks = {"A":(A_start,A_end),"B":(B_start,B_end),"C":(C_start,C_end)}
                 t_med_map = {}
                 for L,(s,e) in blocks.items():
@@ -754,16 +783,16 @@ if btn:
                     st.markdown(f"**{T['struct']}** {recommended_structure(t_for_struct)}")
                     wax_form, brush_seq, use_topcoat = wax_form_and_brushes(t_for_struct, rh_med)
 
-                    # >>> CARD GRID PER BRAND (Base solida + Topcoat + Forma + Spazzole) <<<
                     st.markdown("<div class='grid'>", unsafe_allow_html=True)
                     for (name, solid_bands, liquid_bands) in BRANDS:
-                        rec_solid  = pick_wax(solid_bands, t_for_struct, rh_med)  # BASE SOLIDA
+                        rec_solid  = pick_wax(solid_bands, t_for_struct, rh_med)
                         topcoat = (pick_liquid(liquid_bands, t_for_struct, rh_med) if use_topcoat else ("non necessario" if lang=="IT" else "not needed"))
-                        html = brand_card_html(name, rec_solid, wax_form, topcoat, brush_seq)
+                        logo_b64 = get_brand_logo_b64(name)
+                        html = brand_card_html(name, rec_solid, wax_form, topcoat, brush_seq, logo_b64)
                         st.markdown(html, unsafe_allow_html=True)
                     st.markdown("</div>", unsafe_allow_html=True)
 
-                    # >>> CARD COMPATTA PER TUNING DISCIPLINE (al posto della tabella) <<<
+                    # Tuning per disciplina
                     rows=[]
                     for d in ["SL","GS","SG","DH"]:
                         fam, side, base = tune_for(t_for_struct, d)
@@ -771,7 +800,7 @@ if btn:
                     tune_list = "".join([f"<li><b>{d}</b>: {fam} — SIDE {side} · BASE {base}</li>" for d,fam,side,base in rows])
                     st.markdown(f"<div class='card tune'><div><b>Tuning per disciplina</b></div><ul class='small'>{tune_list}</ul></div>", unsafe_allow_html=True)
 
-                # CSV/PDF download restano disponibili
+                # CSV/PDF download
                 csv = disp.copy()
                 csv["time_local"] = csv["time_local"].dt.strftime("%Y-%m-%d %H:%M")
                 csv = csv.drop(columns=["time_utc"])
