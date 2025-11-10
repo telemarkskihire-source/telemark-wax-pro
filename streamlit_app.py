@@ -22,15 +22,13 @@ hr {{ border:none; border-top:1px solid var(--line); margin:.75rem 0 }}
 .badge {{ display:inline-flex; align-items:center; gap:.5rem; background:#0b1220; border:1px solid #203045; color:#cce7f2; border-radius:12px; padding:.35rem .6rem; font-size:.85rem; }}
 .card {{ background: var(--panel); border:1px solid var(--line); border-radius:12px; padding: .9rem .95rem; }}
 .banner {{ border-left: 6px solid {ACCENT}; background:#1a2230; color:#e2e8f0; padding:.75rem .9rem; border-radius:10px; font-size:.98rem; }}
-.brand {{ display:flex; align-items:center; gap:.65rem; background:#0e141d; border:1px solid #1e2a3a; border-radius:10px; padding:.45rem .6rem; }}
-.tbl table {{ border-collapse:collapse; width:100% }}
-.tbl th, .tbl td {{ border-bottom:1px solid var(--line); padding:.5rem .6rem }}
-.tbl th {{ color:#cbd5e1; font-weight:700; text-transform:uppercase; font-size:.78rem; letter-spacing:.06em }}
-.btn-primary button {{ background:{ACCENT} !important; color:{'#111'} !important; font-weight:800 !important; }}
-.slider-tip {{ color:var(--muted); font-size:.85rem }}
-a, .stMarkdown a {{ color:{PRIMARY} !important }}
-.map-wrap {{ display:flex; align-items:center; gap:.5rem; }}
-.map-wrap img {{ border-radius:6px; border:1px solid #1e2a3a; }}
+.brand {{ display:flex; align-items:flex-start; gap:.65rem; background:#0e141d; border:1px solid #1e2a3a; border-radius:10px; padding:.75rem .8rem; width:100% }}
+.brand h4 {{ margin:0 0 .25rem 0; font-size:1rem; color:#fff }}
+.brand .muted {{ color:#a9bacb }}
+.brand .sub {{ color:#93b2c6; font-size:.85rem }}
+.grid {{ display:grid; grid-template-columns: repeat(4, minmax(0,1fr)); gap:.6rem; }}
+.tune ul {{ margin:.5rem 0 0 1rem; padding:0; }}
+.small {{ font-size:.85rem; color:#cbd5e1 }}
 .badge-red {{ border-left:6px solid {ERR}; background:#2a1518; color:#fee2e2; padding:.6rem .8rem; border-radius:10px; }}
 </style>
 """, unsafe_allow_html=True)
@@ -646,6 +644,19 @@ def plot_speed_mini(res):
     plt.title(T["speed_chart"]); plt.grid(alpha=.2)
     st.pyplot(fig)
 
+def brand_card_html(name, base_solid, form, topcoat, brushes):
+    return f"""
+    <div class='brand'>
+      <div style='flex:1'>
+        <h4>{name}</h4>
+        <div class='muted'>{T['base_solid']}: <b>{base_solid}</b></div>
+        <div class='sub'>Forma: {form}</div>
+        <div class='sub'>{T['topcoat_lbl']}: {topcoat}</div>
+        <div class='sub'>Spazzole: {brushes}</div>
+      </div>
+    </div>
+    """
+
 if btn:
     if windows_valid():
         with st.status(T["status_title"], expanded=False) as status:
@@ -687,6 +698,7 @@ if btn:
                 wind_eff_disp = disp["wind_eff"] if not use_fahrenheit else ms_to_kmh(disp["wind_eff"])
                 wind_unit_lbl = "m/s" if not use_fahrenheit else "km/h"
 
+                # --- Charts (restano) ---
                 tloc = disp["time_local"]
                 fig1 = plt.figure(figsize=(10,3))
                 plt.plot(tloc, disp["T2m"], label=Tair_lbl)
@@ -708,26 +720,7 @@ if btn:
 
                 plot_speed_mini(disp)
 
-                show = pd.DataFrame({
-                    T["hour"]:    disp["time_local"].dt.strftime("%Y-%m-%d %H:%M"),
-                    Tair_lbl: disp["T2m"].round(1),
-                    Td_lbl:     disp["td"].round(1),
-                    T["rh"]:      disp["RH"].round(0),
-                    Tw_lbl:     disp["Tw"].round(1),
-                    f"{T['we'].split('(')[0].strip()} ({wind_unit_lbl})":  wind_eff_disp.round(1),
-                    T["cloud"]:  (disp["cloud"]*100).round(0),
-                    T["sw"]:  disp["SW_down"].round(0),
-                    T["prp"]:  disp["prp_mmph"].round(2),
-                    T["ptype"]:    disp["ptyp"].map({"none":T["none"],"rain":T["rain"],"snow":T["snow"],"mixed":T["mixed"]}),
-                    Tsurf_lbl: disp["T_surf"].round(1),
-                    Ttop_lbl:  disp["T_top5"].round(1),
-                    T["lw"]:  disp["liq_water_pct"].round(1),
-                    T["speed"]: disp["speed_index"].astype(int),
-                    T["lead"]:  disp["lead_h"]
-                })
-                st.markdown("<div class='card tbl'>", unsafe_allow_html=True)
-                st.dataframe(show, use_container_width=True, hide_index=True)
-                st.markdown("</div>", unsafe_allow_html=True)
+                # >>> RIMOSSA LA TABELLA "show" — tutto passa in card <<<
 
                 blocks = {"A":(A_start,A_end),"B":(B_start,B_end),"C":(C_start,C_end)}
                 t_med_map = {}
@@ -753,65 +746,32 @@ if btn:
                     st.markdown(
                         f"<div class='banner'><b>{T['cond']}</b> {k} · "
                         f"<b>T_neve med</b> {t_med:.1f}{'°F' if use_fahrenheit else '°C'} · <b>H₂O liquida</b> {float(W['liq_water_pct'].mean()):.1f}% · "
-                        f"<b>Affidabilità</b> ≈ {rel}%</div>",
+                        f"<b>Affidabilità</b> ≈ {rel}% · "
+                        f"<b>V eff</b> {((W['wind'] if not use_fahrenheit else ms_to_kmh(W['wind'])).mean()):.1f} {wind_unit_lbl}</div>",
                         unsafe_allow_html=True
                     )
                     t_for_struct = t_med if not use_fahrenheit else (t_med-32)*5/9
                     st.markdown(f"**{T['struct']}** {recommended_structure(t_for_struct)}")
                     wax_form, brush_seq, use_topcoat = wax_form_and_brushes(t_for_struct, rh_med)
 
-                    # >>> NEW: Tabella riepilogo BASE SOLIDA per marca (e topcoat) <<<
-                    base_rows = []
+                    # >>> CARD GRID PER BRAND (Base solida + Topcoat + Forma + Spazzole) <<<
+                    st.markdown("<div class='grid'>", unsafe_allow_html=True)
                     for (name, solid_bands, liquid_bands) in BRANDS:
-                        rec_solid = pick_wax(solid_bands, t_for_struct, rh_med)
-                        top = (pick_liquid(liquid_bands, t_for_struct, rh_med) if use_topcoat else (T["none"] if lang=="IT" else "—"))
-                        base_rows.append([name, rec_solid, top if use_topcoat else ( "non necessario" if lang=="IT" else "not needed")])
-                    st.table(pd.DataFrame(base_rows, columns=["Brand", T["base_solid"], T["topcoat_lbl"]]))
+                        rec_solid  = pick_wax(solid_bands, t_for_struct, rh_med)  # BASE SOLIDA
+                        topcoat = (pick_liquid(liquid_bands, t_for_struct, rh_med) if use_topcoat else ("non necessario" if lang=="IT" else "not needed"))
+                        html = brand_card_html(name, rec_solid, wax_form, topcoat, brush_seq)
+                        st.markdown(html, unsafe_allow_html=True)
+                    st.markdown("</div>", unsafe_allow_html=True)
 
-                    st.markdown(f"**{T['waxes']}**")
-                    ccols1 = st.columns(4); ccols2 = st.columns(4)
-                    for i,(name,solid_bands,liquid_bands) in enumerate(BRANDS[:4]):
-                        rec_solid  = pick_wax(solid_bands, t_for_struct, rh_med)
-                        topcoat = pick_liquid(liquid_bands, t_for_struct, rh_med) if use_topcoat else "—"
-                        extra_liq = f"<div style='color:#93b2c6;font-size:.85rem'>Topcoat: {topcoat if use_topcoat else 'non necessario'}</div>"
-                        ccols1[i].markdown(
-                            f"<div class='brand'><div><b>{name}</b>"
-                            f"<div style='color:#a9bacb'>Base: {rec_solid}</div>"
-                            f"<div style='color:#93b2c6;font-size:.85rem'>Forma: {wax_form}</div>"
-                            f"{extra_liq}"
-                            f"<div style='color:#93b2c6;font-size:.85rem'>Spazzole: {brush_seq}</div>"
-                            f"</div></div>", unsafe_allow_html=True
-                        )
-                    for i,(name,solid_bands,liquid_bands) in enumerate(BRANDS[4:]):
-                        rec_solid  = pick_wax(solid_bands, t_for_struct, rh_med)
-                        topcoat = pick_liquid(liquid_bands, t_for_struct, rh_med) if use_topcoat else "—"
-                        extra_liq = f"<div style='color:#93b2c6;font-size:.85rem'>Topcoat: {topcoat if use_topcoat else 'non necessario'}</div>"
-                        ccols2[i].markdown(
-                            f"<div class='brand'><div><b>{name}</b>"
-                            f"<div style='color:#a9bacb'>Base: {rec_solid}</div>"
-                            f"<div style='color:#93b2c6;font-size:.85rem'>Forma: {wax_form}</div>"
-                            f"{extra_liq}"
-                            f"<div style='color:#93b2c6;font-size:.85rem'>Spazzole: {brush_seq}</div>"
-                            f"</div></div>", unsafe_allow_html=True
-                        )
-
-                    mini = pd.DataFrame({
-                        T["hour"]: W["time_local"].dt.strftime("%H:%M"),
-                        "T aria" if lang=="IT" else "Air T": W["T2m"].round(1),
-                        "T neve" if lang=="IT" else "Snow T": W["T_surf"].round(1),
-                        "UR%" if lang=="IT" else "RH%":   W["RH"].round(0),
-                        ("V (m/s)" if not use_fahrenheit else "V (km/h)"): (W["wind"] if not use_fahrenheit else ms_to_kmh(W["wind"])).round(1),
-                        T["ptype"]:   W["ptyp"].map({"none":T["none"],"snow":T["snow"],"rain":T["rain"],"mixed":T["mixed"]})
-                    })
-                    st.dataframe(mini, use_container_width=True, hide_index=True)
-
-                    st.markdown("**Tuning per disciplina (SIDE/BASE):**")
+                    # >>> CARD COMPATTA PER TUNING DISCIPLINE (al posto della tabella) <<<
                     rows=[]
                     for d in ["SL","GS","SG","DH"]:
                         fam, side, base = tune_for(t_for_struct, d)
-                        rows.append([d, fam, f"{side:.1f}°", f"{base:.1f}°"])
-                    st.table(pd.DataFrame(rows, columns=["Disciplina","Struttura","Lamina SIDE (°)","Lamina BASE (°)"]))
+                        rows.append((d, fam, f"{side:.1f}°", f"{base:.1f}°"))
+                    tune_list = "".join([f"<li><b>{d}</b>: {fam} — SIDE {side} · BASE {base}</li>" for d,fam,side,base in rows])
+                    st.markdown(f"<div class='card tune'><div><b>Tuning per disciplina</b></div><ul class='small'>{tune_list}</ul></div>", unsafe_allow_html=True)
 
+                # CSV/PDF download restano disponibili
                 csv = disp.copy()
                 csv["time_local"] = csv["time_local"].dt.strftime("%Y-%m-%d %H:%M")
                 csv = csv.drop(columns=["time_utc"])
