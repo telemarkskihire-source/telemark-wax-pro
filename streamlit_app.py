@@ -577,11 +577,41 @@ def osm_tile(lat, lon, z=9):
     r = requests.get(url, headers=UA, timeout=8); r.raise_for_status()
     return r.content
 
+# --- Reverse geocoding per aggiornare l’etichetta quando si impostano coordinate manuali ---
+def reverse_geocode(lat, lon):
+    try:
+        def go():
+            return requests.get(
+                "https://nominatim.openstreetmap.org/reverse",
+                params={"format":"json","lat":lat,"lon":lon,"zoom":12,"addressdetails":1},
+                headers=UA, timeout=8
+            )
+        r = _retry(go); r.raise_for_status()
+        j = r.json(); addr = j.get("address",{}) or {}
+        lab = concise_label(addr, j.get("display_name",""))
+        cc = addr.get("country_code","")
+        lab = f"{flag(cc)}  {lab}"
+        return lab
+    except:
+        return f"{lat:.5f}, {lon:.5f}"
+
 try:
     tile = osm_tile(lat,lon, z=9)
     st.image(tile, caption=T["map"], width=220)
 except:
     pass
+
+# --- Piccolo pannello opzionale: posizionamento manuale preciso ---
+with st.expander("➕ Imposta coordinate manuali / Set precise coordinates", expanded=False):
+    c_lat, c_lon = st.columns(2)
+    new_lat = c_lat.number_input("Lat", value=float(lat), format="%.6f")
+    new_lon = c_lon.number_input("Lon", value=float(lon), format="%.6f")
+    if st.button("Imposta / Set"):
+        st.session_state["lat"] = float(new_lat)
+        st.session_state["lon"] = float(new_lon)
+        new_label = reverse_geocode(float(new_lat), float(new_lon))
+        st.session_state["place_label"] = new_label
+        st.rerun()
 
 # ---------------------- DATE & WINDOWS + DOWNSCALING ALT ----------------------
 cdate, calt = st.columns([1,1])
