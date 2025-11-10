@@ -72,7 +72,9 @@ L = {
         "offset":"Calibrazione pista (offset termico °C)",
         "speed_chart":"Indice scorrevolezza (mini)",
         "lang":"Lingua","unit":"Unità","unit_c":"°C / m/s","unit_f":"°F / km/h",
-        "map":"Mappa (selezione)"
+        "map":"Mappa (selezione)",
+        "base_solid":"Base solida",
+        "topcoat_lbl":"Topcoat"
     },
     "en": {
         "country":"Country (search prefilter)",
@@ -107,7 +109,9 @@ L = {
         "offset":"Track calibration (thermal offset °C)",
         "speed_chart":"Speed index (mini)",
         "lang":"Language","unit":"Units","unit_c":"°C / m/s","unit_f":"°F / km/h",
-        "map":"Map (selection)"
+        "map":"Map (selection)",
+        "base_solid":"Base solid",
+        "topcoat_lbl":"Topcoat"
     }
 }
 
@@ -755,6 +759,14 @@ if btn:
                     t_for_struct = t_med if not use_fahrenheit else (t_med-32)*5/9
                     st.markdown(f"**{T['struct']}** {recommended_structure(t_for_struct)}")
                     wax_form, brush_seq, use_topcoat = wax_form_and_brushes(t_for_struct, rh_med)
+
+                    # >>> NEW: Tabella riepilogo BASE SOLIDA per marca (e topcoat) <<<
+                    base_rows = []
+                    for (name, solid_bands, liquid_bands) in BRANDS:
+                        rec_solid = pick_wax(solid_bands, t_for_struct, rh_med)
+                        top = (pick_liquid(liquid_bands, t_for_struct, rh_med) if use_topcoat else (T["none"] if lang=="IT" else "—"))
+                        base_rows.append([name, rec_solid, top if use_topcoat else ( "non necessario" if lang=="IT" else "not needed")])
+                    st.table(pd.DataFrame(base_rows, columns=["Brand", T["base_solid"], T["topcoat_lbl"]]))
 
                     st.markdown(f"**{T['waxes']}**")
                     ccols1 = st.columns(4); ccols2 = st.columns(4)
