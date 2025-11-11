@@ -34,8 +34,8 @@ hr {{ border:none; border-top:1px solid var(--line); margin:.75rem 0 }}
 .tune ul {{ margin:.5px 0 0 1rem; padding:0; }}
 .small {{ font-size:.85rem; color:#cbd5e1 }}
 .badge-red {{ border-left:6px solid {ERR}; background:#2a1518; color:#fee2e2; padding:.6rem .8rem; border-radius:10px; }}
-/* Evita che i controlli di Leaflet finiscano al centro */
-.leaflet-control {{ z-index: 1000; }}
+/* Assicura che i controlli Leaflet restino cliccabili sopra i layer */
+.leaflet-control {{ z-index: 1000 !important; }}
 </style>
 """, unsafe_allow_html=True)
 
@@ -639,7 +639,7 @@ except Exception:
 if HAS_FOLIUM:
     with st.expander(T["map"] + " — clicca sulla mappa per selezionare", expanded=True):
         # Mappa
-        m = folium.Map(location=[lat, lon], zoom_start=12, tiles=None, control_scale=True, prefer_canvas=True)
+        m = folium.Map(location=[lat, lon], zoom_start=12, tiles=None, control_scale=True, prefer_canvas=True, zoom_control=True)
 
         # Base maps
         TileLayer(tiles="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",
@@ -654,7 +654,7 @@ if HAS_FOLIUM:
             overlay=True, control=True, opacity=0.85
         ).add_to(m)
 
-        # Piste vettoriali via Overpass (no download da parte dell'utente)
+        # Piste vettoriali via Overpass
         try:
             gj = fetch_pistes_geojson(lat, lon, dist_km=30)
             if gj["features"]:
@@ -670,15 +670,21 @@ if HAS_FOLIUM:
         # Marker posizione corrente
         Marker([lat, lon], tooltip=place_label, icon=folium.Icon(color="lightgray")).add_to(m)
 
-        # Controlli compatti in basso a sinistra (non intralciano i click)
+        # Controlli
         MousePosition().add_to(m)
         LayerControl(position="bottomleft", collapsed=True).add_to(m)
 
-        # Cattura click (niente marker aggiuntivi client-side)
-        out = st_folium(m, height=420, use_container_width=True, key="map", returned_objects=[])
+        # Render + click
+        out = st_folium(
+            m,
+            height=420,
+            use_container_width=True,
+            key="map_widget",
+            returned_objects=["last_clicked"]  # <-- garantisce il ritorno del click
+        )
 
         # Aggiorna coordinate su click
-        click = (out.get("last_clicked") or {})
+        click = (out or {}).get("last_clicked") or {}
         if click:
             new_lat = float(click.get("lat")); new_lon = float(click.get("lng"))
             st.session_state["lat"] = new_lat
@@ -864,7 +870,7 @@ if btn:
                     if W.empty:
                         st.info(T["nodata"]); continue
                     t_med = float(W["T_surf"].mean()); t_med_map[L]=round(t_med,1)
-                    rh_med = float(W["RH"].mean())
+                    rh_med = float(W["RH"].mean"])
                     any_alert = ((W["T_surf"] > (-0.5 if not use_fahrenheit else c_to_f(-0.5))) & (W["RH"]>85)).any()
                     if any_alert:
                         st.markdown(f"<div class='badge-red'>⚠ {T['alert'].format(lbl=L)}</div>", unsafe_allow_html=True)
@@ -916,4 +922,3 @@ if btn:
                 status.update(label=f"Errore HTTP: {e}", state="error", expanded=True)
             except Exception as e:
                 status.update(label=f"Errore: {e}", state="error", expanded=True)
-```0
