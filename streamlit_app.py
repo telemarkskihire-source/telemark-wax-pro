@@ -322,7 +322,7 @@ def noaa_bias_correction(df, lat, lon):
 # ---------------------- DATE & WINDOWS + DOWNSCALING ALT ----------------------
 def build_df(js, hours):
     h = js["hourly"]; df = pd.DataFrame(h)
-    df["time"] = pd.to_datetime(df["time"], utc=True)  # tz-aware UTC
+    df["time"] = pd.to_datetime(df["time"], utc=True)
     now0 = pd.Timestamp.now(tz="UTC").floor("H")
     df = df[df["time"] >= now0].head(int(hours)).reset_index(drop=True)
 
@@ -332,7 +332,7 @@ def build_df(js, hours):
     out["RH"] = df["relative_humidity_2m"].astype(float) if "relative_humidity_2m" in df else np.full(len(df), np.nan)
     out["td"] = (df["dew_point_2m"].astype(float) if "dew_point_2m" in df else out["T2m"].astype(float))
     out["cloud"] = (df["cloudcover"].astype(float)/100).clip(0,1) if "cloudcover" in df else np.zeros(len(df))
-    out["wind"] = (df["windspeed_10m"].astype(float)/3.6) if "windspeed_10m" in df else np.zeros(len(df))  # m/s
+    out["wind"] = (df["windspeed_10m"].astype(float)/3.6) if "windspeed_10m" in df else np.zeros(len(df))
     out["sunup"] = df["is_day"].astype(int) if "is_day" in df else np.zeros(len(df), dtype=int)
     out["prp_mmph"] = df["precipitation"].astype(float) if "precipitation" in df else np.zeros(len(df))
     out["rain"] = df["rain"].astype(float) if "rain" in df else np.zeros(len(df))
@@ -418,7 +418,7 @@ def snow_temperature_model(X: pd.DataFrame, dt_hours=1.0):
     radiation_bonus = np.clip(X["SW_down"]/600, 0, 1)*8
     wind_pen        = np.clip(X["wind"]/10, 0, 1)*10
     wet_pen         = np.clip(X["liq_water_pct"]/6, 0, 1)*25
-    base_speed      = 55 + near_zero_bonus + radiation_bonus + humidity_bonus
+    base_speed      = 55 + near_zero_bonus + humidity_bonus + radiation_bonus
     X["speed_index"] = np.clip(base_speed - wind_pen - wet_pen, 0, 100).round(0)
     return X
 
@@ -595,7 +595,7 @@ def reverse_geocode(lat, lon):
     except:
         return f"{lat:.5f}, {lon:.5f}"
 
-# --- Mappa interattiva con selezione clic ---
+# --- Mappa interattiva: selezione con click + Satellite layer ---
 HAS_FOLIUM = False
 try:
     from streamlit_folium import st_folium
@@ -605,13 +605,27 @@ except Exception:
     HAS_FOLIUM = False
 
 if HAS_FOLIUM:
-    with st.expander(T["map"] + " — clicca per scegliere", expanded=True):
-        m = folium.Map(location=[lat, lon], zoom_start=12, tiles="CartoDB positron")
+    with st.expander(T["map"] + " — clicca per scegliere (una pressione sulla mappa)", expanded=True):
+        # Selettore basemap
+        basemap = st.radio("Basemap", ["Strade (CartoDB)", "Satellite (Esri)", "OSM classica"], horizontal=True, index=0)
+        tiles_init = "CartoDB positron" if basemap=="Strade (CartoDB)" else "OpenStreetMap"
+        m = folium.Map(location=[lat, lon], zoom_start=12, tiles=tiles_init, control_scale=True)
+
+        # Aggiungo i layer alternativi (con controllo)
+        folium.TileLayer("CartoDB positron", name="Strade (CartoDB)", control=True).add_to(m)
+        folium.TileLayer(
+            tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+            attr="Esri World Imagery", name="Satellite (Esri)", control=True
+        ).add_to(m)
+        folium.TileLayer("OpenStreetMap", name="OSM classica", control=True).add_to(m)
+
+        # Marker posizione corrente e popup per clic
         folium.Marker([lat, lon], tooltip=place_label).add_to(m)
-        # opzionale: mostra lat/lon al click come popup
-        folium.LatLngPopup().add_to(m)
-        # *** FIX: chiediamo esplicitamente last_clicked ***
-        out = st_folium(m, height=360, width=None, returned_objects=["last_clicked"], key="map_click")
+        m.add_child(folium.LatLngPopup())
+        folium.LayerControl(position="topright").add_to(m)
+
+        out = st_folium(m, height=420, use_container_width=True, key="map_select")
+        # Se l'utente clicca sulla mappa, out["last_clicked"] contiene lat/lng
         if out and out.get("last_clicked"):
             new_lat = float(out["last_clicked"]["lat"])
             new_lon = float(out["last_clicked"]["lng"])
@@ -681,7 +695,7 @@ def build_pdf_report(res, place_label, t_med_map, wax_cards_html):
     ax0 = fig.add_subplot(gs[0,0]); ax1 = fig.add_subplot(gs[1:3,0]); ax2 = fig.add_subplot(gs[3:4,0]); ax3 = fig.add_subplot(gs[4:5,0])
     ax4 = fig.add_subplot(gs[5:6,0]); ax5 = fig.add_subplot(gs[6:7,0])
     fig.suptitle(f"Telemark · Pro Wax & Tune — {place_label}", fontsize=12, y=0.995)
-    tloc = res["time_local"].dt.tz_localize(None)  # <-- naive per il PDF
+    tloc = res["time_local"].dt.tz_localize(None)
     ax1.plot(tloc, res["T2m"], label="T aria"); ax1.plot(tloc, res["T_surf"], label="T neve"); ax1.plot(tloc, res["T_top5"], label="Top 5mm")
     ax1.set_title("Temperature"); ax1.grid(alpha=.2); ax1.legend(fontsize=8)
     ax2.bar(tloc, res["prp_mmph"], width=0.03); ax2.set_title("Precipitazione (mm/h)"); ax2.grid(alpha=.2)
@@ -696,7 +710,7 @@ def build_pdf_report(res, place_label, t_med_map, wax_cards_html):
 
 def plot_speed_mini(res):
     fig = plt.figure(figsize=(6,2.2))
-    plt.plot(res["time_local"].dt.tz_localize(None), res["speed_index"])  # <-- naive
+    plt.plot(res["time_local"].dt.tz_localize(None), res["speed_index"])
     plt.title(T["speed_chart"]); plt.grid(alpha=.2)
     st.pyplot(fig); plt.close(fig)
 
@@ -742,7 +756,7 @@ if btn:
                     radiation_bonus = np.clip(res["SW_down"]/600, 0, 1)*8
                     wind_pen        = np.clip(res["wind"]/10, 0, 1)*10
                     wet_pen         = np.clip(res["liq_water_pct"]/6, 0, 1)*25
-                    base_speed      = 55 + near_zero_bonus + radiation_bonus + humidity_bonus
+                    base_speed      = 55 + near_zero_bonus + humidity_bonus + radiation_bonus
                     res["speed_index"] = np.clip(base_speed - wind_pen - wet_pen, 0, 100).round(0)
 
                 disp = res.copy()
@@ -757,7 +771,7 @@ if btn:
 
                 wind_unit_lbl = "m/s" if not use_fahrenheit else "km/h"
 
-                # --- Charts (timezone-naive per robustezza plotting) ---
+                # --- Charts ---
                 tloc = disp["time_local"].dt.tz_localize(None)
                 fig1 = plt.figure(figsize=(10,3))
                 plt.plot(tloc, disp["T2m"], label=Tair_lbl)
@@ -782,7 +796,7 @@ if btn:
                 if show_debug:
                     st.info(f"Rows: {len(disp)} · time_local: {disp['time_local'].min()} → {disp['time_local'].max()}")
 
-                # --- Blocchi & Cards brand (con loghi) ---
+                # --- Blocchi & Cards brand ---
                 blocks = {"A":(A_start,A_end),"B":(B_start,B_end),"C":(C_start,C_end)}
                 t_med_map = {}
                 for L,(s,e) in blocks.items():
