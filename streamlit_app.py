@@ -559,6 +559,8 @@ def persist(key, default):
 
 lat = persist("lat", 45.831); lon = persist("lon", 7.730)
 place_label = persist("place_label", "🇮🇹  Champoluc, Valle d’Aosta — IT")
+
+# Se arriva una selezione dalla searchbox aggiorna coordinata (solo se la searchbox NON è stata azzerata da mappa/manuel)
 if selected and "|||" in selected and "_options" in st.session_state:
     info = st.session_state._options.get(selected)
     if info:
@@ -600,7 +602,6 @@ def reverse_geocode(lat, lon):
 # ---------- PISTE (Overpass) ----------
 @st.cache_data(ttl=3*3600, show_spinner=False)
 def fetch_pistes_geojson(lat:float, lon:float, dist_km:int=30):
-    # OSM piste:type nelle vicinanze (downhill, nordic, skitour, ecc.)
     query = f"""
     [out:json][timeout:25];
     (
@@ -614,18 +615,16 @@ def fetch_pistes_geojson(lat:float, lon:float, dist_km:int=30):
     data = r.json().get("elements", [])
     feats=[]
     for el in data:
-        props = {
-            "id": el.get("id"),
-            "piste:type": (el.get("tags") or {}).get("piste:type",""),
-            "name": (el.get("tags") or {}).get("name","")
-        }
+        props = {"id": el.get("id"),
+                 "piste:type": (el.get("tags") or {}).get("piste:type",""),
+                 "name": (el.get("tags") or {}).get("name","")}
         if "geometry" in el:
             coords = [(g["lon"], g["lat"]) for g in el["geometry"]]
             geom = {"type":"LineString","coordinates":coords}
             feats.append({"type":"Feature","geometry":geom,"properties":props})
     return {"type":"FeatureCollection","features":feats}
 
-# --- Mappa interattiva (Leaflet/Folium) con Satellite + piste ---
+# --- Mappa interattiva ---
 HAS_FOLIUM = False
 try:
     from streamlit_folium import st_folium
@@ -638,23 +637,19 @@ except Exception:
 
 if HAS_FOLIUM:
     with st.expander(T["map"] + " — clicca sulla mappa per selezionare", expanded=True):
-        # Mappa
         m = folium.Map(location=[lat, lon], zoom_start=12, tiles=None, control_scale=True, prefer_canvas=True, zoom_control=True)
 
-        # Base maps
-        TileLayer(tiles="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",
+        TileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",
                   name="Strade", attr="© OSM", overlay=False, control=True).add_to(m)
-        TileLayer(tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+        TileLayer("https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
                   name="Satellite", attr="Tiles © Esri", overlay=False, control=True).add_to(m)
 
-        # Piste overlays (tiles)
         TileLayer(
             tiles="https://tiles.opensnowmap.org/pistes/{z}/{x}/{y}.png",
             name="Piste overlay (tiles)", attr="© OpenSnowMap.org contributors",
             overlay=True, control=True, opacity=0.85
         ).add_to(m)
 
-        # Piste vettoriali via Overpass
         try:
             gj = fetch_pistes_geojson(lat, lon, dist_km=30)
             if gj["features"]:
@@ -667,14 +662,11 @@ if HAS_FOLIUM:
         except Exception:
             pass
 
-        # Marker posizione corrente
         Marker([lat, lon], tooltip=place_label, icon=folium.Icon(color="lightgray")).add_to(m)
 
-        # Controlli
         MousePosition().add_to(m)
         LayerControl(position="bottomleft", collapsed=True).add_to(m)
 
-        # Render + click
         out = st_folium(
             m,
             height=420,
@@ -683,13 +675,14 @@ if HAS_FOLIUM:
             returned_objects=["last_clicked"]
         )
 
-        # Aggiorna coordinate su click
         click = (out or {}).get("last_clicked") or {}
         if click:
             new_lat = float(click.get("lat")); new_lon = float(click.get("lng"))
             st.session_state["lat"] = new_lat
             st.session_state["lon"] = new_lon
             st.session_state["place_label"] = reverse_geocode(new_lat, new_lon)
+            # IMPORTANT: evita che la searchbox riscriva di nuovo le coordinate
+            if "place" in st.session_state: del st.session_state["place"]
             st.success(f"Posizione aggiornata: {st.session_state['place_label']}")
             st.rerun()
 else:
@@ -699,7 +692,7 @@ else:
     except:
         pass
 
-# --- Pannello opzionale: posizionamento manuali ---
+# --- Pannello opzionale: coordinate manuali ---
 with st.expander("➕ Imposta coordinate manuali / Set precise coordinates", expanded=False):
     c_lat, c_lon = st.columns(2)
     new_lat = c_lat.number_input("Lat", value=float(lat), format="%.6f")
@@ -707,8 +700,8 @@ with st.expander("➕ Imposta coordinate manuali / Set precise coordinates", exp
     if st.button("Imposta / Set"):
         st.session_state["lat"] = float(new_lat)
         st.session_state["lon"] = float(new_lon)
-        new_label = reverse_geocode(float(new_lat), float(new_lon))
-        st.session_state["place_label"] = new_label
+        st.session_state["place_label"] = reverse_geocode(float(new_lat), float(new_lon))
+        if "place" in st.session_state: del st.session_state["place"]  # idem: non sovrascrivere
         st.rerun()
 
 # ---------------------- DATE & WINDOWS + DOWNSCALING ALT ----------------------
@@ -716,7 +709,7 @@ cdate, calt = st.columns([1,1])
 with cdate:
     target_day: date = st.date_input(T["ref_day"], value=persist("ref_day", date.today()), key="ref_day")
 with calt:
-    pista_alt = st.number_input(T["alt_lbl"], min_value=0, max_value=5000, value=int(elev or 1800), step=50, key="alt_m")
+    pista_alt = st.number_input(T["alt_lbl"], min_value=0, max_value=5000, value=int(get_elev(persist("lat",lat), persist("lon",lon)) or 1800), step=50, key="alt_m")
     if pista_alt<300:
         st.warning(T["low_alt"])
 
@@ -829,7 +822,7 @@ if btn:
 
                 wind_unit_lbl = "m/s" if not use_fahrenheit else "km/h"
 
-                # --- Charts (timezone-naive per robustezza plotting) ---
+                # --- Charts ---
                 tloc = disp["time_local"].dt.tz_localize(None)
                 fig1 = plt.figure(figsize=(10,3))
                 plt.plot(tloc, disp["T2m"], label=Tair_lbl)
@@ -854,7 +847,7 @@ if btn:
                 if show_debug:
                     st.info(f"Rows: {len(disp)} · time_local: {disp['time_local'].min()} → {disp['time_local'].max()}")
 
-                # --- Blocchi & Cards brand (con loghi) ---
+                # --- Blocchi & Cards brand ---
                 blocks = {"A":(A_start,A_end),"B":(B_start,B_end),"C":(C_start,C_end)}
                 t_med_map = {}
                 for L,(s,e) in blocks.items():
@@ -870,7 +863,7 @@ if btn:
                     if W.empty:
                         st.info(T["nodata"]); continue
                     t_med = float(W["T_surf"].mean()); t_med_map[L]=round(t_med,1)
-                    rh_med = float(W["RH"].mean())   # <-- FIX PARENTHESIS
+                    rh_med = float(W["RH"].mean())  # FIX
                     any_alert = ((W["T_surf"] > (-0.5 if not use_fahrenheit else c_to_f(-0.5))) & (W["RH"]>85)).any()
                     if any_alert:
                         st.markdown(f"<div class='badge-red'>⚠ {T['alert'].format(lbl=L)}</div>", unsafe_allow_html=True)
@@ -897,7 +890,6 @@ if btn:
                         st.markdown(html, unsafe_allow_html=True)
                     st.markdown("</div>", unsafe_allow_html=True)
 
-                    # Tuning per disciplina
                     rows=[]
                     for d in ["SL","GS","SG","DH"]:
                         fam, side, base = tune_for(t_for_struct, d)
