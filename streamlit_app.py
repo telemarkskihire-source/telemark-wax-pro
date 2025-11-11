@@ -213,13 +213,33 @@ def _retry(func, attempts=2, sleep=0.8):
             time.sleep(sleep*(1.5**i))
 
 # ---------------------- SEARCH with COUNTRY prefilter ----------------------
-COUNTRIES = {"Italia":"IT","Svizzera":"CH","Francia":"FR","Austria":"AT","Germania":"DE","Spagna":"ES","Norvegia":"NO","Svezia":"SE"}
+# ---------------------- SEARCH with COUNTRY prefilter ----------------------
+COUNTRIES = {
+    "Italia":"IT","Svizzera":"CH","Francia":"FR","Austria":"AT",
+    "Germania":"DE","Spagna":"ES","Norvegia":"NO","Svezia":"SE"
+}
+
+# Nominatim richiede un UA chiaro e (meglio) un'email: metti NOMINATIM_EMAIL in st.secrets se puoi
+NOMINATIM_EMAIL = st.secrets.get("NOMINATIM_EMAIL", None)
+BASE_UA = "telemark-wax-pro/1.0 (+https://telemarkskihire.com)"
+HEADERS_NOM = {
+    "User-Agent": BASE_UA,
+    "Accept": "application/json",
+    **({"Referer":"https://telemarkskihire.com"} if True else {}),
+    **({"Accept-Language":"it,en;q=0.8"} if True else {}),
+}
+if NOMINATIM_EMAIL:
+    HEADERS_NOM["From"] = NOMINATIM_EMAIL  # conforme a policy Nominatim
+
 col_top = st.columns([2,1,1,1])
+
 with col_top[1]:
     sel_country = st.selectbox(T["country"], list(COUNTRIES.keys()), index=0, key="country_sel")
     iso2 = COUNTRIES[sel_country]
+
 with col_top[2]:
     offset = st.slider(T["offset"], -1.5, 1.5, 0.0, 0.1, key="cal_offset")
+
 with col_top[3]:
     if st.button(T["reset"], use_container_width=True):
         for k in ["A_s","A_e","B_s","B_e","C_s","C_e","place","lat","lon","place_label","hours","country_sel","cal_offset","ref_day","alt_m",
@@ -227,88 +247,97 @@ with col_top[3]:
             if k in st.session_state: del st.session_state[k]
         st.rerun()
 
-# --- Ricerca località robusta (Open-Meteo primary, Nominatim fallback) ---
-def _lang_code():
-    return "it" if (st.session_state.get("lang_sel") or (1 if T is L["it"] else 0)) else "en"
+def _concise_label_from_addr(addr:dict, fallback:str)->str:
+    name = (addr.get("neighbourhood") or addr.get("hamlet") or addr.get("village")
+            or addr.get("town") or addr.get("city") or fallback)
+    admin1 = addr.get("state") or addr.get("region") or addr.get("county") or ""
+    parts = [p for p in [name, admin1] if p]
+    return ", ".join([p for p in parts if p])
 
-@st.cache_data(ttl=600, show_spinner=False)
-def _geocode_openmeteo(q: str, iso2: str, lang: str):
-    if not q: return []
-    r = requests.get(
-        "https://geocoding-api.open-meteo.com/v1/search",
-        params={"name": q, "count": 12, "language": lang, "format": "json", "country": iso2},
-        headers=UA, timeout=8
-    )
-    r.raise_for_status()
-    j = r.json() or {}
-    results = j.get("results") or []
-    out = []
-    for it in results:
-        name = it.get("name") or ""
-        admin1 = it.get("admin1") or it.get("admin2") or ""
-        cc = (it.get("country_code") or "").upper()
-        lat = float(it.get("latitude")); lon = float(it.get("longitude"))
-        lab_core = ", ".join([p for p in [name, admin1] if p])
-        lab = f"{flag(cc)}  {lab_core} — {cc}"
-        out.append({"label": lab, "lat": lat, "lon": lon})
-    return out
-
-@st.cache_data(ttl=600, show_spinner=False)
-def _geocode_nominatim(q: str, iso2: str):
-    r = requests.get(
-        "https://nominatim.openstreetmap.org/search",
-        params={"q": q, "format": "json", "limit": 12, "addressdetails": 1, "countrycodes": iso2.lower(), "accept-language": _lang_code()},
-        headers={**UA, "Accept-Language": _lang_code()},
-        timeout=8
-    )
-    r.raise_for_status()
-    out = []
-    for it in r.json():
-        addr = it.get("address", {}) or {}
-        lab_core = concise_label(addr, it.get("display_name", ""))
-        cc = (addr.get("country_code") or "").upper()
-        lat = float(it.get("lat", 0)); lon = float(it.get("lon", 0))
-        lab = f"{flag(cc)}  {lab_core}{(' — '+cc) if cc else ''}"
-        out.append({"label": lab, "lat": lat, "lon": lon})
-    return out
-
-# piccolo debounce per la digitazione
-def _debounced(ident="search", secs=0.25):
-    now = time.time()
-    key = f"__deb_{ident}"
-    last = st.session_state.get(key, 0)
-    if now - last < secs:
-        return False
-    st.session_state[key] = now
-    return True
-
-def place_search(q: str):
-    if not q or len(q.strip()) < 2 or not _debounced("place", 0.25):
+def _search_nominatim(q:str, country_iso2:str):
+    if not q or len(q.strip()) < 2:
         return []
     try:
-        lang_code = "it" if (T is L["it"]) else "en"
-        pri = _geocode_openmeteo(q.strip(), iso2, lang_code)
-        data = pri if pri else _geocode_nominatim(q.strip(), iso2)
+        def go():
+            return requests.get(
+                "https://nominatim.openstreetmap.org/search",
+                params={
+                    "q": q,
+                    "format": "json",
+                    "limit": 10,
+                    "addressdetails": 1,
+                    "countrycodes": country_iso2.lower(),  # filtro paese selezionato
+                },
+                headers=HEADERS_NOM, timeout=8
+            )
+        r = _retry(go); r.raise_for_status()
+        js = r.json() or []
+        out = []
+        for it in js:
+            addr = it.get("address",{}) or {}
+            lab_core = _concise_label_from_addr(addr, it.get("display_name",""))
+            cc = (addr.get("country_code") or "").upper()
+            lab = f"{flag(cc)}  {lab_core}" if cc else lab_core
+            lat = float(it.get("lat",0)); lon=float(it.get("lon",0))
+            key = f"{lab}|||{lat:.6f},{lon:.6f}"
+            out.append((key, {"lat":lat,"lon":lon,"label":lab,"addr":addr}))
+        return out
     except Exception:
-        try:
-            data = _geocode_nominatim(q.strip(), iso2)
-        except Exception:
-            data = []
-    # salva opzioni in sessione per recuperare lat/lon dopo la scelta
+        return []
+
+def _search_photon(q:str, country_iso2:str):
+    # Fallback (Komoot Photon). NB: non ha country filter server-side per ISO2, quindi filtriamo client-side.
+    if not q or len(q.strip()) < 2:
+        return []
+    try:
+        r = requests.get(
+            "https://photon.komoot.io/api",
+            params={"q": q, "limit": 10, "lang": "it"},
+            headers={"User-Agent": BASE_UA}, timeout=8
+        )
+        r.raise_for_status()
+        js = r.json() or {}
+        feats = js.get("features",[]) or []
+        out=[]
+        for f in feats:
+            props = f.get("properties",{}) or {}
+            cc = (props.get("countrycode") or props.get("country", "")).upper()
+            if cc and cc != country_iso2.upper():
+                continue
+            name = props.get("name") or props.get("city") or props.get("state") or ""
+            admin1 = props.get("state") or props.get("county") or ""
+            label_core = ", ".join([p for p in [name, admin1] if p])
+            lab = f"{flag(cc)}  {label_core}" if cc else label_core
+            lon, lat = f.get("geometry",{}).get("coordinates",[None,None])
+            if lat is None or lon is None: continue
+            key = f"{lab}|||{lat:.6f},{lon:.6f}"
+            out.append((key, {"lat":float(lat),"lon":float(lon),"label":lab,"addr":{}}))
+        return out
+    except Exception:
+        return []
+
+def search_places(q:str):
+    """Funzione usata da st_searchbox. Ritorna lista di stringhe-chiave e popola _options."""
+    q = (q or "").strip()
+    # crea la mappa ogni volta
     st.session_state._options = {}
-    out_labels = []
-    for it in data:
-        key = f"{it['label']}|||{it['lat']:.6f},{it['lon']:.6f}"
-        st.session_state._options[key] = it
-        out_labels.append(key)
-    return out_labels or ["— nessun risultato —"]
+    results = _search_nominatim(q, iso2)
+    if not results:
+        results = _search_photon(q, iso2)
+    keys=[]
+    for key, payload in results:
+        st.session_state._options[key] = payload
+        keys.append(key)
+    return keys
 
 with col_top[0]:
+    # debounce: evita flood; highlight: migliore UX
     selected = st_searchbox(
-        place_search,
+        search_function=search_places,
         key="place",
         placeholder=T["search_ph"],
         clear_on_submit=False,
+        debounce=400,
         default=None
     )
 
