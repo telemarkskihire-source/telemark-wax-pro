@@ -7,7 +7,7 @@ from datetime import datetime, date, time as dtime, timedelta
 from dateutil import tz
 from streamlit_searchbox import st_searchbox
 import matplotlib
-matplotlib.use("Agg")  # backend sicuro per Streamlit
+matplotlib.use("Agg")  # <-- backend sicuro per Streamlit
 import matplotlib.pyplot as plt
 
 # ---------------------- THEME (dark) ----------------------
@@ -79,8 +79,13 @@ L = {
         "base_solid":"Base solida",
         "topcoat_lbl":"Topcoat",
         "debug":"Mostra debug",
-        "slope":"Pendenza locale",
-        "aspect":"Esposizione"
+        # NEW (DEM)
+        "dem_hdr":"Esposizione & pendenza (DEM locale)",
+        "slope_deg":"Pendenza (°)",
+        "slope_pct":"Pendenza (%)",
+        "aspect_deg":"Esposizione (° da N)",
+        "aspect_dir":"Esposizione (bussola)",
+        "dem_err":"DEM non disponibile ora. Riprova tra poco."
     },
     "en": {
         "country":"Country (search prefilter)",
@@ -119,8 +124,13 @@ L = {
         "base_solid":"Base solid",
         "topcoat_lbl":"Topcoat",
         "debug":"Show debug",
-        "slope":"Local slope",
-        "aspect":"Aspect"
+        # NEW (DEM)
+        "dem_hdr":"Aspect & slope (local DEM)",
+        "slope_deg":"Slope (°)",
+        "slope_pct":"Slope (%)",
+        "aspect_deg":"Aspect (° from N)",
+        "aspect_dir":"Aspect (compass)",
+        "dem_err":"DEM unavailable now. Try again shortly."
     }
 }
 
@@ -204,7 +214,8 @@ with col_top[2]:
     offset = st.slider(T["offset"], -1.5, 1.5, 0.0, 0.1, key="cal_offset")
 with col_top[3]:
     if st.button(T["reset"], use_container_width=True):
-        for k in ["A_s","A_e","B_s","B_e","C_s","C_e","place","lat","lon","place_label","hours","country_sel","cal_offset","ref_day","alt_m"]:
+        for k in ["A_s","A_e","B_s","B_e","C_s","C_e","place","lat","lon","place_label","hours","country_sel","cal_offset","ref_day","alt_m",
+                  "slope_deg","slope_pct","aspect_deg","aspect_txt","_alt_sync_key"]:
             if k in st.session_state: del st.session_state[k]
         st.rerun()
 
@@ -263,9 +274,51 @@ def detect_timezone(lat, lon):
     r.raise_for_status()
     return r.json().get("timezone","Europe/Rome")
 
+# ---------------------- DEM (patch 3x3) & slope/aspect ----------------------
+@st.cache_data(ttl=6*3600, show_spinner=False)
+def dem_patch(lat: float, lon: float, spacing_m: int = 30, size: int = 3):
+    """Scarica un mini DEM 3x3 da Open-Meteo Elevation e restituisce la griglia Z e metadati."""
+    half = size // 2
+    dlat = spacing_m / 111320.0
+    dlon = spacing_m / (111320.0 * max(0.1, math.cos(math.radians(lat))))
+    lats, lons = [], []
+    for j in range(size):
+        for i in range(size):
+            lats.append(lat + (j - half) * dlat)
+            lons.append(lon + (i - half) * dlon)
+    params = {
+        "latitude": ",".join(f"{x:.6f}" for x in lats),
+        "longitude": ",".join(f"{x:.6f}" for x in lons),
+    }
+    r = requests.get("https://api.open-meteo.com/v1/elevation", params=params, headers=UA, timeout=10)
+    r.raise_for_status()
+    js = r.json()
+    elevs = js.get("elevation")
+    if not elevs or len(elevs) != size * size:
+        return None
+    Z = np.array(elevs, dtype=float).reshape(size, size)
+    return {"Z": Z, "spacing_m": spacing_m}
+
+def slope_aspect_from_dem(Z: np.ndarray, spacing_m: float):
+    """Metodo di Horn su finestra 3×3 per derivare pendenza e aspect (° da Nord, orario)."""
+    # Horn kernels
+    dzdx = ((Z[0,2] + 2*Z[1,2] + Z[2,2]) - (Z[0,0] + 2*Z[1,0] + Z[2,0])) / (8.0 * spacing_m)
+    dzdy = ((Z[2,0] + 2*Z[2,1] + Z[2,2]) - (Z[0,0] + 2*Z[0,1] + Z[0,2])) / (8.0 * spacing_m)
+    slope_rad = math.atan(math.hypot(dzdx, dzdy))
+    slope_deg = math.degrees(slope_rad)
+    slope_pct = math.tan(slope_rad) * 100.0
+    # aspect: azimuth da Nord in senso orario
+    aspect_rad = math.atan2(dzdx, dzdy)   # nota: invertito per avere 0° = Nord
+    aspect_deg = (math.degrees(aspect_rad) + 360.0) % 360.0
+    return float(slope_deg), float(slope_pct), float(aspect_deg)
+
+def aspect_to_compass(deg: float):
+    dirs = ["N","NNE","NE","ENE","E","ESE","SE","SSE","S","SSW","SW","WSW","W","WNW","NW","NNW"]
+    idx = int((deg + 11.25) // 22.5) % 16
+    return dirs[idx]
+
 # ---------------------- NOAA (optional robust bias) ----------------------
 NOAA_TOKEN = st.secrets.get("NOAA_TOKEN", None)
-
 @st.cache_data(ttl=24*3600, show_spinner=False)
 def _noaa_nearby_station(lat, lon, radius_m=25000, limit=3):
     if not NOAA_TOKEN: return []
@@ -324,21 +377,17 @@ def noaa_bias_correction(df, lat, lon):
     except Exception:
         return df
 
-# =================== METEO PIPELINE (funzioni ripristinate) ===================
+# ---------------------- METEO PIPELINE ----------------------
 def build_df(js, hours):
-    """Trasforma la risposta Open-Meteo in dataframe orario limitato a 'hours'."""
     h = js["hourly"]; df = pd.DataFrame(h)
     df["time"] = pd.to_datetime(df["time"], utc=True)
     now0 = pd.Timestamp.now(tz="UTC").floor("H")
     df = df[df["time"] >= now0].head(int(hours)).reset_index(drop=True)
-
     out = pd.DataFrame()
     out["time_utc"]   = df["time"]
     out["T2m"]        = df["temperature_2m"].astype(float)
-    out["RH"]         = (df["relative_humidity_2m"].astype(float)
-                         if "relative_humidity_2m" in df else np.full(len(df), np.nan))
-    out["td"]         = (df["dew_point_2m"].astype(float)
-                         if "dew_point_2m" in df else out["T2m"].astype(float))
+    out["RH"]         = df["relative_humidity_2m"].astype(float) if "relative_humidity_2m" in df else np.full(len(df), np.nan)
+    out["td"]         = (df["dew_point_2m"].astype(float) if "dew_point_2m" in df else out["T2m"].astype(float))
     out["cloud"]      = (df["cloudcover"].astype(float)/100).clip(0,1) if "cloudcover" in df else np.zeros(len(df))
     out["wind"]       = (df["windspeed_10m"].astype(float)/3.6) if "windspeed_10m" in df else np.zeros(len(df))  # m/s
     out["sunup"]      = df["is_day"].astype(int) if "is_day" in df else np.zeros(len(df), dtype=int)
@@ -574,63 +623,34 @@ if selected and "|||" in selected and "_options" in st.session_state:
 elev = get_elev(lat,lon)
 tzname = detect_timezone(lat,lon)
 
-# ---------------------- ALT SYNC ----------------------
-if st.session_state.get("_alt_sync_key") != (lat, lon):
+# ---------------------- ALT/DEM SYNC ----------------------
+coords_key = (round(lat,6), round(lon,6))
+if st.session_state.get("_alt_sync_key") != coords_key:
+    # aggiorna altitudine
     st.session_state["alt_m"] = int(elev) if elev is not None else st.session_state.get("alt_m", 1800)
-    st.session_state["_alt_sync_key"] = (lat, lon)
-
-# ---------------------- SLOPE & ASPECT (pendenza / esposizione) --------------
-def _meters_to_deg_lat(d_m):  # ~111.32 km/deg
-    return d_m / 111320.0
-
-def _meters_to_deg_lon(d_m, lat):
-    return d_m / (111320.0 * math.cos(math.radians(lat)) + 1e-9)
-
-@st.cache_data(ttl=6*3600, show_spinner=False)
-def sample_elevations(lat, lon, d_m=40):
-    """Preleva quota a centro, N, E, S, W e calcola pendenza (%) e aspect (°)."""
-    dlat = _meters_to_deg_lat(d_m)
-    dlon = _meters_to_deg_lon(d_m, lat)
-    pts = [
-        (lat, lon),               # C
-        (lat+dlat, lon),          # N
-        (lat, lon+dlon),          # E
-        (lat-dlat, lon),          # S
-        (lat, lon-dlon)           # W
-    ]
-    # chiama Open-Meteo Elevation per ogni punto
-    es = []
-    for la, lo in pts:
-        rr = requests.get("https://api.open-meteo.com/v1/elevation",
-                          params={"latitude":la, "longitude":lo}, headers=UA, timeout=6)
-        rr.raise_for_status(); j = rr.json()
-        es.append(float(j["elevation"][0]))
-    zc, zn, ze, zs, zw = es
-    # gradienti (m/m) usando differenze centrali
-    dz_dy = (zn - zs) / (2*d_m)   # N-S (lat)
-    dz_dx = (ze - zw) / (2*d_m)   # E-W (lon)
-    slope_rad = math.atan( math.hypot(dz_dx, dz_dy) )
-    slope_deg = math.degrees(slope_rad)
-    # aspect: direzione di massima discesa (0°=N, 90°=E). Formula GIS standard:
-    aspect_rad = math.atan2(dz_dx, dz_dy)  # nota l'ordine (x,y)
-    aspect_deg = (math.degrees(aspect_rad) + 360.0) % 360.0
-    # cardinale
-    dirs = ["N","NE","E","SE","S","SW","W","NW","N"]
-    idx = int((aspect_deg+22.5)//45)
-    aspect_card = dirs[idx]
-    return {
-        "elev_center": zc,
-        "slope_deg": round(slope_deg,1),
-        "aspect_deg": round(aspect_deg,0),
-        "aspect_card": aspect_card
-    }
+    # calcola DEM, pendenza, aspect
+    try:
+        dem = dem_patch(lat, lon)
+        if dem:
+            slope_deg, slope_pct, aspect_deg = slope_aspect_from_dem(dem["Z"], dem["spacing_m"])
+            st.session_state["slope_deg"]  = round(slope_deg, 1)
+            st.session_state["slope_pct"]  = round(slope_pct)
+            st.session_state["aspect_deg"] = round(aspect_deg)
+            st.session_state["aspect_txt"] = aspect_to_compass(aspect_deg)
+        else:
+            st.session_state["slope_deg"]=st.session_state["slope_pct"]=st.session_state["aspect_deg"]=None
+            st.session_state["aspect_txt"]=None
+    except Exception:
+        st.session_state["slope_deg"]=st.session_state["slope_pct"]=st.session_state["aspect_deg"]=None
+        st.session_state["aspect_txt"]=None
+    st.session_state["_alt_sync_key"] = coords_key
 
 # Badge info
-sl_info = sample_elevations(lat, lon)
+dem_badge = ""
+if st.session_state.get("slope_deg") is not None:
+    dem_badge = f" · ⛰️ {T['slope_deg']} <b>{st.session_state['slope_deg']}°</b> ({T['slope_pct']} <b>{st.session_state['slope_pct']}%</b>) · 🧭 {T['aspect_dir']} <b>{st.session_state['aspect_txt']}</b>"
 st.markdown(
-    f"<div class='badge map-wrap'>📍 <b>{place_label}</b> · Altitudine <b>{int(elev) if elev is not None else '—'} m</b> · "
-    f"{T['slope']}: <b>{sl_info['slope_deg']}°</b> · {T['aspect']}: <b>{sl_info['aspect_card']} ({int(sl_info['aspect_deg'])}°)</b> · "
-    f"TZ <b>{tzname}</b></div>",
+    f"<div class='badge map-wrap'>📍 <b>{place_label}</b> · Altitudine <b>{int(elev) if elev is not None else '—'} m</b> · TZ <b>{tzname}</b>{dem_badge}</div>",
     unsafe_allow_html=True
 )
 
@@ -726,8 +746,6 @@ if HAS_FOLIUM:
             st.session_state["lat"] = new_lat
             st.session_state["lon"] = new_lon
             st.session_state["place_label"] = reverse_geocode(new_lat, new_lon)
-            # aggiorna altitudine + pendenza/esposizione
-            st.session_state["alt_m"] = int(get_elev(new_lat, new_lon) or st.session_state.get("alt_m", 1800))
             st.success(f"Posizione aggiornata: {st.session_state['place_label']}")
             st.rerun()
 else:
@@ -737,7 +755,7 @@ else:
     except:
         pass
 
-# --- Pannello opzionale: posizionamento manuale ---
+# --- Pannello opzionale: posizionamento manuali ---
 with st.expander("➕ Imposta coordinate manuali / Set precise coordinates", expanded=False):
     c_lat, c_lon = st.columns(2)
     new_lat = c_lat.number_input("Lat", value=float(lat), format="%.6f")
@@ -747,8 +765,18 @@ with st.expander("➕ Imposta coordinate manuali / Set precise coordinates", exp
         st.session_state["lon"] = float(new_lon)
         new_label = reverse_geocode(float(new_lat), float(new_lon))
         st.session_state["place_label"] = new_label
-        st.session_state["alt_m"] = int(get_elev(float(new_lat), float(new_lon)) or st.session_state.get("alt_m", 1800))
         st.rerun()
+
+# --- Pannello DEM: esposizione & pendenza ---
+with st.expander(T["dem_hdr"], expanded=False):
+    sd = st.session_state.get("slope_deg")
+    if sd is None:
+        st.warning(T["dem_err"])
+    else:
+        c1, c2, c3 = st.columns(3)
+        c1.metric(T["slope_deg"], f"{st.session_state['slope_deg']}°")
+        c2.metric(T["slope_pct"], f"{st.session_state['slope_pct']}%")
+        c3.metric(T["aspect_dir"], f"{st.session_state['aspect_txt']} ({st.session_state['aspect_deg']}°)")
 
 # ---------------------- DATE & WINDOWS + DOWNSCALING ALT ----------------------
 cdate, calt = st.columns([1,1])
