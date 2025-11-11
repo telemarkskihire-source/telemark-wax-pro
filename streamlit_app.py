@@ -551,7 +551,7 @@ def tune_for(Tsurf, discipline):
 
 # ---------------------- Persist selection ----------------------
 def tt(h,m): return dtime(h,m)
-def persist(key, default): 
+def persist(key, default):
     if key not in st.session_state: st.session_state[key]=default
     return st.session_state[key]
 
@@ -595,7 +595,7 @@ def reverse_geocode(lat, lon):
     except:
         return f"{lat:.5f}, {lon:.5f}"
 
-# --- Mappa interattiva se disponibile (folium); altrimenti fallback statico ---
+# --- Mappa interattiva con selezione clic ---
 HAS_FOLIUM = False
 try:
     from streamlit_folium import st_folium
@@ -605,10 +605,13 @@ except Exception:
     HAS_FOLIUM = False
 
 if HAS_FOLIUM:
-    with st.expander(T["map"] + " — clicca per scegliere", expanded=True):
+    with st.expander(T["map"] + " — clicca sulla mappa per scegliere", expanded=True):
         m = folium.Map(location=[lat, lon], zoom_start=12, tiles="CartoDB positron")
         folium.Marker([lat, lon], tooltip=place_label).add_to(m)
-        out = st_folium(m, height=360, width=None, returned_objects=[])
+        # popup di coordinate al click (utile su mobile)
+        m.add_child(folium.LatLngPopup())
+        # ritorna l'ultimo click
+        out = st_folium(m, height=360, use_container_width=True, key="map", return_on_click=True)
         if out and out.get("last_clicked"):
             new_lat = float(out["last_clicked"]["lat"])
             new_lon = float(out["last_clicked"]["lng"])
@@ -618,13 +621,14 @@ if HAS_FOLIUM:
             st.success(f"Posizione aggiornata: {st.session_state['place_label']}")
             st.rerun()
 else:
+    st.info("Mappa interattiva non disponibile. (Installa opzionalmente 'streamlit-folium'). Mostro tile statico.")
     try:
         tile = osm_tile(lat,lon, z=9)
         st.image(tile, caption=T["map"], width=220)
     except:
         pass
 
-# --- Pannello opzionale: posizionamento manuale preciso ---
+# --- Pannello opzionale: posizionamento manuali preciso ---
 with st.expander("➕ Imposta coordinate manuali / Set precise coordinates", expanded=False):
     c_lat, c_lon = st.columns(2)
     new_lat = c_lat.number_input("Lat", value=float(lat), format="%.6f")
