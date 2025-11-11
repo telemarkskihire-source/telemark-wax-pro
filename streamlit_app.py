@@ -34,6 +34,8 @@ hr {{ border:none; border-top:1px solid var(--line); margin:.75rem 0 }}
 .tune ul {{ margin:.5px 0 0 1rem; padding:0; }}
 .small {{ font-size:.85rem; color:#cbd5e1 }}
 .badge-red {{ border-left:6px solid {ERR}; background:#2a1518; color:#fee2e2; padding:.6rem .8rem; border-radius:10px; }}
+/* Evita che i controlli di Leaflet finiscano al centro */
+.leaflet-control {{ z-index: 1000; }}
 </style>
 """, unsafe_allow_html=True)
 
@@ -598,7 +600,7 @@ def reverse_geocode(lat, lon):
 # ---------- PISTE (Overpass) ----------
 @st.cache_data(ttl=3*3600, show_spinner=False)
 def fetch_pistes_geojson(lat:float, lon:float, dist_km:int=30):
-    # OSM piste:type (downhill, nordic, skitour, sled etc.)
+    # OSM piste:type nelle vicinanze (downhill, nordic, skitour, ecc.)
     query = f"""
     [out:json][timeout:25];
     (
@@ -629,29 +631,30 @@ try:
     from streamlit_folium import st_folium
     import folium
     from folium import TileLayer, LayerControl, Marker
-    from folium.plugins import ClickForMarker, MousePosition
+    from folium.plugins import MousePosition
     HAS_FOLIUM = True
 except Exception:
     HAS_FOLIUM = False
 
 if HAS_FOLIUM:
-    with st.expander(T["map"] + " — clicca o aggiungi un marker", expanded=True):
+    with st.expander(T["map"] + " — clicca sulla mappa per selezionare", expanded=True):
+        # Mappa
         m = folium.Map(location=[lat, lon], zoom_start=12, tiles=None, control_scale=True, prefer_canvas=True)
 
         # Base maps
         TileLayer(tiles="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",
-                  name="Strade", attr="© OSM", control=True, overlay=False).add_to(m)
+                  name="Strade", attr="© OSM", overlay=False, control=True).add_to(m)
         TileLayer(tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
-                  name="Satellite", attr="Tiles © Esri", control=True, overlay=False).add_to(m)
+                  name="Satellite", attr="Tiles © Esri", overlay=False, control=True).add_to(m)
 
-        # Piste overlays
+        # Piste overlays (tiles)
         TileLayer(
             tiles="https://tiles.opensnowmap.org/pistes/{z}/{x}/{y}.png",
             name="Piste overlay (tiles)", attr="© OpenSnowMap.org contributors",
-            overlay=True, control=True, opacity=0.8
+            overlay=True, control=True, opacity=0.85
         ).add_to(m)
 
-        # Vector overlay da OSM (auto, nessun download lato utente)
+        # Piste vettoriali via Overpass (no download da parte dell'utente)
         try:
             gj = fetch_pistes_geojson(lat, lon, dist_km=30)
             if gj["features"]:
@@ -664,13 +667,15 @@ if HAS_FOLIUM:
         except Exception:
             pass
 
-        # Marker posizione corrente + click per selezione
-        Marker([lat, lon], tooltip=place_label, draggable=False, icon=folium.Icon(color="lightgray")).add_to(m)
-        ClickForMarker(popup="Selezionato").add_to(m)
-        MousePosition().add_to(m)
-        LayerControl(position="topleft", collapsed=False).add_to(m)
+        # Marker posizione corrente
+        Marker([lat, lon], tooltip=place_label, icon=folium.Icon(color="lightgray")).add_to(m)
 
-        out = st_folium(m, height=420, use_container_width=True, returned_objects=[])
+        # Controlli compatti in basso a sinistra (non intralciano i click)
+        MousePosition().add_to(m)
+        LayerControl(position="bottomleft", collapsed=True).add_to(m)
+
+        # Cattura click (niente marker aggiuntivi client-side)
+        out = st_folium(m, height=420, use_container_width=True, key="map", returned_objects=[])
 
         # Aggiorna coordinate su click
         click = (out.get("last_clicked") or {})
@@ -911,3 +916,4 @@ if btn:
                 status.update(label=f"Errore HTTP: {e}", state="error", expanded=True)
             except Exception as e:
                 status.update(label=f"Errore: {e}", state="error", expanded=True)
+```0
