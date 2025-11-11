@@ -85,7 +85,10 @@ L = {
         "slope_pct":"Pendenza (%)",
         "aspect_deg":"Esposizione (° da N)",
         "aspect_dir":"Esposizione (bussola)",
-        "dem_err":"DEM non disponibile ora. Riprova tra poco."
+        "dem_err":"DEM non disponibile ora. Riprova tra poco.",
+        # NEW (tables)
+        "tables_hdr":"Tabelle dati meteo",
+        "block_table":"Tabella blocco"
     },
     "en": {
         "country":"Country (search prefilter)",
@@ -130,7 +133,10 @@ L = {
         "slope_pct":"Slope (%)",
         "aspect_deg":"Aspect (° from N)",
         "aspect_dir":"Aspect (compass)",
-        "dem_err":"DEM unavailable now. Try again shortly."
+        "dem_err":"DEM unavailable now. Try again shortly.",
+        # NEW (tables)
+        "tables_hdr":"Weather data tables",
+        "block_table":"Block table"
     }
 }
 
@@ -215,7 +221,7 @@ with col_top[2]:
 with col_top[3]:
     if st.button(T["reset"], use_container_width=True):
         for k in ["A_s","A_e","B_s","B_e","C_s","C_e","place","lat","lon","place_label","hours","country_sel","cal_offset","ref_day","alt_m",
-                  "slope_deg","slope_pct","aspect_deg","aspect_txt","_alt_sync_key"]:
+                  "slope_deg","slope_pct","aspect_deg","aspect_txt","_alt_sync_key","_last_click"]:
             if k in st.session_state: del st.session_state[k]
         st.rerun()
 
@@ -301,14 +307,12 @@ def dem_patch(lat: float, lon: float, spacing_m: int = 30, size: int = 3):
 
 def slope_aspect_from_dem(Z: np.ndarray, spacing_m: float):
     """Metodo di Horn su finestra 3×3 per derivare pendenza e aspect (° da Nord, orario)."""
-    # Horn kernels
     dzdx = ((Z[0,2] + 2*Z[1,2] + Z[2,2]) - (Z[0,0] + 2*Z[1,0] + Z[2,0])) / (8.0 * spacing_m)
     dzdy = ((Z[2,0] + 2*Z[2,1] + Z[2,2]) - (Z[0,0] + 2*Z[0,1] + Z[0,2])) / (8.0 * spacing_m)
     slope_rad = math.atan(math.hypot(dzdx, dzdy))
     slope_deg = math.degrees(slope_rad)
     slope_pct = math.tan(slope_rad) * 100.0
-    # aspect: azimuth da Nord in senso orario
-    aspect_rad = math.atan2(dzdx, dzdy)   # nota: invertito per avere 0° = Nord
+    aspect_rad = math.atan2(dzdx, dzdy)   # 0° = Nord, senso orario
     aspect_deg = (math.degrees(aspect_rad) + 360.0) % 360.0
     return float(slope_deg), float(slope_pct), float(aspect_deg)
 
@@ -626,9 +630,7 @@ tzname = detect_timezone(lat,lon)
 # ---------------------- ALT/DEM SYNC ----------------------
 coords_key = (round(lat,6), round(lon,6))
 if st.session_state.get("_alt_sync_key") != coords_key:
-    # aggiorna altitudine
     st.session_state["alt_m"] = int(elev) if elev is not None else st.session_state.get("alt_m", 1800)
-    # calcola DEM, pendenza, aspect
     try:
         dem = dem_patch(lat, lon)
         if dem:
@@ -742,12 +744,16 @@ if HAS_FOLIUM:
         out = st_folium(m, height=420, use_container_width=True, key="map_widget", returned_objects=["last_clicked"])
         click = (out or {}).get("last_clicked") or {}
         if click:
-            new_lat = float(click.get("lat")); new_lon = float(click.get("lng"))
-            st.session_state["lat"] = new_lat
-            st.session_state["lon"] = new_lon
-            st.session_state["place_label"] = reverse_geocode(new_lat, new_lon)
-            st.success(f"Posizione aggiornata: {st.session_state['place_label']}")
-            st.rerun()
+            curr = (round(float(click.get("lat")),6), round(float(click.get("lng")),6))
+            prev = st.session_state.get("_last_click")
+            if curr != prev:
+                st.session_state["_last_click"] = curr  # debounce per evitare loop
+                new_lat, new_lon = curr
+                st.session_state["lat"] = new_lat
+                st.session_state["lon"] = new_lon
+                st.session_state["place_label"] = reverse_geocode(new_lat, new_lon)
+                st.toast(f"Posizione aggiornata: {st.session_state['place_label']}", icon="📍")
+                st.rerun()
 else:
     try:
         tile = osm_tile(lat,lon, z=9)
@@ -761,6 +767,7 @@ with st.expander("➕ Imposta coordinate manuali / Set precise coordinates", exp
     new_lat = c_lat.number_input("Lat", value=float(lat), format="%.6f")
     new_lon = c_lon.number_input("Lon", value=float(lon), format="%.6f")
     if st.button("Imposta / Set"):
+        st.session_state["_last_click"] = (round(float(new_lat),6), round(float(new_lon),6))  # aggiorna anche debounce
         st.session_state["lat"] = float(new_lat)
         st.session_state["lon"] = float(new_lon)
         new_label = reverse_geocode(float(new_lat), float(new_lon))
@@ -898,6 +905,7 @@ if btn:
 
                 wind_unit_lbl = "m/s" if not use_fahrenheit else "km/h"
 
+                # --- CHARTS
                 tloc = disp["time_local"].dt.tz_localize(None)
                 fig1 = plt.figure(figsize=(10,3))
                 plt.plot(tloc, disp["T2m"], label=Tair_lbl)
@@ -919,9 +927,18 @@ if btn:
 
                 plot_speed_mini(disp)
 
+                # --- TABELLE (completa)
+                st.subheader(T.get("tables_hdr","Tabelle"))
+                table_cols = ["time_local","T2m","td","RH","Tw","wind","cloud","SW_down","prp_mmph","rain","snowfall","T_surf","T_top5","liq_water_pct","speed_index"]
+                show_cols = [c for c in table_cols if c in disp.columns]
+                tbl = disp[show_cols].copy()
+                tbl["time_local"] = tbl["time_local"].dt.strftime("%Y-%m-%d %H:%M")
+                st.dataframe(tbl, use_container_width=True, height=260)
+
                 if show_debug:
                     st.info(f"Rows: {len(disp)} · time_local: {disp['time_local'].min()} → {disp['time_local'].max()}")
 
+                # --- BLOCCHI
                 blocks = {"A":(A_start,A_end),"B":(B_start,B_end),"C":(C_start,C_end)}
                 t_med_map = {}
                 for L,(s,e) in blocks.items():
@@ -964,6 +981,13 @@ if btn:
                         st.markdown(html, unsafe_allow_html=True)
                     st.markdown("</div>", unsafe_allow_html=True)
 
+                    # Tabella del blocco
+                    Wtbl = W[show_cols].copy()
+                    Wtbl["time_local"] = Wtbl["time_local"].dt.strftime("%Y-%m-%d %H:%M")
+                    with st.expander(f"{T.get('block_table','Tabella blocco')} {L}", expanded=False):
+                        st.dataframe(Wtbl, use_container_width=True, height=220)
+
+                    # Tuning discipline
                     rows=[]
                     for d in ["SL","GS","SG","DH"]:
                         fam, side, base = tune_for(t_for_struct, d)
@@ -971,6 +995,7 @@ if btn:
                     tune_list = "".join([f"<li><b>{d}</b>: {fam} — SIDE {side} · BASE {base}</li>" for d,fam,side,base in rows])
                     st.markdown(f"<div class='card tune'><div><b>Tuning per disciplina</b></div><ul class='small'>{tune_list}</ul></div>", unsafe_allow_html=True)
 
+                # Download CSV e PDF
                 csv = disp.copy()
                 csv["time_local"] = csv["time_local"].dt.strftime("%Y-%m-%d %H:%M")
                 csv = csv.drop(columns=["time_utc"])
