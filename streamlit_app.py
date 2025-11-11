@@ -223,37 +223,94 @@ with col_top[2]:
 with col_top[3]:
     if st.button(T["reset"], use_container_width=True):
         for k in ["A_s","A_e","B_s","B_e","C_s","C_e","place","lat","lon","place_label","hours","country_sel","cal_offset","ref_day","alt_m",
-                  "slope_deg","slope_pct","aspect_deg","aspect_txt","_alt_sync_key","_last_click"]:
+                  "slope_deg","slope_pct","aspect_deg","aspect_txt","_alt_sync_key"]:
             if k in st.session_state: del st.session_state[k]
         st.rerun()
 
-with col_top[0]:
-    def nominatim_search(q:str):
-        if not q or len(q)<2: return []
-        try:
-            def go():
-                return requests.get(
-                    "https://nominatim.openstreetmap.org/search",
-                    params={"q":q, "format":"json", "limit":12, "addressdetails":1, "countrycodes": iso2.lower()},
-                    headers=UA, timeout=8
-                )
-            r = _retry(go); r.raise_for_status()
-            st.session_state._options = {}
-            out=[]
-            for it in r.json():
-                addr = it.get("address",{}) or {}
-                lab = concise_label(addr, it.get("display_name",""))
-                cc = addr.get("country_code","")
-                lab = f"{flag(cc)}  {lab}"
-                lat = float(it.get("lat",0)); lon=float(it.get("lon",0))
-                key = f"{lab}|||{lat:.6f},{lon:.6f}"
-                st.session_state._options[key] = {"lat":lat,"lon":lon,"label":lab,"addr":addr}
-                out.append(key)
-            return out
-        except:
-            return []
+# --- Ricerca località robusta (Open-Meteo primary, Nominatim fallback) ---
+def _lang_code():
+    return "it" if (st.session_state.get("lang_sel") or (1 if T is L["it"] else 0)) else "en"
 
-    selected = st_searchbox(nominatim_search, key="place", placeholder=T["search_ph"], clear_on_submit=False, default=None)
+@st.cache_data(ttl=600, show_spinner=False)
+def _geocode_openmeteo(q: str, iso2: str, lang: str):
+    if not q: return []
+    r = requests.get(
+        "https://geocoding-api.open-meteo.com/v1/search",
+        params={"name": q, "count": 12, "language": lang, "format": "json", "country": iso2},
+        headers=UA, timeout=8
+    )
+    r.raise_for_status()
+    j = r.json() or {}
+    results = j.get("results") or []
+    out = []
+    for it in results:
+        name = it.get("name") or ""
+        admin1 = it.get("admin1") or it.get("admin2") or ""
+        cc = (it.get("country_code") or "").upper()
+        lat = float(it.get("latitude")); lon = float(it.get("longitude"))
+        lab_core = ", ".join([p for p in [name, admin1] if p])
+        lab = f"{flag(cc)}  {lab_core} — {cc}"
+        out.append({"label": lab, "lat": lat, "lon": lon})
+    return out
+
+@st.cache_data(ttl=600, show_spinner=False)
+def _geocode_nominatim(q: str, iso2: str):
+    r = requests.get(
+        "https://nominatim.openstreetmap.org/search",
+        params={"q": q, "format": "json", "limit": 12, "addressdetails": 1, "countrycodes": iso2.lower(), "accept-language": _lang_code()},
+        headers={**UA, "Accept-Language": _lang_code()},
+        timeout=8
+    )
+    r.raise_for_status()
+    out = []
+    for it in r.json():
+        addr = it.get("address", {}) or {}
+        lab_core = concise_label(addr, it.get("display_name", ""))
+        cc = (addr.get("country_code") or "").upper()
+        lat = float(it.get("lat", 0)); lon = float(it.get("lon", 0))
+        lab = f"{flag(cc)}  {lab_core}{(' — '+cc) if cc else ''}"
+        out.append({"label": lab, "lat": lat, "lon": lon})
+    return out
+
+# piccolo debounce per la digitazione
+def _debounced(ident="search", secs=0.25):
+    now = time.time()
+    key = f"__deb_{ident}"
+    last = st.session_state.get(key, 0)
+    if now - last < secs:
+        return False
+    st.session_state[key] = now
+    return True
+
+def place_search(q: str):
+    if not q or len(q.strip()) < 2 or not _debounced("place", 0.25):
+        return []
+    try:
+        lang_code = "it" if (T is L["it"]) else "en"
+        pri = _geocode_openmeteo(q.strip(), iso2, lang_code)
+        data = pri if pri else _geocode_nominatim(q.strip(), iso2)
+    except Exception:
+        try:
+            data = _geocode_nominatim(q.strip(), iso2)
+        except Exception:
+            data = []
+    # salva opzioni in sessione per recuperare lat/lon dopo la scelta
+    st.session_state._options = {}
+    out_labels = []
+    for it in data:
+        key = f"{it['label']}|||{it['lat']:.6f},{it['lon']:.6f}"
+        st.session_state._options[key] = it
+        out_labels.append(key)
+    return out_labels or ["— nessun risultato —"]
+
+with col_top[0]:
+    selected = st_searchbox(
+        place_search,
+        key="place",
+        placeholder=T["search_ph"],
+        clear_on_submit=False,
+        default=None
+    )
 
 # ---------------------- Cached services ----------------------
 @st.cache_data(ttl=60*10, show_spinner=False)
