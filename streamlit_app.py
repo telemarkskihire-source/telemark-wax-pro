@@ -1,7 +1,7 @@
 # telemark_pro_app.py
 # Telemark · Pro Wax & Tune — dark, cached, robust fetch, i18n, units toggle, lead-time, alerts, PDF report, map, validation
 
-import os, math, base64, requests, pandas as pd, numpy as np, io, time
+import os, math, base64, requests, pandas as pd, numpy as np, io, time, json
 import streamlit as st
 from datetime import datetime, date, time as dtime, timedelta
 from dateutil import tz
@@ -31,7 +31,7 @@ hr {{ border:none; border-top:1px solid var(--line); margin:.75rem 0 }}
 .brand .logo {{ flex:0 0 auto; display:flex; align-items:center; justify-content:center; width:54px; height:54px; background:#0b121a; border:1px solid #1e2a3a; border-radius:10px; overflow:hidden }}
 .brand .logo img {{ max-width:52px; max-height:52px; display:block }}
 .grid {{ display:grid; grid-template-columns: repeat(4, minmax(0,1fr)); gap:.6rem; }}
-.tune ul {{ margin:.5rem 0 0 1rem; padding:0; }}
+.tune ul {{ margin:.5px 0 0 1rem; padding:0; }}
 .small {{ font-size:.85rem; color:#cbd5e1 }}
 .badge-red {{ border-left:6px solid {ERR}; background:#2a1518; color:#fee2e2; padding:.6rem .8rem; border-radius:10px; }}
 </style>
@@ -524,8 +524,6 @@ def wax_form_and_brushes(t_surf: float, rh: float):
             brushes = "Ottone → Nylon → Feltro/Rotowool → Panno microfibra"
     else:
         form = "Solida (panetto)"
-    # dettagli spazzole per regime:
-    if not use_liquid:
         if regime == "very_cold":
             brushes = "Ottone → Nylon duro → Crine"
         elif regime == "cold":
@@ -597,136 +595,100 @@ def reverse_geocode(lat, lon):
     except:
         return f"{lat:.5f}, {lon:.5f}"
 
-# ---------- PISTE (OSM/Overpass) ----------
-@st.cache_data(ttl=6*3600, show_spinner=False)
-def fetch_pistes_osm(lat, lon, radius_km=20):
+# ---------- PISTE (Overpass) ----------
+@st.cache_data(ttl=3*3600, show_spinner=False)
+def fetch_pistes_geojson(lat:float, lon:float, dist_km:int=30):
+    # OSM piste:type (downhill, nordic, skitour, sled etc.)
+    query = f"""
+    [out:json][timeout:25];
+    (
+      way(around:{int(dist_km*1000)},{lat},{lon})["piste:type"];
+      relation(around:{int(dist_km*1000)},{lat},{lon})["piste:type"];
+    );
+    out geom;
     """
-    Scarica piste 'piste:type=*' in un raggio (km) via Overpass.
-    Ritorna GeoJSON FeatureCollection o None.
-    """
-    try:
-        q = f"""
-        [out:json][timeout:25];
-        (
-          way["piste:type"](around:{int(radius_km*1000)},{lat},{lon});
-          relation["piste:type"](around:{int(radius_km*1000)},{lat},{lon});
-        );
-        out geom;
-        """
-        r = requests.post("https://overpass-api.de/api/interpreter", data=q, headers=UA, timeout=30)
-        r.raise_for_status()
-        js = r.json()
-        feats = []
-        for el in js.get("elements", []):
-            if "geometry" not in el: continue
-            coords = [[pt["lon"], pt["lat"]] for pt in el["geometry"]]
-            props = {"name": el.get("tags",{}).get("name",""), "type": el.get("tags",{}).get("piste:type","")}
-            # LineString
-            feats.append({"type":"Feature","geometry":{"type":"LineString","coordinates":coords},"properties":props})
-        if not feats: return None
-        return {"type":"FeatureCollection","features":feats}
-    except Exception:
-        return None
+    r = requests.post("https://overpass-api.de/api/interpreter", data=query, headers=UA, timeout=30)
+    r.raise_for_status()
+    data = r.json().get("elements", [])
+    feats=[]
+    for el in data:
+        props = {
+            "id": el.get("id"),
+            "piste:type": (el.get("tags") or {}).get("piste:type",""),
+            "name": (el.get("tags") or {}).get("name","")
+        }
+        if "geometry" in el:
+            coords = [(g["lon"], g["lat"]) for g in el["geometry"]]
+            geom = {"type":"LineString","coordinates":coords}
+            feats.append({"type":"Feature","geometry":geom,"properties":props})
+    return {"type":"FeatureCollection","features":feats}
 
-# --- Mappa interattiva (folium) con Satellite + Piste ---
+# --- Mappa interattiva (Leaflet/Folium) con Satellite + piste ---
 HAS_FOLIUM = False
 try:
     from streamlit_folium import st_folium
     import folium
-    from folium.plugins import Draw, MousePosition
+    from folium import TileLayer, LayerControl, Marker
+    from folium.plugins import ClickForMarker, MousePosition
     HAS_FOLIUM = True
 except Exception:
     HAS_FOLIUM = False
 
 if HAS_FOLIUM:
     with st.expander(T["map"] + " — clicca o aggiungi un marker", expanded=True):
-        # Base map without default tiles (we add our layers)
-        m = folium.Map(location=[lat, lon], zoom_start=12, tiles=None, control_scale=True)
+        m = folium.Map(location=[lat, lon], zoom_start=12, tiles=None, control_scale=True, prefer_canvas=True)
 
-        # Base/overlay layers
-        folium.TileLayer(  # Light streets
-            tiles="https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png",
-            attr="© OpenStreetMap contributors © CARTO",
-            name="Strade"
-        ).add_to(m)
-        folium.TileLayer(  # Satellite
-            tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{x}/{y}.png",
-            attr="Tiles © Esri — Source: Esri, i-cubed, USDA, USGS, AEX, GeoEye, Getmapping, Aerogrid, IGN, IGP, UPR-EGP, and the GIS User Community",
-            name="Satellite"
-        ).add_to(m)
-        folium.TileLayer(  # Piste overlay (tiles)
+        # Base maps
+        TileLayer(tiles="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",
+                  name="Strade", attr="© OSM", control=True, overlay=False).add_to(m)
+        TileLayer(tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+                  name="Satellite", attr="Tiles © Esri", control=True, overlay=False).add_to(m)
+
+        # Piste overlays
+        TileLayer(
             tiles="https://tiles.opensnowmap.org/pistes/{z}/{x}/{y}.png",
-            attr="© OpenSnowMap.org, © OpenStreetMap contributors",
-            name="Piste overlay (tiles)",
-            overlay=True,
-            control=True,
-            opacity=0.85
+            name="Piste overlay (tiles)", attr="© OpenSnowMap.org contributors",
+            overlay=True, control=True, opacity=0.8
         ).add_to(m)
 
-        # Marker attuale (trascinabile)
-        folium.Marker([lat, lon], tooltip=place_label, draggable=True).add_to(m)
+        # Vector overlay da OSM (auto, nessun download lato utente)
+        try:
+            gj = fetch_pistes_geojson(lat, lon, dist_km=30)
+            if gj["features"]:
+                folium.GeoJson(
+                    data=gj,
+                    name="Piste (OSM/Overpass)",
+                    tooltip=folium.GeoJsonTooltip(fields=["name","piste:type"], aliases=["Nome","Tipo"]),
+                    style_function=lambda f: {"color":"#3388ff","weight":3,"opacity":0.9}
+                ).add_to(m)
+        except Exception:
+            pass
 
-        # Plugin per vedere lat/lon sotto il mouse
-        MousePosition(position='bottomright', prefix="Lat,Lon:").add_to(m)
+        # Marker posizione corrente + click per selezione
+        Marker([lat, lon], tooltip=place_label, draggable=False, icon=folium.Icon(color="lightgray")).add_to(m)
+        ClickForMarker(popup="Selezionato").add_to(m)
+        MousePosition().add_to(m)
+        LayerControl(position="topleft", collapsed=False).add_to(m)
 
-        # Disegno: abilitiamo solo i marker (modo sicuro per selezionare)
-        Draw(
-            draw_options={
-                "polyline": False, "polygon": False, "circle": False,
-                "rectangle": False, "circlemarker": False, "marker": True
-            },
-            edit_options={"edit": False, "remove": True}
-        ).add_to(m)
+        out = st_folium(m, height=420, use_container_width=True, returned_objects=[])
 
-        # (Opzionale) linee piste dall'API OSM attorno alla posizione (no download manuale)
-        pistes_geo = fetch_pistes_osm(lat, lon, radius_km=20)
-        if pistes_geo:
-            def _style(_):
-                return {"weight": 2, "opacity": 0.9}
-            folium.GeoJson(pistes_geo, name="Piste (OSM/Overpass)", style_function=_style,
-                           tooltip=folium.GeoJsonTooltip(fields=["name","type"], aliases=["Nome","Tipo"])
-                           ).add_to(m)
-
-        folium.LayerControl(collapsed=False).add_to(m)
-
-        # Render mappa
-        out = st_folium(m, height=450, use_container_width=True, key="map")
-
-        # Cattura: 1) ultimo marker disegnato; 2) click singolo
-        if out:
-            # Da Draw plugin
-            if out.get("last_active_drawing") and out["last_active_drawing"].get("geometry"):
-                try:
-                    coords = out["last_active_drawing"]["geometry"]["coordinates"]
-                    new_lon, new_lat = float(coords[0]), float(coords[1])
-                    st.session_state["lat"] = new_lat
-                    st.session_state["lon"] = new_lon
-                    st.session_state["place_label"] = reverse_geocode(new_lat, new_lon)
-                    st.toast(f"Posizione aggiornata: {st.session_state['place_label']}", icon="✅")
-                    st.rerun()
-                except Exception:
-                    pass
-            # Click semplice
-            elif out.get("last_clicked"):
-                try:
-                    new_lat = float(out["last_clicked"]["lat"])
-                    new_lon = float(out["last_clicked"]["lng"])
-                    st.session_state["lat"] = new_lat
-                    st.session_state["lon"] = new_lon
-                    st.session_state["place_label"] = reverse_geocode(new_lat, new_lon)
-                    st.toast(f"Posizione aggiornata: {st.session_state['place_label']}", icon="✅")
-                    st.rerun()
-                except Exception:
-                    pass
+        # Aggiorna coordinate su click
+        click = (out.get("last_clicked") or {})
+        if click:
+            new_lat = float(click.get("lat")); new_lon = float(click.get("lng"))
+            st.session_state["lat"] = new_lat
+            st.session_state["lon"] = new_lon
+            st.session_state["place_label"] = reverse_geocode(new_lat, new_lon)
+            st.success(f"Posizione aggiornata: {st.session_state['place_label']}")
+            st.rerun()
 else:
-    # Fallback statico
     try:
         tile = osm_tile(lat,lon, z=9)
         st.image(tile, caption=T["map"], width=220)
     except:
         pass
 
-# --- Pannello opzionale: posizionamento manuale preciso ---
+# --- Pannello opzionale: posizionamento manuali ---
 with st.expander("➕ Imposta coordinate manuali / Set precise coordinates", expanded=False):
     c_lat, c_lon = st.columns(2)
     new_lat = c_lat.number_input("Lat", value=float(lat), format="%.6f")
@@ -780,7 +742,7 @@ def build_pdf_report(res, place_label, t_med_map, wax_cards_html):
     ax0 = fig.add_subplot(gs[0,0]); ax1 = fig.add_subplot(gs[1:3,0]); ax2 = fig.add_subplot(gs[3:4,0]); ax3 = fig.add_subplot(gs[4:5,0])
     ax4 = fig.add_subplot(gs[5:6,0]); ax5 = fig.add_subplot(gs[6:7,0])
     fig.suptitle(f"Telemark · Pro Wax & Tune — {place_label}", fontsize=12, y=0.995)
-    tloc = res["time_local"].dt.tz_localize(None)  # <-- naive per il PDF
+    tloc = res["time_local"].dt.tz_localize(None)
     ax1.plot(tloc, res["T2m"], label="T aria"); ax1.plot(tloc, res["T_surf"], label="T neve"); ax1.plot(tloc, res["T_top5"], label="Top 5mm")
     ax1.set_title("Temperature"); ax1.grid(alpha=.2); ax1.legend(fontsize=8)
     ax2.bar(tloc, res["prp_mmph"], width=0.03); ax2.set_title("Precipitazione (mm/h)"); ax2.grid(alpha=.2)
@@ -795,7 +757,7 @@ def build_pdf_report(res, place_label, t_med_map, wax_cards_html):
 
 def plot_speed_mini(res):
     fig = plt.figure(figsize=(6,2.2))
-    plt.plot(res["time_local"].dt.tz_localize(None), res["speed_index"])  # <-- naive
+    plt.plot(res["time_local"].dt.tz_localize(None), res["speed_index"])
     plt.title(T["speed_chart"]); plt.grid(alpha=.2)
     st.pyplot(fig); plt.close(fig)
 
