@@ -680,7 +680,7 @@ if HAS_FOLIUM:
             height=420,
             use_container_width=True,
             key="map_widget",
-            returned_objects=["last_clicked"]  # <-- garantisce il ritorno del click
+            returned_objects=["last_clicked"]
         )
 
         # Aggiorna coordinate su click
@@ -855,63 +855,55 @@ if btn:
                     st.info(f"Rows: {len(disp)} · time_local: {disp['time_local'].min()} → {disp['time_local'].max()}")
 
                 # --- Blocchi & Cards brand (con loghi) ---
-blocks = {"A":(A_start,A_end),"B":(B_start,B_end),"C":(C_start,C_end)}
-t_med_map = {}
-for L,(s,e) in blocks.items():
-    st.markdown("---")
-    st.markdown(f"### Blocco {L}")
-    mask_day = disp["time_local"].dt.date == target_day
-    day_df = disp[mask_day].copy()
-    if day_df.empty:
-        W = disp.head(7).copy()
-    else:
-        sel = day_df[(day_df["time_local"].dt.time>=s) & (day_df["time_local"].dt.time<=e)]
-        W = sel if not sel.empty else day_df.head(6)
+                blocks = {"A":(A_start,A_end),"B":(B_start,B_end),"C":(C_start,C_end)}
+                t_med_map = {}
+                for L,(s,e) in blocks.items():
+                    st.markdown("---")
+                    st.markdown(f"### Blocco {L}")
+                    mask_day = disp["time_local"].dt.date == target_day
+                    day_df = disp[mask_day].copy()
+                    if day_df.empty:
+                        W = disp.head(7).copy()
+                    else:
+                        sel = day_df[(day_df["time_local"].dt.time>=s) & (day_df["time_local"].dt.time<=e)]
+                        W = sel if not sel.empty else day_df.head(6)
+                    if W.empty:
+                        st.info(T["nodata"]); continue
+                    t_med = float(W["T_surf"].mean()); t_med_map[L]=round(t_med,1)
+                    rh_med = float(W["RH"].mean())   # <-- FIX PARENTHESIS
+                    any_alert = ((W["T_surf"] > (-0.5 if not use_fahrenheit else c_to_f(-0.5))) & (W["RH"]>85)).any()
+                    if any_alert:
+                        st.markdown(f"<div class='badge-red'>⚠ {T['alert'].format(lbl=L)}</div>", unsafe_allow_html=True)
+                    k = classify_snow(W.iloc[0])
+                    rel = reliability((W.index[0] if not W.empty else 0) + 1)
+                    v_eff = (W["wind"] if not use_fahrenheit else ms_to_kmh(W["wind"])).mean()
+                    st.markdown(
+                        f"<div class='banner'><b>{T['cond']}</b> {k} · "
+                        f"<b>T_neve med</b> {t_med:.1f}{'°F' if use_fahrenheit else '°C'} · <b>H₂O liquida</b> {float(W['liq_water_pct'].mean()):.1f}% · "
+                        f"<b>Affidabilità</b> ≈ {rel}% · "
+                        f"<b>V eff</b> {v_eff:.1f} {wind_unit_lbl}</div>",
+                        unsafe_allow_html=True
+                    )
+                    t_for_struct = t_med if not use_fahrenheit else (t_med-32)*5/9
+                    st.markdown(f"**{T['struct']}** {recommended_structure(t_for_struct)}")
+                    wax_form, brush_seq, use_topcoat = wax_form_and_brushes(t_for_struct, rh_med)
 
-    if W.empty:
-        st.info(T["nodata"]); 
-        continue
+                    st.markdown("<div class='grid'>", unsafe_allow_html=True)
+                    for (name, solid_bands, liquid_bands) in BRANDS:
+                        rec_solid  = pick_wax(solid_bands, t_for_struct, rh_med)
+                        topcoat = (pick_liquid(liquid_bands, t_for_struct, rh_med) if use_topcoat else ("non necessario" if lang=="IT" else "not needed"))
+                        logo_b64 = get_brand_logo_b64(name)
+                        html = brand_card_html(name, rec_solid, wax_form, topcoat, brush_seq, logo_b64)
+                        st.markdown(html, unsafe_allow_html=True)
+                    st.markdown("</div>", unsafe_allow_html=True)
 
-    t_med  = float(W["T_surf"].mean()); t_med_map[L] = round(t_med, 1)
-    rh_med = float(W["RH"].mean())  # <-- FIX qui
-
-    any_alert = ((W["T_surf"] > (-0.5 if not use_fahrenheit else c_to_f(-0.5))) & (W["RH"]>85)).any()
-    if any_alert:
-        st.markdown(f"<div class='badge-red'>⚠ {T['alert'].format(lbl=L)}</div>", unsafe_allow_html=True)
-
-    k   = classify_snow(W.iloc[0])
-    rel = reliability((W.index[0] if not W.empty else 0) + 1)
-    v_eff = (W["wind"] if not use_fahrenheit else ms_to_kmh(W["wind"])).mean()
-    st.markdown(
-        f"<div class='banner'><b>{T['cond']}</b> {k} · "
-        f"<b>T_neve med</b> {t_med:.1f}{'°F' if use_fahrenheit else '°C'} · "
-        f"<b>H₂O liquida</b> {float(W['liq_water_pct'].mean()):.1f}% · "
-        f"<b>Affidabilità</b> ≈ {rel}% · "
-        f"<b>V eff</b> {v_eff:.1f} {'km/h' if use_fahrenheit else 'm/s'}</div>",
-        unsafe_allow_html=True
-    )
-
-    t_for_struct = t_med if not use_fahrenheit else (t_med-32)*5/9
-    st.markdown(f"**{T['struct']}** {recommended_structure(t_for_struct)}")
-    wax_form, brush_seq, use_topcoat = wax_form_and_brushes(t_for_struct, rh_med)
-
-    st.markdown("<div class='grid'>", unsafe_allow_html=True)
-    for (name, solid_bands, liquid_bands) in BRANDS:
-        rec_solid = pick_wax(solid_bands, t_for_struct, rh_med)
-        topcoat = (pick_liquid(liquid_bands, t_for_struct, rh_med) 
-                   if use_topcoat else ("non necessario" if lang=="IT" else "not needed"))
-        logo_b64 = get_brand_logo_b64(name)
-        html = brand_card_html(name, rec_solid, wax_form, topcoat, brush_seq, logo_b64)
-        st.markdown(html, unsafe_allow_html=True)
-    st.markdown("</div>", unsafe_allow_html=True)
-
-    # Tuning per disciplina
-    rows = []
-    for d in ["SL","GS","SG","DH"]:
-        fam, side, base = tune_for(t_for_struct, d)
-        rows.append((d, fam, f"{side:.1f}°", f"{base:.1f}°"))
-    tune_list = "".join([f"<li><b>{d}</b>: {fam} — SIDE {side} · BASE {base}</li>" for d,fam,side,base in rows])
-    st.markdown(f"<div class='card tune'><div><b>Tuning per disciplina</b></div><ul class='small'>{tune_list}</ul></div>", unsafe_allow_html=True)
+                    # Tuning per disciplina
+                    rows=[]
+                    for d in ["SL","GS","SG","DH"]:
+                        fam, side, base = tune_for(t_for_struct, d)
+                        rows.append((d, fam, f"{side:.1f}°", f"{base:.1f}°"))
+                    tune_list = "".join([f"<li><b>{d}</b>: {fam} — SIDE {side} · BASE {base}</li>" for d,fam,side,base in rows])
+                    st.markdown(f"<div class='card tune'><div><b>Tuning per disciplina</b></div><ul class='small'>{tune_list}</ul></div>", unsafe_allow_html=True)
 
                 # CSV/PDF download
                 csv = disp.copy()
