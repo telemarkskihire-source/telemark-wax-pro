@@ -321,255 +321,36 @@ def noaa_bias_correction(df, lat, lon):
     except Exception:
         return df
 
-# ---------------------- DATE & WINDOWS + DOWNSCALING ALT ----------------------
-def build_df(js, hours):
-    h = js["hourly"]; df = pd.DataFrame(h)
-    df["time"] = pd.to_datetime(df["time"], utc=True)  # tz-aware UTC
-    now0 = pd.Timestamp.now(tz="UTC").floor("H")
-    df = df[df["time"] >= now0].head(int(hours)).reset_index(drop=True)
-
-    out = pd.DataFrame()
-    out["time_utc"] = df["time"]
-    out["T2m"] = df["temperature_2m"].astype(float)
-    out["RH"] = df["relative_humidity_2m"].astype(float) if "relative_humidity_2m" in df else np.full(len(df), np.nan)
-    out["td"] = (df["dew_point_2m"].astype(float) if "dew_point_2m" in df else out["T2m"].astype(float))
-    out["cloud"] = (df["cloudcover"].astype(float)/100).clip(0,1) if "cloudcover" in df else np.zeros(len(df))
-    out["wind"] = (df["windspeed_10m"].astype(float)/3.6) if "windspeed_10m" in df else np.zeros(len(df))  # m/s
-    out["sunup"] = df["is_day"].astype(int) if "is_day" in df else np.zeros(len(df), dtype=int)
-    out["prp_mmph"] = df["precipitation"].astype(float) if "precipitation" in df else np.zeros(len(df))
-    out["rain"] = df["rain"].astype(float) if "rain" in df else np.zeros(len(df))
-    out["snowfall"] = df["snowfall"].astype(float) if "snowfall" in df else np.zeros(len(df))
-    out["wcode"] = df["weathercode"].astype(int) if "weathercode" in df else np.zeros(len(df), dtype=int)
-    out["lead_h"] = ((out["time_utc"] - now0).dt.total_seconds()/3600.0).round(1)
-    return out
-
-def prp_type_row(row):
-    if row.prp_mmph<=0 or pd.isna(row.prp_mmph): return "none"
-    if row.rain>0 and row.snowfall>0: return "mixed"
-    if row.snowfall>0 and row.rain==0: return "snow"
-    if row.rain>0 and row.snowfall==0: return "rain"
-    snow_codes = {71,73,75,77,85,86}; rain_codes={51,53,55,61,63,65,80,81,82}
-    if int(row.wcode) in snow_codes: return "snow"
-    if int(row.wcode) in rain_codes: return "rain"
-    return "mixed"
-
-def lapse_correction(Tv, base_alt, target_alt, lapse=-6.5):
-    dz = (target_alt - (base_alt or target_alt))
-    return Tv + (lapse/1000.0) * dz
-
-def enrich_meteo_quickwins(df, lat, lon, base_alt, target_alt):
-    X = df.copy()
-    if X["RH"].isna().any():
-        X.loc[:, "RH"] = rh_from_t_td(X["T2m"], X["td"])
-    X["Tw"] = wetbulb_stull(X["T2m"], X["RH"])
-    X["wind_eff"] = effective_wind(X["wind"])
-    sw_list = []
-    for ts in X["time_utc"]:
-        sw_clear = clear_sky_ghi(lat, lon, ts.to_pydatetime())
-        sw_list.append(sw_clear)
-    X["SW_clear"] = sw_list
-    X["SW_down"] = X["SW_clear"] * (1 - 0.75*(X["cloud"]**3))
-    snow_mask = X["snowfall"] > 0.5
-    last_snow_idx = -1; age_hours = []
-    for i, s in enumerate(snow_mask):
-        if s: last_snow_idx = i
-        age_hours.append(999 if last_snow_idx<0 else (i-last_snow_idx))
-    X["snow_age_h"] = age_hours
-    alb = 0.85 - 0.30 * np.clip(X["snow_age_h"]/48.0, 0, 1)
-    hot = X["T2m"] > 0
-    alb = np.where(hot, alb - 0.05, alb)
-    X["albedo"] = np.clip(alb, 0.45, 0.90)
-    if target_alt and base_alt:
-        X["T2m"] = lapse_correction(X["T2m"], base_alt, target_alt)
-        X["td"]  = lapse_correction(X["td"],  base_alt, target_alt)
-        X["RH"]  = rh_from_t_td(X["T2m"], X["td"])
-        X["Tw"]  = wetbulb_stull(X["T2m"], X["RH"])
-    return X
-
-def snow_temperature_model(X: pd.DataFrame, dt_hours=1.0):
-    X = X.copy()
-    X["ptyp"] = X.apply(prp_type_row, axis=1)
-    wet = ((X["ptyp"].isin(["rain","mixed"])) |
-           ( (X["ptyp"]=="snow") & (X["T2m"]>-0.5) & (X["RH"]>90) ) |
-           ( (X["SW_down"]>250) & (X["T2m"]>-1.0) ) | (X["T2m"]>0.5))
-    conv = 0.20 * X["wind_eff"]
-    rad_cool = (0.8 * (1.0 - X["cloud"]))
-    sw_gain = (X["SW_down"] * (1 - X["albedo"])) / 200.0
-    T_surf = X["T2m"] - conv - rad_cool + sw_gain
-    T_surf = np.where(wet, np.minimum(T_surf, 0.0), T_surf)
-    sun_boost_mask = (X["SW_down"]>350) & (X["T2m"]<0)
-    T_surf = np.where(sun_boost_mask, np.maximum(T_surf, X["T2m"] - 0.5), T_surf)
-    T_top5 = np.empty_like(T_surf); T_top5[:] = np.nan
-    tau = np.full_like(T_surf, 6.0)
-    tau = np.where((X["ptyp"]!="none") | (X["wind"]>=6), 3.0, tau)
-    tau = np.where((X["SW_down"]>300) & (X["T2m"]>-2), 4.0, tau)
-    tau = np.where((X["SW_down"]<50) & (X["wind"]<2) & (X["cloud"]<0.3), 8.0, tau)
-    alpha = 1.0 - np.exp(-dt_hours / tau)
-    if len(T_surf)>0:
-        T_top5[0] = min(X["T2m"].iloc[0], 0.0)
-        for i in range(1, len(T_surf)):
-            T_top5[i] = T_top5[i-1] + alpha[i] * (T_surf[i] - T_top5[i-1])
-    X["T_surf"] = np.round(T_surf, 2)
-    X["T_top5"] = np.round(T_top5, 2)
-    excess = np.clip(sw_gain - conv - rad_cool, 0, None)
-    wetness = ( (X["ptyp"].isin(["rain","mixed"]).astype(float))*2.0 + (excess/5.0) )
-    wetness = np.where(X["T_surf"]<-0.5, 0.0, wetness)
-    X["liq_water_pct"] = np.round(np.clip(wetness, 0, 6.0), 1)
-    near_zero_bonus = 20 * np.exp(-((X["T_surf"] + 0.4)/1.1)**2)
-    humidity_bonus  = np.clip((X["RH"]-60)/40, 0, 1)*10
-    radiation_bonus = np.clip(X["SW_down"]/600, 0, 1)*8
-    wind_pen        = np.clip(X["wind"]/10, 0, 1)*10
-    wet_pen         = np.clip(X["liq_water_pct"]/6, 0, 1)*25
-    base_speed      = 55 + near_zero_bonus + humidity_bonus + radiation_bonus
-    X["speed_index"] = np.clip(base_speed - wind_pen - wet_pen, 0, 100).round(0)
-    return X
-
-def classify_snow(row):
-    if row.ptyp=="rain": return "Neve bagnata/pioggia"
-    if row.ptyp=="mixed": return "Mista pioggia-neve"
-    if row.ptyp=="snow" and row.T_surf>-2: return "Neve nuova umida"
-    if row.ptyp=="snow" and row.T_surf<=-2: return "Neve nuova fredda"
-    if row.liq_water_pct>=3.0: return "Primaverile/trasformata bagnata"
-    if row.T_surf<=-8 and row.cloud<0.4: return "Rigelata/ghiacciata"
-    return "Compatta/trasformata secca"
-
-def reliability(hours_ahead):
-    x = float(hours_ahead)
-    if x<=24: return 85
-    if x<=48: return 75
-    if x<=72: return 65
-    if x<=120: return 50
-    return 40
-
-# ---------------------- WAX BRANDS (SOLID + LIQUID) ----------------------
-SWIX = [("PS5 Turquoise",-18,-10),("PS6 Blue",-12,-6),("PS7 Violet",-8,-2),("PS8 Red",-4,4),("PS10 Yellow",0,10)]
-TOKO = [("Blue",-30,-9),("Red",-12,-4),("Yellow",-6,0)]
-VOLA = [("MX-E Blue",-25,-10),("MX-E Violet",-12,-4),("MX-E Red",-5,0),("MX-E Yellow",-2,6)]
-RODE = [("R20 Blue",-18,-8),("R30 Violet",-10,-3),("R40 Red",-5,0),("R50 Yellow",-1,10)]
-HOLM = [("UltraMix Blue",-20,-8),("BetaMix Red",-14,-4),("AlphaMix Yellow",-4,5)]
-MAPL = [("Univ Cold",-12,-6),("Univ Medium",-7,-2),("Univ Soft",-5,0)]
-START= [("SG Blue",-12,-6),("SG Purple",-8,-2),("SG Red",-3,7)]
-SKIGO= [("Blue",-12,-6),("Violet",-8,-2),("Red",-3,2)]
-SWIX_LQ = [("HS Liquid Blue",-12,-6),("HS Liquid Violet",-8,-2),("HS Liquid Red",-4,4),("HS Liquid Yellow",0,10)]
-TOKO_LQ = [("LP Liquid Blue",-12,-6),("LP Liquid Red",-6,-2),("LP Liquid Yellow",-2,8)]
-VOLA_LQ = [("Liquid Blue",-12,-6),("Liquid Violet",-8,-2),("Liquid Red",-4,4),("Liquid Yellow",0,8)]
-RODE_LQ = [("RL Blue",-12,-6),("RL Violet",-8,-2),("RL Red",-4,3),("RL Yellow",0,8)]
-HOLM_LQ = [("Liquid Blue",-12,-6),("Liquid Red",-6,2),("Liquid Yellow",0,8)]
-MAPL_LQ = [("Liquid Cold",-12,-6),("Liquid Medium",-7,-1),("Liquid Soft",-2,8)]
-START_LQ= [("FHF Liquid Blue",-12,-6),("FHF Liquid Purple",-8,-2),("FHF Liquid Red",-3,6)]
-SKIGO_LQ= [("C110 Liquid Blue",-12,-6),("C22 Liquid Violet",-8,-2),("C44 Liquid Red",-3,6)]
-
-BRANDS = [("Swix",SWIX,SWIX_LQ),("Toko",TOKO,TOKO_LQ),("Vola",VOLA,VOLA_LQ),("Rode",RODE,RODE_LQ),
-          ("Holmenkol",HOLM,HOLM_LQ),("Maplus",MAPL,MAPL_LQ),("Start",START,START_LQ),("Skigo",SKIGO,SKIGO_LQ)]
-
-# ---------------------- LOGHI BRAND ----------------------
-BRAND_LOGO_FILES = {
-    "Swix": "swix.png",
-    "Toko": "toko.png",
-    "Vola": "vola.png",
-    "Rode": "rode.png",
-    "Holmenkol": "holmenkol.png",
-    "Maplus": "maplus.png",
-    "Start": "start.png",
-    "Skigo": "skigo.png",
-}
-
-def _try_paths(filename: str):
-    for root in ["logos", "assets/logos", "."]:
-        path = os.path.join(root, filename)
-        if os.path.exists(path):
-            return path
-    return None
-
-@st.cache_data(show_spinner=False)
-def _logo_b64(path: str):
-    try:
-        with open(path, "rb") as f:
-            return base64.b64encode(f.read()).decode("ascii")
-    except Exception:
-        return None
-
-def get_brand_logo_b64(brand_name: str):
-    fname = BRAND_LOGO_FILES.get(brand_name)
-    if not fname: return None
-    p = _try_paths(fname)
-    return _logo_b64(p) if p else None
-
-def pick_wax(bands, t, rh):
-    name = bands[0][0]
-    for n,tmin,tmax in bands:
-        if t>=tmin and t<=tmax:
-            name = n; break
-    rh_tag = " (secco)" if rh<60 else " (medio)" if rh<80 else " (umido)"
-    return name + rh_tag
-
-def pick_liquid(liq_bands, t, rh):
-    name = liq_bands[0][0]
-    for n,tmin,tmax in liq_bands:
-        if t>=tmin and t<=tmax:
-            name = n; break
-    return name
-
-def wax_form_and_brushes(t_surf: float, rh: float):
-    use_liquid = (t_surf > -1.0) or (rh >= 80)
-    if t_surf <= -12: regime = "very_cold"
-    elif t_surf <= -5: regime = "cold"
-    elif t_surf <= -1: regime = "medium"
-    else: regime = "warm"
-    if use_liquid:
-        form = "Liquida (topcoat) su base solida"
-        if regime in ("very_cold","cold"):
-            brushes = "Ottone → Nylon duro → Feltro/Rotowool → Nylon morbido"
-        elif regime == "medium":
-            brushes = "Ottone → Nylon → Feltro/Rotowool → Crine"
-        else:
-            brushes = "Ottone → Nylon → Feltro/Rotowool → Panno microfibra"
-    else:
-        form = "Solida (panetto)"
-        if regime == "very_cold":
-            brushes = "Ottone → Nylon duro → Crine"
-        elif regime == "cold":
-            brushes = "Ottone → Nylon → Crine"
-        elif regime == "medium":
-            brushes = "Ottone → Nylon → Crine → Nylon fine"
-        else:
-            brushes = "Ottone → Nylon → Nylon fine → Panno"
-    return form, brushes, use_liquid
-
-def recommended_structure(Tsurf):
-    if Tsurf <= -10: return "Linear Fine (freddo/secco)"
-    if Tsurf <= -3:  return "Cross Hatch leggera (universale freddo)"
-    if Tsurf <= 0.5: return "Diagonal / Scarico a V (umido)"
-    return "Wave marcata (bagnato caldo)"
-
-def tune_for(Tsurf, discipline):
-    if Tsurf <= -10:
-        fam = "Linear Fine"; base = 0.5; side = {"SL":88.5,"GS":88.0,"SG":87.5,"DH":87.5}[discipline]
-    elif Tsurf <= -3:
-        fam = "Cross Hatch leggera"; base=0.7; side = {"SL":88.0,"GS":88.0,"SG":87.5,"DH":87.0}[discipline]
-    else:
-        fam = "Diagonal / V"; base = 0.8 if Tsurf<=0.5 else 1.0; side = {"SL":88.0,"GS":87.5,"SG":87.0,"DH":87.0}[discipline]
-    return fam, side, base
-
-# ---------------------- Persist selection ----------------------
+# ---------------------- Persist selection helpers ----------------------
 def tt(h,m): return dtime(h,m)
 def persist(key, default):
     if key not in st.session_state: st.session_state[key]=default
     return st.session_state[key]
 
+# ---------------------- Coordinates from selection ----------------------
 lat = persist("lat", 45.831); lon = persist("lon", 7.730)
 place_label = persist("place_label", "🇮🇹  Champoluc, Valle d’Aosta — IT")
-
-# Se arriva una selezione dalla searchbox aggiorna coordinata (solo se la searchbox NON è stata azzerata da mappa/manuel)
 if selected and "|||" in selected and "_options" in st.session_state:
     info = st.session_state._options.get(selected)
     if info:
         lat, lon, place_label = info["lat"], info["lon"], info["label"]
         st.session_state["lat"]=lat; st.session_state["lon"]=lon; st.session_state["place_label"]=place_label
 
+# Fetch derived metadata
 elev = get_elev(lat,lon)
 tzname = detect_timezone(lat,lon)
-st.markdown(f"<div class='badge map-wrap'>📍 <b>{place_label}</b> · Altitudine <b>{int(elev) if elev is not None else '—'} m</b> · TZ <b>{tzname}</b></div>", unsafe_allow_html=True)
+
+# ---------------------- ALT SYNC (aggiorna il toggle quando cambiano le coordinate) ----------------------
+# Se le coordinate sono cambiate rispetto all'ultimo sync, riallinea alt_m all'elevazione calcolata.
+if st.session_state.get("_alt_sync_key") != (lat, lon):
+    st.session_state["alt_m"] = int(elev) if elev is not None else st.session_state.get("alt_m", 1800)
+    st.session_state["_alt_sync_key"] = (lat, lon)
+
+# Badge info
+st.markdown(
+    f"<div class='badge map-wrap'>📍 <b>{place_label}</b> · Altitudine <b>{int(elev) if elev is not None else '—'} m</b> · TZ <b>{tzname}</b></div>",
+    unsafe_allow_html=True
+)
 
 @st.cache_data(ttl=6*3600, show_spinner=False)
 def osm_tile(lat, lon, z=9):
@@ -615,16 +396,18 @@ def fetch_pistes_geojson(lat:float, lon:float, dist_km:int=30):
     data = r.json().get("elements", [])
     feats=[]
     for el in data:
-        props = {"id": el.get("id"),
-                 "piste:type": (el.get("tags") or {}).get("piste:type",""),
-                 "name": (el.get("tags") or {}).get("name","")}
+        props = {
+            "id": el.get("id"),
+            "piste:type": (el.get("tags") or {}).get("piste:type",""),
+            "name": (el.get("tags") or {}).get("name","")
+        }
         if "geometry" in el:
             coords = [(g["lon"], g["lat"]) for g in el["geometry"]]
             geom = {"type":"LineString","coordinates":coords}
             feats.append({"type":"Feature","geometry":geom,"properties":props})
     return {"type":"FeatureCollection","features":feats}
 
-# --- Mappa interattiva ---
+# --- Mappa interattiva (Leaflet/Folium) con Satellite + piste ---
 HAS_FOLIUM = False
 try:
     from streamlit_folium import st_folium
@@ -639,9 +422,9 @@ if HAS_FOLIUM:
     with st.expander(T["map"] + " — clicca sulla mappa per selezionare", expanded=True):
         m = folium.Map(location=[lat, lon], zoom_start=12, tiles=None, control_scale=True, prefer_canvas=True, zoom_control=True)
 
-        TileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",
+        TileLayer(tiles="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",
                   name="Strade", attr="© OSM", overlay=False, control=True).add_to(m)
-        TileLayer("https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+        TileLayer(tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
                   name="Satellite", attr="Tiles © Esri", overlay=False, control=True).add_to(m)
 
         TileLayer(
@@ -681,8 +464,6 @@ if HAS_FOLIUM:
             st.session_state["lat"] = new_lat
             st.session_state["lon"] = new_lon
             st.session_state["place_label"] = reverse_geocode(new_lat, new_lon)
-            # IMPORTANT: evita che la searchbox riscriva di nuovo le coordinate
-            if "place" in st.session_state: del st.session_state["place"]
             st.success(f"Posizione aggiornata: {st.session_state['place_label']}")
             st.rerun()
 else:
@@ -692,7 +473,7 @@ else:
     except:
         pass
 
-# --- Pannello opzionale: coordinate manuali ---
+# --- Pannello opzionale: posizionamento manuali ---
 with st.expander("➕ Imposta coordinate manuali / Set precise coordinates", expanded=False):
     c_lat, c_lon = st.columns(2)
     new_lat = c_lat.number_input("Lat", value=float(lat), format="%.6f")
@@ -700,8 +481,8 @@ with st.expander("➕ Imposta coordinate manuali / Set precise coordinates", exp
     if st.button("Imposta / Set"):
         st.session_state["lat"] = float(new_lat)
         st.session_state["lon"] = float(new_lon)
-        st.session_state["place_label"] = reverse_geocode(float(new_lat), float(new_lon))
-        if "place" in st.session_state: del st.session_state["place"]  # idem: non sovrascrivere
+        new_label = reverse_geocode(float(new_lat), float(new_lon))
+        st.session_state["place_label"] = new_label
         st.rerun()
 
 # ---------------------- DATE & WINDOWS + DOWNSCALING ALT ----------------------
@@ -709,7 +490,7 @@ cdate, calt = st.columns([1,1])
 with cdate:
     target_day: date = st.date_input(T["ref_day"], value=persist("ref_day", date.today()), key="ref_day")
 with calt:
-    pista_alt = st.number_input(T["alt_lbl"], min_value=0, max_value=5000, value=int(get_elev(persist("lat",lat), persist("lon",lon)) or 1800), step=50, key="alt_m")
+    pista_alt = st.number_input(T["alt_lbl"], min_value=0, max_value=5000, value=st.session_state.get("alt_m", int(elev or 1800)), step=50, key="alt_m")
     if pista_alt<300:
         st.warning(T["low_alt"])
 
@@ -792,8 +573,8 @@ if btn:
                     status.update(label="Sorgente vuota", state="error", expanded=True)
                     st.stop()
                 raw = noaa_bias_correction(raw, lat, lon)
-                base_alt = elev or pista_alt
-                X = enrich_meteo_quickwins(raw, lat, lon, base_alt, pista_alt)
+                base_alt = st.session_state.get("alt_m", elev or 1800)
+                X = enrich_meteo_quickwins(raw, lat, lon, base_alt, st.session_state.get("alt_m", base_alt))
                 res = snow_temperature_model(X)
 
                 tzobj = tz.gettz(tzname)
@@ -822,7 +603,6 @@ if btn:
 
                 wind_unit_lbl = "m/s" if not use_fahrenheit else "km/h"
 
-                # --- Charts ---
                 tloc = disp["time_local"].dt.tz_localize(None)
                 fig1 = plt.figure(figsize=(10,3))
                 plt.plot(tloc, disp["T2m"], label=Tair_lbl)
@@ -847,7 +627,6 @@ if btn:
                 if show_debug:
                     st.info(f"Rows: {len(disp)} · time_local: {disp['time_local'].min()} → {disp['time_local'].max()}")
 
-                # --- Blocchi & Cards brand ---
                 blocks = {"A":(A_start,A_end),"B":(B_start,B_end),"C":(C_start,C_end)}
                 t_med_map = {}
                 for L,(s,e) in blocks.items():
@@ -863,7 +642,7 @@ if btn:
                     if W.empty:
                         st.info(T["nodata"]); continue
                     t_med = float(W["T_surf"].mean()); t_med_map[L]=round(t_med,1)
-                    rh_med = float(W["RH"].mean())  # FIX
+                    rh_med = float(W["RH"].mean())
                     any_alert = ((W["T_surf"] > (-0.5 if not use_fahrenheit else c_to_f(-0.5))) & (W["RH"]>85)).any()
                     if any_alert:
                         st.markdown(f"<div class='badge-red'>⚠ {T['alert'].format(lbl=L)}</div>", unsafe_allow_html=True)
@@ -897,7 +676,6 @@ if btn:
                     tune_list = "".join([f"<li><b>{d}</b>: {fam} — SIDE {side} · BASE {base}</li>" for d,fam,side,base in rows])
                     st.markdown(f"<div class='card tune'><div><b>Tuning per disciplina</b></div><ul class='small'>{tune_list}</ul></div>", unsafe_allow_html=True)
 
-                # CSV/PDF download
                 csv = disp.copy()
                 csv["time_local"] = csv["time_local"].dt.strftime("%Y-%m-%d %H:%M")
                 csv = csv.drop(columns=["time_utc"])
