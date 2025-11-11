@@ -35,6 +35,7 @@ hr {{ border:none; border-top:1px solid var(--line); margin:.75rem 0 }}
 .small {{ font-size:.85rem; color:#cbd5e1 }}
 .badge-red {{ border-left:6px solid {ERR}; background:#2a1518; color:#fee2e2; padding:.6rem .8rem; border-radius:10px; }}
 .leaflet-control {{ z-index: 1000 !important; }}
+.dataframe caption {{ caption-side: top; color:#cbd5e1; padding:.25rem 0 .5rem; }}
 </style>
 """, unsafe_allow_html=True)
 
@@ -86,9 +87,9 @@ L = {
         "aspect_deg":"Esposizione (° da N)",
         "aspect_dir":"Esposizione (bussola)",
         "dem_err":"DEM non disponibile ora. Riprova tra poco.",
-        # NEW (tables)
-        "tables_hdr":"Tabelle dati meteo",
-        "block_table":"Tabella blocco"
+        # NEW tables
+        "tbl_full":"Tabella dati orari (locale)",
+        "tbl_blk":"Sintesi blocco {b} (media/min/max)",
     },
     "en": {
         "country":"Country (search prefilter)",
@@ -134,9 +135,9 @@ L = {
         "aspect_deg":"Aspect (° from N)",
         "aspect_dir":"Aspect (compass)",
         "dem_err":"DEM unavailable now. Try again shortly.",
-        # NEW (tables)
-        "tables_hdr":"Weather data tables",
-        "block_table":"Block table"
+        # NEW tables
+        "tbl_full":"Hourly data table (local time)",
+        "tbl_blk":"Block {b} summary (mean/min/max)",
     }
 }
 
@@ -221,7 +222,7 @@ with col_top[2]:
 with col_top[3]:
     if st.button(T["reset"], use_container_width=True):
         for k in ["A_s","A_e","B_s","B_e","C_s","C_e","place","lat","lon","place_label","hours","country_sel","cal_offset","ref_day","alt_m",
-                  "slope_deg","slope_pct","aspect_deg","aspect_txt","_alt_sync_key","_last_click"]:
+                  "slope_deg","slope_pct","aspect_deg","aspect_txt","_alt_sync_key","_handled_click"]:
             if k in st.session_state: del st.session_state[k]
         st.rerun()
 
@@ -683,33 +684,6 @@ def reverse_geocode(lat, lon):
     except:
         return f"{lat:.5f}, {lon:.5f}"
 
-# ---------- PISTE (Overpass) ----------
-@st.cache_data(ttl=3*3600, show_spinner=False)
-def fetch_pistes_geojson(lat:float, lon:float, dist_km:int=30):
-    query = f"""
-    [out:json][timeout:25];
-    (
-      way(around:{int(dist_km*1000)},{lat},{lon})["piste:type"];
-      relation(around:{int(dist_km*1000)},{lat},{lon})["piste:type"];
-    );
-    out geom;
-    """
-    r = requests.post("https://overpass-api.de/api/interpreter", data=query, headers=UA, timeout=30)
-    r.raise_for_status()
-    data = r.json().get("elements", [])
-    feats=[]
-    for el in data:
-        props = {
-            "id": el.get("id"),
-            "piste:type": (el.get("tags") or {}).get("piste:type",""),
-            "name": (el.get("tags") or {}).get("name","")
-        }
-        if "geometry" in el:
-            coords = [(g["lon"], g["lat"]) for g in el["geometry"]]
-            geom = {"type":"LineString","coordinates":coords}
-            feats.append({"type":"Feature","geometry":geom,"properties":props})
-    return {"type":"FeatureCollection","features":feats}
-
 # --- Mappa interattiva ---
 HAS_FOLIUM = False
 try:
@@ -723,36 +697,37 @@ except Exception:
 
 if HAS_FOLIUM:
     with st.expander(T["map"] + " — clicca sulla mappa per selezionare", expanded=True):
-        m = folium.Map(location=[lat, lon], zoom_start=12, tiles=None, control_scale=True, prefer_canvas=True, zoom_control=True)
+        # usa sempre le coord nello state come centro (evita "salti")
+        center_lat = st.session_state.get("lat", lat)
+        center_lon = st.session_state.get("lon", lon)
+        m = folium.Map(location=[center_lat, center_lon], zoom_start=12, tiles=None, control_scale=True, prefer_canvas=True, zoom_control=True)
+
+        # Basemaps
         TileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", name="Strade", attr="© OSM", overlay=False, control=True).add_to(m)
         TileLayer("https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}", name="Satellite", attr="Tiles © Esri", overlay=False, control=True).add_to(m)
-        TileLayer("https://tiles.opensnowmap.org/pistes/{z}/{x}/{y}.png", name="Piste overlay (tiles)", attr="© OpenSnowMap.org contributors", overlay=True, control=True, opacity=0.85).add_to(m)
-        try:
-            gj = fetch_pistes_geojson(lat, lon, dist_km=30)
-            if gj["features"]:
-                folium.GeoJson(
-                    data=gj, name="Piste (OSM/Overpass)",
-                    tooltip=folium.GeoJsonTooltip(fields=["name","piste:type"], aliases=["Nome","Tipo"]),
-                    style_function=lambda f: {"color":"#3388ff","weight":3,"opacity":0.9}
-                ).add_to(m)
-        except Exception:
-            pass
-        Marker([lat, lon], tooltip=place_label, icon=folium.Icon(color="lightgray")).add_to(m)
+        # SOLO piste: tiles OpenSnowMap (nessun GeoJSON extra)
+        TileLayer("https://tiles.opensnowmap.org/pistes/{z}/{x}/{y}.png", name="Piste (OpenSnowMap)", attr="© OpenSnowMap.org contributors", overlay=True, control=True, opacity=0.9).add_to(m)
+
+        # Marker posizione selezionata
+        Marker([center_lat, center_lon], tooltip=place_label, icon=folium.Icon(color="lightgray")).add_to(m)
         MousePosition().add_to(m)
         LayerControl(position="bottomleft", collapsed=True).add_to(m)
 
         out = st_folium(m, height=420, use_container_width=True, key="map_widget", returned_objects=["last_clicked"])
         click = (out or {}).get("last_clicked") or {}
+
+        # Debounce click: aggiorna solo se realmente diverso dall'ultimo gestito
         if click:
-            curr = (round(float(click.get("lat")),6), round(float(click.get("lng")),6))
-            prev = st.session_state.get("_last_click")
-            if curr != prev:
-                st.session_state["_last_click"] = curr  # debounce per evitare loop
-                new_lat, new_lon = curr
+            new_lat = float(click.get("lat")); new_lon = float(click.get("lng"))
+            new_key = (round(new_lat,6), round(new_lon,6))
+            prev_key = st.session_state.get("_handled_click")
+            cur_key  = (round(st.session_state.get("lat",0.0),6), round(st.session_state.get("lon",0.0),6))
+            if new_key != prev_key and new_key != cur_key:
                 st.session_state["lat"] = new_lat
                 st.session_state["lon"] = new_lon
                 st.session_state["place_label"] = reverse_geocode(new_lat, new_lon)
-                st.toast(f"Posizione aggiornata: {st.session_state['place_label']}", icon="📍")
+                st.session_state["_handled_click"] = new_key
+                st.success(f"Posizione aggiornata: {st.session_state['place_label']}")
                 st.rerun()
 else:
     try:
@@ -764,15 +739,17 @@ else:
 # --- Pannello opzionale: posizionamento manuali ---
 with st.expander("➕ Imposta coordinate manuali / Set precise coordinates", expanded=False):
     c_lat, c_lon = st.columns(2)
-    new_lat = c_lat.number_input("Lat", value=float(lat), format="%.6f")
-    new_lon = c_lon.number_input("Lon", value=float(lon), format="%.6f")
+    new_lat = c_lat.number_input("Lat", value=float(st.session_state.get("lat", lat)), format="%.6f")
+    new_lon = c_lon.number_input("Lon", value=float(st.session_state.get("lon", lon)), format="%.6f")
     if st.button("Imposta / Set"):
-        st.session_state["_last_click"] = (round(float(new_lat),6), round(float(new_lon),6))  # aggiorna anche debounce
-        st.session_state["lat"] = float(new_lat)
-        st.session_state["lon"] = float(new_lon)
-        new_label = reverse_geocode(float(new_lat), float(new_lon))
-        st.session_state["place_label"] = new_label
-        st.rerun()
+        new_key = (round(float(new_lat),6), round(float(new_lon),6))
+        cur_key = (round(st.session_state.get("lat",0.0),6), round(st.session_state.get("lon",0.0),6))
+        if new_key != cur_key:
+            st.session_state["lat"] = float(new_lat)
+            st.session_state["lon"] = float(new_lon)
+            st.session_state["place_label"] = reverse_geocode(float(new_lat), float(new_lon))
+            st.session_state["_handled_click"] = new_key
+            st.rerun()
 
 # --- Pannello DEM: esposizione & pendenza ---
 with st.expander(T["dem_hdr"], expanded=False):
@@ -905,7 +882,7 @@ if btn:
 
                 wind_unit_lbl = "m/s" if not use_fahrenheit else "km/h"
 
-                # --- CHARTS
+                # --- Grafici
                 tloc = disp["time_local"].dt.tz_localize(None)
                 fig1 = plt.figure(figsize=(10,3))
                 plt.plot(tloc, disp["T2m"], label=Tair_lbl)
@@ -927,18 +904,17 @@ if btn:
 
                 plot_speed_mini(disp)
 
-                # --- TABELLE (completa)
-                st.subheader(T.get("tables_hdr","Tabelle"))
-                table_cols = ["time_local","T2m","td","RH","Tw","wind","cloud","SW_down","prp_mmph","rain","snowfall","T_surf","T_top5","liq_water_pct","speed_index"]
-                show_cols = [c for c in table_cols if c in disp.columns]
-                tbl = disp[show_cols].copy()
+                # --- TABELLA METEO COMPLETA (locale)
+                tbl_cols = ["time_local","T2m","td","Tw","RH","wind","cloud","SW_down","prp_mmph","rain","snowfall","T_surf","T_top5","liq_water_pct","speed_index"]
+                tbl = disp[tbl_cols].copy()
                 tbl["time_local"] = tbl["time_local"].dt.strftime("%Y-%m-%d %H:%M")
-                st.dataframe(tbl, use_container_width=True, height=260)
+                st.markdown(f"#### {T['tbl_full']}")
+                st.dataframe(tbl, use_container_width=True, hide_index=True)
 
                 if show_debug:
                     st.info(f"Rows: {len(disp)} · time_local: {disp['time_local'].min()} → {disp['time_local'].max()}")
 
-                # --- BLOCCHI
+                # --- Blocchi A/B/C
                 blocks = {"A":(A_start,A_end),"B":(B_start,B_end),"C":(C_start,C_end)}
                 t_med_map = {}
                 for L,(s,e) in blocks.items():
@@ -959,7 +935,8 @@ if btn:
                     if any_alert:
                         st.markdown(f"<div class='badge-red'>⚠ {T['alert'].format(lbl=L)}</div>", unsafe_allow_html=True)
                     k = classify_snow(W.iloc[0])
-                    rel = reliability((W.index[0] if not W.empty else 0) + 1)
+                    # affidabilità semplice: basata sul lead time medio del blocco
+                    rel = reliability(float(W["lead_h"].mean()) if "lead_h" in W else (W.index[0] + 1))
                     v_eff = (W["wind"] if not use_fahrenheit else ms_to_kmh(W["wind"])).mean()
                     st.markdown(
                         f"<div class='banner'><b>{T['cond']}</b> {k} · "
@@ -972,6 +949,22 @@ if btn:
                     st.markdown(f"**{T['struct']}** {recommended_structure(t_for_struct)}")
                     wax_form, brush_seq, use_topcoat = wax_form_and_brushes(t_for_struct, rh_med)
 
+                    # tabella riassuntiva blocco
+                    sum_rows = {
+                        "T_surf (mean)": round(float(W["T_surf"].mean()),1),
+                        "T_surf (min)":  round(float(W["T_surf"].min()),1),
+                        "T_surf (max)":  round(float(W["T_surf"].max()),1),
+                        "RH% (mean)":    round(float(W["RH"].mean()),0),
+                        "SW↓ (mean)":    round(float(W["SW_down"].mean()),0),
+                        "Prp mm/h (max)":round(float(W["prp_mmph"].max()),1),
+                        "Wind (mean)":   round(float(W["wind"].mean() if not use_fahrenheit else ms_to_kmh(W["wind"]).mean()),2),
+                        "H₂O liq % (mean)": round(float(W["liq_water_pct"].mean()),1),
+                        "Speed idx (mean)": round(float(W["speed_index"].mean()),0),
+                    }
+                    st.markdown(f"**{T['tbl_blk'].format(b=L)}**")
+                    st.dataframe(pd.DataFrame(sum_rows, index=["valori"]), use_container_width=True)
+
+                    # cards brand
                     st.markdown("<div class='grid'>", unsafe_allow_html=True)
                     for (name, solid_bands, liquid_bands) in BRANDS:
                         rec_solid  = pick_wax(solid_bands, t_for_struct, rh_med)
@@ -981,13 +974,7 @@ if btn:
                         st.markdown(html, unsafe_allow_html=True)
                     st.markdown("</div>", unsafe_allow_html=True)
 
-                    # Tabella del blocco
-                    Wtbl = W[show_cols].copy()
-                    Wtbl["time_local"] = Wtbl["time_local"].dt.strftime("%Y-%m-%d %H:%M")
-                    with st.expander(f"{T.get('block_table','Tabella blocco')} {L}", expanded=False):
-                        st.dataframe(Wtbl, use_container_width=True, height=220)
-
-                    # Tuning discipline
+                    # tuning disciplines
                     rows=[]
                     for d in ["SL","GS","SG","DH"]:
                         fam, side, base = tune_for(t_for_struct, d)
@@ -995,7 +982,7 @@ if btn:
                     tune_list = "".join([f"<li><b>{d}</b>: {fam} — SIDE {side} · BASE {base}</li>" for d,fam,side,base in rows])
                     st.markdown(f"<div class='card tune'><div><b>Tuning per disciplina</b></div><ul class='small'>{tune_list}</ul></div>", unsafe_allow_html=True)
 
-                # Download CSV e PDF
+                # --- Download CSV & PDF
                 csv = disp.copy()
                 csv["time_local"] = csv["time_local"].dt.strftime("%Y-%m-%d %H:%M")
                 csv = csv.drop(columns=["time_utc"])
