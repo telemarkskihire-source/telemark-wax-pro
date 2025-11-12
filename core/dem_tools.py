@@ -37,3 +37,13 @@ def aspect_to_compass(deg: float):
     dirs = ["N","NNE","NE","ENE","E","ESE","SE","SSE","S","SSW","SW","WSW","W","WNW","NW","NNW"]
     idx = int((deg + 11.25) // 22.5) % 16
     return dirs[idx]
+# --- EXPORT COMPAT ---
+def render_dem(T, ctx):
+    for name in ["dem_panel", "show_dem", "main", "render"]:
+        fn = globals().get(name)
+        if callable(fn):
+            return fn(T, ctx)
+    import streamlit as st
+    st.markdown("**[dem]** pronto (stub).")
+
+render = render_dem
