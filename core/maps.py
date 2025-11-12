@@ -80,3 +80,13 @@ def place_search_box(T):
         _, la, lo, lab = sel.split("|", 3)
         return {"lat": float(la), "lon": float(lo), "label": lab}
     return None
+# --- EXPORT COMPAT ---
+def render_map(T, ctx):
+    for name in ["map_panel", "show_map", "main", "render"]:
+        fn = globals().get(name)
+        if callable(fn):
+            return fn(T, ctx)
+    import streamlit as st
+    st.markdown("**[map]** pronto (stub).")
+
+render = render_map
