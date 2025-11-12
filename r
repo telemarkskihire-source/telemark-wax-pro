@@ -1,8 +1,0 @@
-streamlit>=1.30,<2
-streamlit-searchbox>=0.3.0
-streamlit-folium>=0.20.0
-requests>=2.31.0
-pandas>=2.1.0
-numpy>=1.26.0
-matplotlib>=3.8.0
-python-dateutil>=2.8.2
