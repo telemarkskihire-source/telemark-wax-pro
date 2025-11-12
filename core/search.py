@@ -31,7 +31,7 @@ HEADERS_NOM = {
     "Referer": "https://telemarkskihire.com",
 }
 if NOMINATIM_EMAIL:
-    HEADERS_NOM["From"] = NOMINATIM_EMAIL  # in linea con la policy Nominatim
+    HEADERS_NOM["From"] = NOMINATIM_EMAIL  # conforme a policy Nominatim
 
 def _retry(func, attempts: int = 2, sleep: float = 0.8):
     for i in range(attempts):
@@ -52,7 +52,6 @@ def _concise_label(addr: dict, fallback: str) -> str:
 # -------------------- Sorgenti di ricerca --------------------
 @st.cache_data(ttl=60*60, show_spinner=False)
 def _search_nominatim(q: str, iso2: str):
-    """Ricerca su Nominatim con filtro paese; ritorna [] su 403/429/5xx per evitare crash."""
     q = (q or "").strip()
     if len(q) < 2:
         return []
@@ -71,7 +70,6 @@ def _search_nominatim(q: str, iso2: str):
         js = r.json() or []
     except Exception:
         return []
-
     out = []
     for it in js:
         addr = it.get("address", {}) or {}
@@ -88,7 +86,6 @@ def _search_nominatim(q: str, iso2: str):
 
 @st.cache_data(ttl=60*60, show_spinner=False)
 def _search_photon(q: str, iso2: str):
-    """Fallback su Photon (Komoot). Filtro paese lato client."""
     q = (q or "").strip()
     if len(q) < 2:
         return []
@@ -104,7 +101,6 @@ def _search_photon(q: str, iso2: str):
         js = r.json() or {}
     except Exception:
         return []
-
     feats = js.get("features", []) or []
     out = []
     for f in feats:
@@ -127,13 +123,11 @@ def _search_photon(q: str, iso2: str):
 
 # -------------------- UI widgets --------------------
 def country_selectbox(T) -> str:
-    """Ritorna il codice ISO2 del paese selezionato."""
     sel = st.selectbox(T["country"], list(COUNTRIES.keys()), index=0, key="country_sel")
     return COUNTRIES[sel]
 
 def _search_function_factory(iso2: str):
     def _search(q: str):
-        # ogni chiamata rigenera la mappa delle opzioni
         st.session_state._options = {}
         res = _search_nominatim(q, iso2)
         if not res:
@@ -154,17 +148,13 @@ def location_searchbox(T, iso2: str, key: str = "place"):
         search_function=_search_function_factory(iso2),
         key=key,
         placeholder=T["search_ph"],
-        debounce=700,                  # più alto per limitare le chiamate
+        debounce=700,
         clear_on_submit=False,
         default=None,
     )
-
-    # Defaults correnti/persistiti
     lat = float(st.session_state.get("lat", 45.831))
     lon = float(st.session_state.get("lon", 7.730))
     label = st.session_state.get("place_label", "🇮🇹  Champoluc, Valle d’Aosta — IT")
-
-    # Se è stata scelta una riga dai suggerimenti → aggiorna
     if selected and "|||" in selected and "_options" in st.session_state:
         info = st.session_state._options.get(selected)
         if info:
@@ -173,9 +163,7 @@ def location_searchbox(T, iso2: str, key: str = "place"):
                 st.session_state["lat"] = lat
                 st.session_state["lon"] = lon
                 st.session_state["place_label"] = label
-                st.session_state["_last_click"] = None  # reset selezione mappa
+                st.session_state["_last_click"] = None
             except Exception:
                 pass
-
     return lat, lon, label
-```0
