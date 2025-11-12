@@ -1,44 +1,68 @@
 # core/search.py
-# Ricerca località senza streamlit-searchbox (solo Streamlit).
-# Provider 1: Open-Meteo Geocoding (rapido)
+# Ricerca località (solo Streamlit native: text_input + selectbox)
+# Provider 1: Open-Meteo Geocoding (veloce)
 # Provider 2: Nominatim (OSM) con pre-filtro paese
-# Espone: place_search_ui(T, iso2, key_prefix="place") -> (lat, lon, label)
+# API: place_search_ui(T, iso2, key_prefix="place") -> (lat, lon, label)
 
 from __future__ import annotations
 import time, unicodedata, requests
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, Optional
 import streamlit as st
 
 # ---------- Config ----------
-UA = {
-    # Per Nominatim è consigliato includere un contatto (url o email)
-    "User-Agent": "telemark-wax-pro/1.2 (+https://telemarkskihire.com)"
-}
+UA = {"User-Agent": "telemark-wax-pro/1.2 (+https://telemarkskihire.com)"}
 NOMINATIM_MIN_DELAY_S = 1.0  # rate-limit suggerito da OSM
+HTTP_TIMEOUT = 8
+
+# ---------- Cache minimale (compatibile con qualsiasi Streamlit) ----------
+def _ss():
+    st.session_state.setdefault("__search_cache", {})
+    st.session_state.setdefault("__nom_last_ts", 0.0)
+    return st.session_state["__search_cache"]
+
+def _cache_get(key: str) -> Optional[Any]:
+    item = _ss().get(key)
+    if not item: return None
+    val, exp = item
+    if exp and time.time() > exp:
+        del _ss()[key]
+        return None
+    return val
+
+def _cache_put(key: str, val: Any, ttl_s: int = 3600):
+    _ss()[key] = (val, time.time() + ttl_s if ttl_s else None)
 
 # ---------- Utils ----------
-def _flag(cc: str | None) -> str:
-    """Converte ISO2 (es. 'IT') in bandiera emoji, fallback bianca in caso di errori."""
+def _flag(cc: Optional[str]) -> str:
     try:
-        if not cc:
-            return "🏳️"
+        if not cc: return "🏳️"
         c = cc.upper()
         return chr(127397 + ord(c[0])) + chr(127397 + ord(c[1]))
     except Exception:
         return "🏳️"
 
-def _concise_label(addr_name: str, admin: str | None, cc: str | None) -> str:
+def _concise_label(addr_name: str, admin: Optional[str], cc: Optional[str]) -> str:
     parts = [p for p in [addr_name, admin] if p]
     s = ", ".join(parts) if parts else (addr_name or "")
     return f"{s} — {cc.upper()}" if cc else s
 
 def _norm(s: str) -> str:
-    # per dedup: toglie accenti e normalizza
     return unicodedata.normalize("NFKD", s or "").encode("ASCII", "ignore").decode().lower().strip()
 
-# ---------- PROVIDER 1: Open-Meteo Geocoding (veloce) ----------
-@st.cache_data(ttl=3600, show_spinner=False)
-def _om_geocode(name: str, iso2: str | None, lang: str = "it") -> List[Dict[str, Any]]:
+# ---------- HTTP helper ----------
+def _http_get_json(url: str, params: dict, ttl_s: int) -> Any:
+    key = f"GET|{url}|{sorted(params.items())}"
+    cached = _cache_get(key)
+    if cached is not None:
+        return cached
+    r = requests.get(url, params=params, headers=UA, timeout=HTTP_TIMEOUT)
+    r.raise_for_status()
+    j = r.json()
+    _cache_put(key, j, ttl_s=ttl_s)
+    return j
+
+# ---------- PROVIDER 1: Open-Meteo ----------
+def _om_geocode(name: str, iso2: Optional[str], lang: str = "it") -> List[Dict[str, Any]]:
     params = {
         "name": name,
         "count": 12,
@@ -48,12 +72,7 @@ def _om_geocode(name: str, iso2: str | None, lang: str = "it") -> List[Dict[str,
     if iso2:
         params["country"] = iso2.upper()
 
-    r = requests.get(
-        "https://geocoding-api.open-meteo.com/v1/search",
-        params=params, headers=UA, timeout=8
-    )
-    r.raise_for_status()
-    j = r.json() or {}
+    j = _http_get_json("https://geocoding-api.open-meteo.com/v1/search", params, ttl_s=3600) or {}
     results: List[Dict[str, Any]] = []
     for it in (j.get("results") or []):
         city  = it.get("name") or ""
@@ -63,24 +82,17 @@ def _om_geocode(name: str, iso2: str | None, lang: str = "it") -> List[Dict[str,
         lon   = float(it.get("longitude"))
         label_core = _concise_label(city, admin, cc)
         disp  = f"{_flag(cc)}  {label_core}"
-        results.append({
-            "label": disp,           # visibile (con bandiera)
-            "lat": lat, "lon": lon, "cc": cc,
-            "raw_label": label_core  # per dedup
-        })
+        results.append({"label": disp, "lat": lat, "lon": lon, "cc": cc, "raw_label": label_core})
     return results
 
-# ---------- PROVIDER 2: Nominatim (OSM) ----------
-_last_nom_call_ts = 0.0
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def _osm_geocode(name: str, iso2: str | None, lang: str = "it") -> List[Dict[str, Any]]:
-    # Rispetta rate-limit (anche se cache riduce molto il rischio)
-    global _last_nom_call_ts
+# ---------- PROVIDER 2: Nominatim ----------
+def _osm_geocode(name: str, iso2: Optional[str], lang: str = "it") -> List[Dict[str, Any]]:
+    # rate-limit minimo
     now = time.time()
-    if now - _last_nom_call_ts < NOMINATIM_MIN_DELAY_S:
-        time.sleep(NOMINATIM_MIN_DELAY_S - (now - _last_nom_call_ts))
-    _last_nom_call_ts = time.time()
+    last = st.session_state.get("__nom_last_ts", 0.0)
+    if now - last < NOMINATIM_MIN_DELAY_S:
+        time.sleep(NOMINATIM_MIN_DELAY_S - (now - last))
+    st.session_state["__nom_last_ts"] = time.time()
 
     params = {
         "q": name,
@@ -92,13 +104,9 @@ def _osm_geocode(name: str, iso2: str | None, lang: str = "it") -> List[Dict[str
     if iso2:
         params["countrycodes"] = iso2.lower()
 
-    r = requests.get(
-        "https://nominatim.openstreetmap.org/search",
-        params=params, headers=UA, timeout=10
-    )
-    r.raise_for_status()
+    j = _http_get_json("https://nominatim.openstreetmap.org/search", params, ttl_s=3600) or []
     out: List[Dict[str, Any]] = []
-    for it in (r.json() or []):
+    for it in (j or []):
         addr  = it.get("address", {}) or {}
         name0 = (addr.get("village") or addr.get("town") or addr.get("city")
                  or addr.get("hamlet") or it.get("display_name", ""))
@@ -108,39 +116,32 @@ def _osm_geocode(name: str, iso2: str | None, lang: str = "it") -> List[Dict[str
         lon   = float(it.get("lon", 0))
         label_core = _concise_label(name0, admin, cc)
         disp  = f"{_flag(cc)}  {label_core}"
-        out.append({
-            "label": disp, "lat": lat, "lon": lon, "cc": cc,
-            "raw_label": label_core
-        })
+        out.append({"label": disp, "lat": lat, "lon": lon, "cc": cc, "raw_label": label_core})
     return out
 
 # ---------- merge + dedup ----------
-def _merge_results(a: List[Dict[str, Any]] | None,
-                   b: List[Dict[str, Any]] | None) -> List[Dict[str, Any]]:
+def _merge_results(a: List[Dict[str, Any]] | None, b: List[Dict[str, Any]] | None) -> List[Dict[str, Any]]:
     seen = set()
     out: List[Dict[str, Any]] = []
     for src in (a or []), (b or []):
         for it in src:
-            key = (_norm(it.get("raw_label", "")),
-                   round(float(it.get("lat", 0)), 4),
-                   round(float(it.get("lon", 0)), 4))
-            if key in seen:
-                continue
+            key = (_norm(it.get("raw_label", "")), round(float(it.get("lat", 0)), 4), round(float(it.get("lon", 0)), 4))
+            if key in seen: continue
             seen.add(key)
             out.append(it)
     return out
 
-# ---------- UI wrapper (solo Streamlit components) ----------
-def place_search_ui(T: Dict[str, str], iso2: str | None, key_prefix: str = "place") -> Tuple[float, float, str]:
+# ---------- UI wrapper (solo componenti Streamlit) ----------
+def place_search_ui(T: Dict[str, str], iso2: Optional[str], key_prefix: str = "place") -> Tuple[float, float, str]:
     """
     Disegna una searchbox nativa (text_input + selectbox) e restituisce (lat, lon, label).
-    Aggiorna anche st.session_state[f'{key_prefix}_lat'/'_lon'/'_label'].
+    Aggiorna: st.session_state[f'{key_prefix}_lat'/'_lon'/'_label'].
     """
-    # placeholder / lingua
+    # lingua / placeholder
     ph = T.get("search_ph", "Cerca località…")
     lang_ui = "it" if ("Cerca" in ph or "Nazione" in (T.get("country", ""))) else "en"
 
-    # Chiavi di stato namespaziate
+    # chiavi di stato
     LAT_K  = f"{key_prefix}_lat"
     LON_K  = f"{key_prefix}_lon"
     LAB_K  = f"{key_prefix}_label"
@@ -148,15 +149,15 @@ def place_search_ui(T: Dict[str, str], iso2: str | None, key_prefix: str = "plac
     Q_K    = f"{key_prefix}__query"
     SEL_K  = f"{key_prefix}__selected"
 
-    # default: Champoluc
+    # default Champoluc
     lat = float(st.session_state.get(LAT_K, 45.83100))
     lon = float(st.session_state.get(LON_K, 7.73000))
     label = st.session_state.get(LAB_K, "🇮🇹  Champoluc, Valle d’Aosta — IT")
 
-    # input testuale
+    # input
     q = st.text_input(ph, key=Q_K, value=st.session_state.get(Q_K, ""), placeholder=ph)
 
-    # ogni volta che q cambia e ha almeno 2 caratteri → ricerco
+    # cerca se q >= 2 char
     options: List[str] = []
     st.session_state.setdefault(OPTS_K, {})
     if q and len(q.strip()) >= 2:
@@ -170,21 +171,17 @@ def place_search_ui(T: Dict[str, str], iso2: str | None, key_prefix: str = "plac
             b = []
         merged = _merge_results(a, b)
 
-        # mappo token → item e preparo le opzioni visibili
         st.session_state[OPTS_K] = {}
         for it in merged:
             token = f"om|{it['lat']:.6f}|{it['lon']:.6f}|{it['cc']}"
             st.session_state[OPTS_K][token] = it
             options.append(f"{token}  {it['label']}")
 
-    # select dei risultati (se presenti)
+    # select risultati
     if options:
-        selected_display = st.selectbox(
-            "Risultati",
-            options=options,
-            index=0 if st.session_state.get(SEL_K) not in options else options.index(st.session_state[SEL_K]),
-            key=SEL_K
-        )
+        prev = st.session_state.get(SEL_K)
+        idx = options.index(prev) if prev in options else 0
+        selected_display = st.selectbox("Risultati", options=options, index=idx, key=SEL_K)
         if selected_display:
             token = selected_display.split("  ", 1)[0].strip()
             info = (st.session_state.get(OPTS_K) or {}).get(token)
@@ -193,9 +190,6 @@ def place_search_ui(T: Dict[str, str], iso2: str | None, key_prefix: str = "plac
                 lon = float(info["lon"]); st.session_state[LON_K] = lon
                 label = info["label"];    st.session_state[LAB_K] = label
 
-    # badge riassunto (facoltativo, ma comodo)
-    st.markdown(
-        f"<div class='badge'>📍 {label} · lat <b>{lat:.5f}</b>, lon <b>{lon:.5f}</b></div>",
-        unsafe_allow_html=True
-    )
+    # badge riassunto
+    st.markdown(f"<div class='badge'>📍 {label} · lat <b>{lat:.5f}</b>, lon <b>{lon:.5f}</b></div>", unsafe_allow_html=True)
     return lat, lon, label
