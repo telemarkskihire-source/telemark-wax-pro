@@ -1,5 +1,5 @@
 # core/wax_logic.py
-# Telemark · Pro Wax & Tune — pannello Scioline & Tuning (estratto dal monoblocco)
+# Telemark · Pro Wax & Tune — pannello Scioline & Tuning (estratto dal monoblocco, no ricorsioni)
 
 import os, base64
 import numpy as np
@@ -126,12 +126,12 @@ def tune_for(Tsurf, discipline):
     return fam, side, base
 
 def classify_snow(row):
-    if row.ptyp=="rain": return "Neve bagnata/pioggia"
-    if row.ptyp=="mixed": return "Mista pioggia-neve"
-    if row.ptyp=="snow" and row.T_surf>-2: return "Neve nuova umida"
-    if row.ptyp=="snow" and row.T_surf<=-2: return "Neve nuova fredda"
-    if row.liq_water_pct>=3.0: return "Primaverile/trasformata bagnata"
-    if row.T_surf<=-8 and row.cloud<0.4: return "Rigelata/ghiacciata"
+    if getattr(row, "ptyp", None) == "rain": return "Neve bagnata/pioggia"
+    if getattr(row, "ptyp", None) == "mixed": return "Mista pioggia-neve"
+    if getattr(row, "ptyp", None) == "snow" and row.T_surf>-2: return "Neve nuova umida"
+    if getattr(row, "ptyp", None) == "snow" and row.T_surf<=-2: return "Neve nuova fredda"
+    if getattr(row, "liq_water_pct", 0) >= 3.0: return "Primaverile/trasformata bagnata"
+    if row.T_surf<=-8 and getattr(row, "cloud", 0)<0.4: return "Rigelata/ghiacciata"
     return "Compatta/trasformata secca"
 
 # ---------------------- UI helpers ----------------------
@@ -171,10 +171,10 @@ def render_wax(T, ctx):
     st.markdown("#### 4) Scioline & tuning")
     X = st.session_state.get("_meteo_res")
     if X is None or len(X)==0:
-        st.info("Calcola prima il meteo (sezione 3).")
+        st.info(T.get("nodata","Nessun dato nella finestra scelta.") + " Calcola prima il meteo (sezione 3).")
         return
 
-    # Usa le finestre A/B/C se la UI le ha impostate, altrimenti “prossime 6 ore”
+    # day & windows dalla UI principale se presenti
     target_day = st.session_state.get("ref_day") or X["time_local"].dt.date.iloc[0]
     A = (st.session_state.get("A_s"), st.session_state.get("A_e"))
     B = (st.session_state.get("B_s"), st.session_state.get("B_e"))
@@ -203,7 +203,7 @@ def render_wax(T, ctx):
         t_med = float(W["T_surf"].mean())
         rh_med = float(W["RH"].mean())
         v_eff = float(W["wind"].mean())
-        cond = classify_snow(W.iloc[0]) if "ptyp" in W.columns else "—"
+        cond = classify_snow(W.iloc[0]) if "T_surf" in W.columns else "—"
 
         st.markdown(
             f"<div class='banner' style='border-left:6px solid #f97316; background:#1a2230; padding:.75rem .9rem; border-radius:10px;'>"
@@ -242,5 +242,5 @@ def render_wax(T, ctx):
             "</div>", unsafe_allow_html=True
         )
 
-# alias
+# alias che l’orchestratore riconosce
 render = render_wax
