@@ -102,3 +102,9 @@ def render_wax(T, ctx):
     st.markdown("**[wax]** pronto (stub).")
 
 render = render_wax
+# --- export di fallback ---
+if not any(k in globals() for k in ("render_wax","wax_panel","render")):
+    def render_wax(T, ctx):
+        import streamlit as st
+        st.markdown("**[wax_logic]** pronto (stub).")
+    render = render_wax
