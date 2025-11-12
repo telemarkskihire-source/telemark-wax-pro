@@ -1,11 +1,23 @@
 # core/utils.py
 # Utilità condivise (meteo, fisica semplice, UA)
 
-import math
+import math, time
 import numpy as np
 
 # User-Agent coerente per tutte le chiamate HTTP
 UA = {"User-Agent": "telemark-wax-pro/1.2 (+https://telemarkskihire.com)"}
+
+# --- piccolo helper retry generico (serve a core.maps e altri moduli) ---
+def _retry(func, attempts=2, sleep=0.8):
+    last = None
+    for i in range(int(attempts)):
+        try:
+            return func()
+        except Exception as e:
+            last = e
+            if i == attempts - 1:
+                raise
+            time.sleep(sleep * (1.5 ** i))
 
 # --- Umidità relativa da T e Td (°C) ---
 def rh_from_t_td(Tv, Td):
@@ -27,7 +39,8 @@ def wetbulb_stull(Tv, RH):
     """
     Tv [°C], RH [%] -> Tw [°C]
     """
-    RH = np.clip(RH, 1, 100)
+    Tv = np.asarray(Tv, dtype=float)
+    RH = np.clip(np.asarray(RH, dtype=float), 1.0, 100.0)
     Tw = (
         Tv * np.arctan(0.151977 * np.sqrt(RH + 8.313659))
         + np.arctan(Tv + RH)
@@ -61,12 +74,13 @@ def effective_wind(w):
     w = np.clip(w, 0, 8.0)  # limita per evitare outlier
     return 8.0 * (np.log1p(w) / np.log1p(8.0))
 
-# (Opzionali, utili in altri moduli)
+# (Opzionali, utili altrove)
 def c_to_f(x): return x * 9 / 5 + 32
 def ms_to_kmh(x): return x * 3.6
 
 __all__ = [
-    "UA", "rh_from_t_td", "wetbulb_stull",
+    "UA", "_retry",
+    "rh_from_t_td", "wetbulb_stull",
     "clear_sky_ghi", "effective_wind",
     "c_to_f", "ms_to_kmh",
 ]
