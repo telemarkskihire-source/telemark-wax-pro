@@ -47,3 +47,10 @@ def render_dem(T, ctx):
     st.markdown("**[dem]** pronto (stub).")
 
 render = render_dem
+
+# --- export di fallback ---
+if not any(k in globals() for k in ("render_dem","dem_panel","show_dem","render")):
+    def render_dem(T, ctx):
+        import streamlit as st
+        st.markdown("**[dem_tools]** pronto (stub).")
+    render = render_dem
