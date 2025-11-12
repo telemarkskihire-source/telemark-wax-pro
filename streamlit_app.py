@@ -1,4 +1,6 @@
 # app.py
+import sys, os
+sys.path.append(os.path.abspath(os.path.dirname(__file__)))
 import streamlit as st
 from datetime import date
 from core.i18n import L
