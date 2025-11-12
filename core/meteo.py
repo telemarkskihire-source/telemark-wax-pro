@@ -229,3 +229,10 @@ def render_meteo(T, ctx):
 
 # Alias generico
 render = render_meteo
+
+# --- export di fallback per l’orchestratore ---
+if not any(k in globals() for k in ("render_meteo","panel_meteo","run_meteo","show_meteo","render")):
+    def render_meteo(T, ctx):
+        import streamlit as st
+        st.markdown("**[meteo]** pronto (stub).")
+    render = render_meteo
