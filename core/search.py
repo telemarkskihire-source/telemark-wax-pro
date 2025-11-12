@@ -1,13 +1,13 @@
 # core/search.py
-# Ricerca località: provider 1 = Open-Meteo Geocoding (rapido)
-# fallback provider 2 = Nominatim (OSM) con pre-filtro paese
+# Ricerca località senza streamlit-searchbox (solo Streamlit).
+# Provider 1: Open-Meteo Geocoding (rapido)
+# Provider 2: Nominatim (OSM) con pre-filtro paese
 # Espone: place_search_ui(T, iso2, key_prefix="place") -> (lat, lon, label)
 
 from __future__ import annotations
 import time, unicodedata, requests
 from typing import List, Dict, Any, Tuple
 import streamlit as st
-from streamlit_searchbox import st_searchbox
 
 # ---------- Config ----------
 UA = {
@@ -130,91 +130,68 @@ def _merge_results(a: List[Dict[str, Any]] | None,
             out.append(it)
     return out
 
-# ---------- CALLBACK TOP-LEVEL (picklable) ----------
-def _search_callback(q: str) -> List[str]:
-    """
-    Callback top-level per st_searchbox: legge la config dal session_state,
-    in base al prefisso attivo, e ritorna le opzioni 'token  label'.
-    """
-    key_prefix = st.session_state.get("__ps_active_prefix", "place")
-    cfg: Dict[str, Any] = st.session_state.get(f"__ps_cfg__{key_prefix}") or {}
-
-    iso2 = cfg.get("iso2")
-    lang_ui = cfg.get("lang_ui", "en")
-
-    if not q or len(q.strip()) < 2:
-        return []
-
-    # 1) OM (rapido) → 2) OSM (fallback)
-    try:
-        a = _om_geocode(q.strip(), iso2, lang_ui)
-    except Exception:
-        a = []
-    try:
-        b = _osm_geocode(q.strip(), iso2, lang_ui)
-    except Exception:
-        b = []
-
-    merged = _merge_results(a, b)
-
-    # salva mappa opzioni in sessione per risoluzione lat/lon
-    OPTS_K = f"{key_prefix}__search_opts"
-    st.session_state.setdefault(OPTS_K, {})
-    out_strings: List[str] = []
-    for it in merged:
-        token = f"om|{it['lat']:.6f}|{it['lon']:.6f}|{it['cc']}"
-        st.session_state[OPTS_K][token] = it
-        out_strings.append(f"{token}  {it['label']}")
-    return out_strings
-
-# ---------- UI wrapper richiamabile dal main ----------
+# ---------- UI wrapper (solo Streamlit components) ----------
 def place_search_ui(T: Dict[str, str], iso2: str | None, key_prefix: str = "place") -> Tuple[float, float, str]:
     """
-    Disegna la searchbox e restituisce (lat, lon, label).
+    Disegna una searchbox nativa (text_input + selectbox) e restituisce (lat, lon, label).
     Aggiorna anche st.session_state[f'{key_prefix}_lat'/'_lon'/'_label'].
     """
     # placeholder / lingua
     ph = T.get("search_ph", "Cerca località…")
     lang_ui = "it" if ("Cerca" in ph or "Nazione" in (T.get("country", ""))) else "en"
 
-    # Registra config e prefisso attivo (letto dalla callback top-level)
-    st.session_state[f"__ps_cfg__{key_prefix}"] = {
-        "iso2": iso2,
-        "lang_ui": lang_ui,
-    }
-    st.session_state["__ps_active_prefix"] = key_prefix
-
-    # Searchbox
-    selected = st_searchbox(
-        _search_callback,                 # <-- top-level, quindi picklable
-        key=f"{key_prefix}_sb",
-        placeholder=ph,
-        clear_on_submit=False,
-        default=None
-    )
-
     # Chiavi di stato namespaziate
-    LAT_K = f"{key_prefix}_lat"
-    LON_K = f"{key_prefix}_lon"
-    LAB_K = f"{key_prefix}_label"
+    LAT_K  = f"{key_prefix}_lat"
+    LON_K  = f"{key_prefix}_lon"
+    LAB_K  = f"{key_prefix}_label"
     OPTS_K = f"{key_prefix}__search_opts"
+    Q_K    = f"{key_prefix}__query"
+    SEL_K  = f"{key_prefix}__selected"
 
-    # valori correnti persistiti (default Champoluc)
+    # default: Champoluc
     lat = float(st.session_state.get(LAT_K, 45.83100))
     lon = float(st.session_state.get(LON_K, 7.73000))
     label = st.session_state.get(LAB_K, "🇮🇹  Champoluc, Valle d’Aosta — IT")
 
-    if selected:
-        # `selected` è la riga visibile. Il token è sempre in testa: om|lat|lon|CC
-        token = selected.split("  ", 1)[0].strip()
-        info = (st.session_state.get(OPTS_K) or {}).get(token)
-        if info:
-            lat = float(info["lat"])
-            lon = float(info["lon"])
-            label = info["label"]
-            st.session_state[LAT_K] = lat
-            st.session_state[LON_K] = lon
-            st.session_state[LAB_K] = label
+    # input testuale
+    q = st.text_input(ph, key=Q_K, value=st.session_state.get(Q_K, ""), placeholder=ph)
+
+    # ogni volta che q cambia e ha almeno 2 caratteri → ricerco
+    options: List[str] = []
+    st.session_state.setdefault(OPTS_K, {})
+    if q and len(q.strip()) >= 2:
+        try:
+            a = _om_geocode(q.strip(), iso2, lang_ui)
+        except Exception:
+            a = []
+        try:
+            b = _osm_geocode(q.strip(), iso2, lang_ui)
+        except Exception:
+            b = []
+        merged = _merge_results(a, b)
+
+        # mappo token → item e preparo le opzioni visibili
+        st.session_state[OPTS_K] = {}
+        for it in merged:
+            token = f"om|{it['lat']:.6f}|{it['lon']:.6f}|{it['cc']}"
+            st.session_state[OPTS_K][token] = it
+            options.append(f"{token}  {it['label']}")
+
+    # select dei risultati (se presenti)
+    if options:
+        selected_display = st.selectbox(
+            "Risultati",
+            options=options,
+            index=0 if st.session_state.get(SEL_K) not in options else options.index(st.session_state[SEL_K]),
+            key=SEL_K
+        )
+        if selected_display:
+            token = selected_display.split("  ", 1)[0].strip()
+            info = (st.session_state.get(OPTS_K) or {}).get(token)
+            if info:
+                lat = float(info["lat"]); st.session_state[LAT_K] = lat
+                lon = float(info["lon"]); st.session_state[LON_K] = lon
+                label = info["label"];    st.session_state[LAB_K] = label
 
     # badge riassunto (facoltativo, ma comodo)
     st.markdown(
