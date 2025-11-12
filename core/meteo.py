@@ -215,3 +215,17 @@ def tune_for(Tsurf, discipline):
     else:
         fam = "Diagonal / V"; base = 0.8 if Tsurf<=0.5 else 1.0; side = {"SL":88.0,"GS":87.5,"SG":87.0,"DH":87.0}[discipline]
     return fam, side, base
+
+# --- EXPORT COMPAT ---
+def render_meteo(T, ctx):
+    # Prova a chiamare la tua funzione reale se esiste
+    for name in ["panel_meteo", "run_meteo", "main", "render"]:
+        fn = globals().get(name)
+        if callable(fn):
+            return fn(T, ctx)
+    # Stub di fallback
+    import streamlit as st
+    st.markdown("**[meteo]** pronto (stub).")
+
+# Alias generico
+render = render_meteo
