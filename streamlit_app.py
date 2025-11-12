@@ -19,6 +19,9 @@ hr { border:none; border-top:1px solid var(--line); margin:.75rem 0 }
 .badge { display:inline-flex; align-items:center; gap:.5rem; background:#0b1220;
   border:1px solid #203045; color:#cce7f2; border-radius:12px; padding:.35rem .6rem; font-size:.85rem; }
 .note { color:#9aa4af; font-size:.9rem; }
+.block { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding: .9rem .95rem; margin:.5rem 0; }
+.hdr { font-weight:600; margin-bottom:.35rem; }
+.small { color:#9aa4af; font-size:.9rem; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -70,52 +73,89 @@ ctx = {
 }
 st.session_state["_ctx"] = ctx  # i moduli possono leggerlo/aggiornarlo
 
-# ---------- LOADER MODULI ----------
+# ---------- UTILS: loader + dispatcher ----------
 def _load(modname: str):
     try:
         return importlib.import_module(modname)
-    except Exception:
+    except Exception as e:
+        st.warning(f"🟡 **{modname}** non importato ({e})")
         return None
 
-def _call_first(mod, names, *args, **kwargs):
-    """Chiama la prima funzione disponibile tra 'names' nel modulo, senza crash."""
+def _call_first(mod, candidates, *args, **kwargs):
+    """
+    Chiama la prima funzione disponibile tra 'candidates' in mod.
+    Ritorna (ok:bool, used:str).
+    """
     if not mod:
         return False, "missing"
-    for n in names:
+    for n in candidates:
         fn = getattr(mod, n, None)
         if callable(fn):
             try:
                 fn(*args, **kwargs)
                 return True, n
             except Exception as e:
-                st.error(f"{mod.__name__}.{n} → errore: {e}")
+                st.error(f"🔴 {mod.__name__}.{n} → errore: {e}")
                 return False, f"error:{n}"
     return False, "no-render-fn"
 
-# ---------- 2) ORCHESTRAZIONE: chiama i moduli esistenti ----------
-st.markdown("### 2) Moduli")
+# ---------- 2) ORCHESTRAZIONE: moduli con stato INLINE ----------
+st.markdown("## 2) Moduli")
 
 MODULES = [
     # (modulo, candidati funzione di rendering)
-    ("core.meteo",     ["render_meteo", "panel_meteo", "run_meteo", "render"]),
-    ("core.wax_logic", ["render_wax", "wax_panel", "render"]),
-    ("core.maps",      ["render_map", "map_panel", "show_map", "render"]),
-    ("core.dem_tools", ["render_dem", "dem_panel", "show_dem", "render"]),
+    ("core.meteo",     ["render_meteo", "panel_meteo", "run_meteo", "show_meteo", "main", "app", "render"]),
+    ("core.wax_logic", ["render_wax", "wax_panel", "show_wax", "main", "app", "render"]),
+    ("core.maps",      ["render_map", "map_panel", "show_map", "main", "app", "render"]),
+    ("core.dem_tools", ["render_dem", "dem_panel", "show_dem", "main", "app", "render"]),
 ]
 
-loaded = []
+statuses = []
 for modname, candidates in MODULES:
+    st.markdown(f"<div class='block'><div class='hdr'>▶ {modname}</div>", unsafe_allow_html=True)
     mod = _load(modname)
     ok, used = _call_first(mod, candidates, T, ctx)
-    loaded.append((modname, ok, used))
 
-# ---------- RIEPILOGO ----------
-with st.expander("Stato moduli caricati", expanded=False):
-    for modname, ok, used in loaded:
-        if ok:
-            st.markdown(f"- **{modname}** → `.{used}`")
+    if ok:
+        st.success(f"✅ {modname} → funzione usata: `{used}`")
+    else:
+        # Placeholder visivo + guida rapida
+        st.info(
+            f"⏭️ {modname} non espone nessuna tra {candidates}. "
+            f"Aggiungi in fondo al file un export veloce, per esempio:",
+            icon="ℹ️",
+        )
+        # Suggerisci nome preferito in base al modulo
+        if modname.endswith("meteo"):
+            prefer = "render_meteo"
+            label  = "[meteo]"
+        elif modname.endswith("wax_logic"):
+            prefer = "render_wax"
+            label  = "[wax]"
+        elif modname.endswith("maps"):
+            prefer = "render_map"
+            label  = "[map]"
         else:
-            st.markdown(f"- **{modname}** → *(non disponibile: {used})*")
+            prefer = "render_dem"
+            label  = "[dem]"
+        st.code(
+f"""def {prefer}(T, ctx):
+    import streamlit as st
+    st.markdown("**{label}** pronto (stub).")
+
+render = {prefer}
+""",
+            language="python",
+        )
+        # mostro comunque un placeholder a schermo
+        st.markdown(f"<div class='small'>Placeholder: {label} (stub)</div>", unsafe_allow_html=True)
+
+    st.markdown("</div>", unsafe_allow_html=True)  # chiudi .block
+    statuses.append((modname, ok, used))
+
+with st.expander("Stato moduli caricati", expanded=True):
+    for modname, ok, used in statuses:
+        st.write(("✅" if ok else "⏭️"), modname, "→", used)
 
 st.markdown(
     "<div class='note'>Ogni modulo dovrebbe esporre una funzione "
