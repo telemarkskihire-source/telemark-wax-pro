@@ -1,38 +1,34 @@
 # core/search.py
-# Ricerca località (solo Streamlit native: text_input + selectbox)
-# Provider 1: Open-Meteo Geocoding (veloce)
-# Provider 2: Nominatim (OSM) con pre-filtro paese
-# API: place_search_ui(T, iso2, key_prefix="place") -> (lat, lon, label)
+# Ricerca località con prefiltro paese.
+# Espone:
+#   - COUNTRIES
+#   - country_selectbox(T, key="country_sel") -> str (iso2)
+#   - location_searchbox(T, iso2, key="place") -> str | None  (chiave selezionata)
+#     (popola anche st.session_state._options[token] = {lat, lon, label})
+# Opzionale:
+#   - place_search_ui(T, iso2, key_prefix="place") -> (lat, lon, label)
 
 from __future__ import annotations
-import time, unicodedata, requests
-from typing import List, Dict, Any, Tuple, Optional
+import time, os, requests, unicodedata
+from typing import Dict, Any, List, Tuple, Optional
 import streamlit as st
 
-# ---------- Config ----------
-UA = {"User-Agent": "telemark-wax-pro/1.2 (+https://telemarkskihire.com)"}
-NOMINATIM_MIN_DELAY_S = 1.0  # rate-limit suggerito da OSM
+# ---------------- Config / Headers ----------------
+BASE_UA = "telemark-wax-pro/1.2 (+https://telemarkskihire.com)"
+HEADERS = {"User-Agent": BASE_UA, "Accept": "application/json"}
+NOMINATIM_EMAIL = st.secrets.get("NOMINATIM_EMAIL")
+if NOMINATIM_EMAIL:
+    HEADERS["From"] = NOMINATIM_EMAIL  # consigliato da Nominatim
 HTTP_TIMEOUT = 8
+NOMINATIM_MIN_DELAY_S = 1.0
 
-# ---------- Cache minimale (compatibile con qualsiasi Streamlit) ----------
-def _ss():
-    st.session_state.setdefault("__search_cache", {})
-    st.session_state.setdefault("__nom_last_ts", 0.0)
-    return st.session_state["__search_cache"]
+# ---------------- Paesi esposti (compatibile con streamlit_app.py) ----------------
+COUNTRIES: Dict[str,str] = {
+    "Italia":"IT","Svizzera":"CH","Francia":"FR","Austria":"AT",
+    "Germania":"DE","Spagna":"ES","Norvegia":"NO","Svezia":"SE"
+}
 
-def _cache_get(key: str) -> Optional[Any]:
-    item = _ss().get(key)
-    if not item: return None
-    val, exp = item
-    if exp and time.time() > exp:
-        del _ss()[key]
-        return None
-    return val
-
-def _cache_put(key: str, val: Any, ttl_s: int = 3600):
-    _ss()[key] = (val, time.time() + ttl_s if ttl_s else None)
-
-# ---------- Utils ----------
+# ---------------- Utils ----------------
 def _flag(cc: Optional[str]) -> str:
     try:
         if not cc: return "🏳️"
@@ -41,52 +37,25 @@ def _flag(cc: Optional[str]) -> str:
     except Exception:
         return "🏳️"
 
-def _concise_label(addr_name: str, admin: Optional[str], cc: Optional[str]) -> str:
-    parts = [p for p in [addr_name, admin] if p]
-    s = ", ".join(parts) if parts else (addr_name or "")
-    return f"{s} — {cc.upper()}" if cc else s
+def _concise_label_from_addr(addr:dict, fallback:str)->str:
+    name = (addr.get("neighbourhood") or addr.get("hamlet") or addr.get("village")
+            or addr.get("town") or addr.get("city") or fallback)
+    admin1 = addr.get("state") or addr.get("region") or addr.get("county") or ""
+    parts = [p for p in [name, admin1] if p]
+    return ", ".join([p for p in parts if p])
 
-def _norm(s: str) -> str:
-    return unicodedata.normalize("NFKD", s or "").encode("ASCII", "ignore").decode().lower().strip()
+def _retry(func, attempts=2, sleep=0.8):
+    for i in range(attempts):
+        try:
+            return func()
+        except Exception:
+            if i == attempts-1: raise
+            time.sleep(sleep*(1.5**i))
 
-# ---------- HTTP helper ----------
-def _http_get_json(url: str, params: dict, ttl_s: int) -> Any:
-    key = f"GET|{url}|{sorted(params.items())}"
-    cached = _cache_get(key)
-    if cached is not None:
-        return cached
-    r = requests.get(url, params=params, headers=UA, timeout=HTTP_TIMEOUT)
-    r.raise_for_status()
-    j = r.json()
-    _cache_put(key, j, ttl_s=ttl_s)
-    return j
-
-# ---------- PROVIDER 1: Open-Meteo ----------
-def _om_geocode(name: str, iso2: Optional[str], lang: str = "it") -> List[Dict[str, Any]]:
-    params = {
-        "name": name,
-        "count": 12,
-        "language": (lang or "en").lower(),
-        "format": "json",
-    }
-    if iso2:
-        params["country"] = iso2.upper()
-
-    j = _http_get_json("https://geocoding-api.open-meteo.com/v1/search", params, ttl_s=3600) or {}
-    results: List[Dict[str, Any]] = []
-    for it in (j.get("results") or []):
-        city  = it.get("name") or ""
-        admin = it.get("admin1") or it.get("admin2") or it.get("country")
-        cc    = (it.get("country_code") or (iso2 or "")).upper()
-        lat   = float(it.get("latitude"))
-        lon   = float(it.get("longitude"))
-        label_core = _concise_label(city, admin, cc)
-        disp  = f"{_flag(cc)}  {label_core}"
-        results.append({"label": disp, "lat": lat, "lon": lon, "cc": cc, "raw_label": label_core})
-    return results
-
-# ---------- PROVIDER 2: Nominatim ----------
-def _osm_geocode(name: str, iso2: Optional[str], lang: str = "it") -> List[Dict[str, Any]]:
+# ---------------- Search providers ----------------
+def _search_nominatim(q:str, iso2:str) -> List[Tuple[str,dict]]:
+    if not q or len(q.strip()) < 2:
+        return []
     # rate-limit minimo
     now = time.time()
     last = st.session_state.get("__nom_last_ts", 0.0)
@@ -94,102 +63,169 @@ def _osm_geocode(name: str, iso2: Optional[str], lang: str = "it") -> List[Dict[
         time.sleep(NOMINATIM_MIN_DELAY_S - (now - last))
     st.session_state["__nom_last_ts"] = time.time()
 
-    params = {
-        "q": name,
-        "format": "json",
-        "limit": 12,
-        "addressdetails": 1,
-        "accept-language": (lang or "en").lower(),
-    }
-    if iso2:
-        params["countrycodes"] = iso2.lower()
+    try:
+        def go():
+            return requests.get(
+                "https://nominatim.openstreetmap.org/search",
+                params={
+                    "q": q, "format": "json", "limit": 10, "addressdetails": 1,
+                    "countrycodes": iso2.lower()
+                },
+                headers=HEADERS, timeout=HTTP_TIMEOUT
+            )
+        r = _retry(go); r.raise_for_status()
+        js = r.json() or []
+        out = []
+        for it in js:
+            addr = it.get("address",{}) or {}
+            lab_core = _concise_label_from_addr(addr, it.get("display_name",""))
+            cc = (addr.get("country_code") or "").upper()
+            lab = f"{_flag(cc)}  {lab_core}" if cc else lab_core
+            lat = float(it.get("lat",0)); lon=float(it.get("lon",0))
+            key = f"{lab}|||{lat:.6f},{lon:.6f}"
+            out.append((key, {"lat":lat,"lon":lon,"label":lab,"addr":addr}))
+        return out
+    except Exception:
+        return []
 
-    j = _http_get_json("https://nominatim.openstreetmap.org/search", params, ttl_s=3600) or []
-    out: List[Dict[str, Any]] = []
-    for it in (j or []):
-        addr  = it.get("address", {}) or {}
-        name0 = (addr.get("village") or addr.get("town") or addr.get("city")
-                 or addr.get("hamlet") or it.get("display_name", ""))
-        admin = (addr.get("state") or addr.get("region") or addr.get("county"))
-        cc    = ((addr.get("country_code") or (iso2 or "")).upper())
-        lat   = float(it.get("lat", 0))
-        lon   = float(it.get("lon", 0))
-        label_core = _concise_label(name0, admin, cc)
-        disp  = f"{_flag(cc)}  {label_core}"
-        out.append({"label": disp, "lat": lat, "lon": lon, "cc": cc, "raw_label": label_core})
-    return out
+def _search_photon(q:str, iso2:str) -> List[Tuple[str,dict]]:
+    # Fallback (Komoot Photon) – filtriamo client-side su countrycode
+    if not q or len(q.strip()) < 2:
+        return []
+    try:
+        r = requests.get(
+            "https://photon.komoot.io/api",
+            params={"q": q, "limit": 10, "lang": "it"},
+            headers={"User-Agent": BASE_UA}, timeout=HTTP_TIMEOUT
+        )
+        r.raise_for_status()
+        js = r.json() or {}
+        feats = js.get("features",[]) or []
+        out=[]
+        for f in feats:
+            props = f.get("properties",{}) or {}
+            cc = (props.get("countrycode") or props.get("country","")).upper()
+            if cc and cc != iso2.upper():
+                continue
+            name = props.get("name") or props.get("city") or props.get("state") or ""
+            admin1 = props.get("state") or props.get("county") or ""
+            label_core = ", ".join([p for p in [name, admin1] if p])
+            lab = f"{_flag(cc)}  {label_core}" if cc else label_core
+            lon, lat = f.get("geometry",{}).get("coordinates",[None,None])
+            if lat is None or lon is None: continue
+            key = f"{lab}|||{float(lat):.6f},{float(lon):.6f}"
+            out.append((key, {"lat":float(lat),"lon":float(lon),"label":lab,"addr":{}}))
+        return out
+    except Exception:
+        return []
 
-# ---------- merge + dedup ----------
-def _merge_results(a: List[Dict[str, Any]] | None, b: List[Dict[str, Any]] | None) -> List[Dict[str, Any]]:
-    seen = set()
-    out: List[Dict[str, Any]] = []
-    for src in (a or []), (b or []):
-        for it in src:
-            key = (_norm(it.get("raw_label", "")), round(float(it.get("lat", 0)), 4), round(float(it.get("lon", 0)), 4))
-            if key in seen: continue
-            seen.add(key)
-            out.append(it)
-    return out
+def _search_places(q:str, iso2:str) -> List[str]:
+    """Ritorna lista di chiavi stringa e popola st.session_state._options."""
+    st.session_state._options = {}
+    results = _search_nominatim(q, iso2)
+    if not results:
+        results = _search_photon(q, iso2)
+    keys=[]
+    for key, payload in results:
+        st.session_state._options[key] = payload
+        keys.append(key)
+    return keys
 
-# ---------- UI wrapper (solo componenti Streamlit) ----------
-def place_search_ui(T: Dict[str, str], iso2: Optional[str], key_prefix: str = "place") -> Tuple[float, float, str]:
+# ---------------- Shim per st_searchbox ----------------
+try:
+    from streamlit_searchbox import st_searchbox as _ext_st_searchbox
+except Exception:
+    _ext_st_searchbox = None
+
+def _shim_searchbox(search_function, key, placeholder="", clear_on_submit=False, debounce=300, default=None):
     """
-    Disegna una searchbox nativa (text_input + selectbox) e restituisce (lat, lon, label).
-    Aggiorna: st.session_state[f'{key_prefix}_lat'/'_lon'/'_label'].
+    Compatibile con streamlit_searchbox. Se disponibile usa il componente,
+    altrimenti fallback nativo (text_input + selectbox).
     """
-    # lingua / placeholder
-    ph = T.get("search_ph", "Cerca località…")
-    lang_ui = "it" if ("Cerca" in ph or "Nazione" in (T.get("country", ""))) else "en"
+    if _ext_st_searchbox is not None:
+        try:
+            return _ext_st_searchbox(
+                search_function=search_function,
+                key=key,
+                placeholder=placeholder,
+                clear_on_submit=clear_on_submit,
+                debounce=debounce,
+                default=default,
+            )
+        except Exception:
+            pass  # se esplode, usa fallback
 
-    # chiavi di stato
-    LAT_K  = f"{key_prefix}_lat"
-    LON_K  = f"{key_prefix}_lon"
-    LAB_K  = f"{key_prefix}_label"
-    OPTS_K = f"{key_prefix}__search_opts"
-    Q_K    = f"{key_prefix}__query"
-    SEL_K  = f"{key_prefix}__selected"
-
-    # default Champoluc
-    lat = float(st.session_state.get(LAT_K, 45.83100))
-    lon = float(st.session_state.get(LON_K, 7.73000))
-    label = st.session_state.get(LAB_K, "🇮🇹  Champoluc, Valle d’Aosta — IT")
-
-    # input
-    q = st.text_input(ph, key=Q_K, value=st.session_state.get(Q_K, ""), placeholder=ph)
-
-    # cerca se q >= 2 char
+    # Fallback nativo
+    q_key = f"{key}__q"
+    sel_key = f"{key}__sel"
+    q = st.text_input(placeholder or "Search…", key=q_key, value="")
     options: List[str] = []
-    st.session_state.setdefault(OPTS_K, {})
     if q and len(q.strip()) >= 2:
         try:
-            a = _om_geocode(q.strip(), iso2, lang_ui)
+            options = search_function(q) or []
         except Exception:
-            a = []
-        try:
-            b = _osm_geocode(q.strip(), iso2, lang_ui)
-        except Exception:
-            b = []
-        merged = _merge_results(a, b)
-
-        st.session_state[OPTS_K] = {}
-        for it in merged:
-            token = f"om|{it['lat']:.6f}|{it['lon']:.6f}|{it['cc']}"
-            st.session_state[OPTS_K][token] = it
-            options.append(f"{token}  {it['label']}")
-
-    # select risultati
+            options = []
     if options:
-        prev = st.session_state.get(SEL_K)
+        prev = st.session_state.get(sel_key)
         idx = options.index(prev) if prev in options else 0
-        selected_display = st.selectbox("Risultati", options=options, index=idx, key=SEL_K)
-        if selected_display:
-            token = selected_display.split("  ", 1)[0].strip()
-            info = (st.session_state.get(OPTS_K) or {}).get(token)
-            if info:
-                lat = float(info["lat"]); st.session_state[LAT_K] = lat
-                lon = float(info["lon"]); st.session_state[LON_K] = lon
-                label = info["label"];    st.session_state[LAB_K] = label
+        selected = st.selectbox("Risultati", options=options, index=idx, key=sel_key)
+    else:
+        selected = None
+    return selected
 
-    # badge riassunto
-    st.markdown(f"<div class='badge'>📍 {label} · lat <b>{lat:.5f}</b>, lon <b>{lon:.5f}</b></div>", unsafe_allow_html=True)
+# ---------------- API attese dallo streamlit_app.py ----------------
+def country_selectbox(T: Dict[str,str], key: str = "country_sel") -> str:
+    """
+    Disegna la select del Paese e restituisce l'ISO2 selezionato.
+    """
+    labels = list(COUNTRIES.keys())
+    default_idx = 0
+    current = st.session_state.get(key)
+    if current in labels:
+        default_idx = labels.index(current)
+    sel_country = st.selectbox(T.get("country","Country"), labels, index=default_idx, key=key)
+    return COUNTRIES[sel_country]
+
+def location_searchbox(T: Dict[str,str], iso2: str, key: str = "place") -> Optional[str]:
+    """
+    Mostra la casella di ricerca luogo e restituisce la *chiave selezionata* (stringa),
+    es. '🇮🇹  Champoluc, Valle d’Aosta — IT|||45.831000,7.730000'.
+    Inoltre popola st.session_state._options[key] = {lat, lon, label}.
+    """
+    ph = T.get("search_ph", "Cerca…")
+    selected = _shim_searchbox(
+        search_function=lambda q: _search_places(q, iso2),
+        key=key,
+        placeholder=ph,
+        clear_on_submit=False,
+        debounce=400,
+        default=None
+    )
+    return selected
+
+# ---------------- Opzionale: API a ritorno diretto (lat, lon, label) ----------------
+def place_search_ui(T: Dict[str,str], iso2: str, key_prefix: str = "place") -> Tuple[float, float, str]:
+    """
+    Variante comoda: disegna la searchbox e gestisce direttamente lo stato.
+    Ritorna (lat, lon, label) e aggiorna st.session_state['lat'/'lon'/'place_label'].
+    """
+    selected = location_searchbox(T, iso2, key=key_prefix)
+
+    # default: Champoluc
+    lat = float(st.session_state.get("lat", 45.83100))
+    lon = float(st.session_state.get("lon", 7.73000))
+    label = st.session_state.get("place_label", "🇮🇹  Champoluc, Valle d’Aosta — IT")
+
+    if selected and "|||" in selected and "_options" in st.session_state:
+        info = st.session_state._options.get(selected)
+        if info:
+            lat, lon, label = info["lat"], info["lon"], info["label"]
+            st.session_state["lat"] = lat
+            st.session_state["lon"] = lon
+            st.session_state["place_label"] = label
+
+    st.markdown(
+        f"<div class='badge'>📍 <b>{label}</b> · lat <b>{lat:.5f}</b>, lon <b>{lon:.5f}</b></div>",
+        unsafe_allow_html=True
+    )
     return lat, lon, label
