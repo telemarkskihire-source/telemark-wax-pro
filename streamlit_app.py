@@ -98,6 +98,7 @@ def _call_first(mod, candidates, *args, **kwargs):
     return False, "no-render-fn"
 
 MODULES = [
+    ("core.site_meta", ["render_site_meta","render"]),            # <- nuovo step “Altitudine/TZ/DEM”
     ("core.maps",      ["render_map","map_panel","show_map","main","app","render"]),
     ("core.dem_tools", ["render_dem","dem_panel","show_dem","main","app","render"]),
     ("core.meteo",     ["render_meteo","panel_meteo","run_meteo","show_meteo","main","app","render"]),
