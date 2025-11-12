@@ -3,7 +3,7 @@ from __future__ import annotations
 import math, requests
 import streamlit as st
 
-# Folium opzionale
+# --- Folium opzionale ---
 HAS_FOLIUM = False
 try:
     from streamlit_folium import st_folium
@@ -25,10 +25,7 @@ _OVERPASS_EP = [
 
 @st.cache_data(ttl=3*3600, show_spinner=False)
 def fetch_pistes_geojson(lat: float, lon: float, dist_km: int = 30):
-    """
-    Cerca piste alpine (piste:type=downhill) entro dist_km.
-    Ritorna FeatureCollection o {} se fallisce.
-    """
+    """Cerca piste alpine entro dist_km. Ritorna FeatureCollection o {} se fallisce."""
     query = f"""
     [out:json][timeout:25];
     (
@@ -64,7 +61,6 @@ def fetch_pistes_geojson(lat: float, lon: float, dist_km: int = 30):
         except Exception as e:
             last_err = f"{ep} → {e}"
             continue
-    # Se tutti gli endpoint falliscono:
     st.info(f"Overpass temporaneamente non disponibile. ({last_err})")
     return {"type": "FeatureCollection", "features": []}
 
@@ -76,11 +72,13 @@ def osm_tile(lat, lon, z=9):
     lat_rad = math.radians(lat)
     ytile = int((1.0 - math.log(math.tan(lat_rad) + (1 / math.cos(lat_rad))) / math.pi) / 2.0 * n)
     url = f"https://tile.openstreetmap.org/{z}/{xtile}/{ytile}.png"
-    r = requests.get(url, headers=UA, timeout=8); r.raise_for_status()
+    r = requests.get(url, headers=UA, timeout=8)
+    r.raise_for_status()
     return r.content
 
 # ---------- Render panel ----------
-def render_map(ctx: dict):
+def render_map(T, ctx: dict):
+    """Mostra mappa interattiva con piste alpine."""
     lat = float(ctx["lat"]); lon = float(ctx["lon"])
     iso2 = ctx.get("iso2") or ""
     place_label = ctx.get("place_label", "")
@@ -88,7 +86,6 @@ def render_map(ctx: dict):
     st.markdown("##### 5) Mappa (selezione) — clicca sulla mappa per selezionare")
 
     if HAS_FOLIUM:
-        # chiave dipendente dalla posizione → forza reinit quando cambi località
         map_key = f"map_{round(lat,5)}_{round(lon,5)}_{iso2}"
         m = folium.Map(location=[lat, lon], zoom_start=12, tiles=None,
                        control_scale=True, prefer_canvas=True, zoom_control=True)
@@ -97,7 +94,6 @@ def render_map(ctx: dict):
             name="Strade", attr="© OpenStreetMap", overlay=False, control=True
         ).add_to(m)
 
-        # Piste
         try:
             gj = fetch_pistes_geojson(lat, lon, dist_km=30)
             if gj.get("features"):
@@ -117,7 +113,6 @@ def render_map(ctx: dict):
         out = st_folium(m, height=420, use_container_width=True, key=map_key, returned_objects=["last_clicked"])
         click = (out or {}).get("last_clicked") or {}
 
-        # Aggiorna coordinate se clicchi la mappa
         if click:
             new_lat, new_lon = float(click.get("lat")), float(click.get("lng"))
             new_pair = (round(new_lat, 5), round(new_lon, 5))
@@ -125,7 +120,6 @@ def render_map(ctx: dict):
                 st.session_state["_last_click"] = new_pair
                 st.session_state["lat"] = new_lat
                 st.session_state["lon"] = new_lon
-                # etichetta verrà aggiornata dal reverse geocode del tuo modulo search (se lo usi)
                 st.success("Posizione aggiornata dalla mappa.")
                 st.rerun()
     else:
@@ -135,7 +129,7 @@ def render_map(ctx: dict):
         except Exception:
             st.info("Mappa base non disponibile al momento.")
 
-# alias compatibili con l’orchestratore
+# alias per orchestratore
 render = render_map
 show_map = render_map
 map_panel = render_map
