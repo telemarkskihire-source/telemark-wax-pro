@@ -92,3 +92,13 @@ def wax_form_and_brushes(t_surf: float, rh: float):
         else:
             brushes = "Ottone → Nylon → Nylon fine → Panno"
     return form, brushes, use_liquid
+# --- EXPORT COMPAT ---
+def render_wax(T, ctx):
+    for name in ["wax_panel", "show_wax", "main", "render"]:
+        fn = globals().get(name)
+        if callable(fn):
+            return fn(T, ctx)
+    import streamlit as st
+    st.markdown("**[wax]** pronto (stub).")
+
+render = render_wax
