@@ -1,9 +1,13 @@
 # core/search.py
-# API pubbliche (compatibili con streamlit_app.py):
+# API pubbliche per streamlit_app.py:
 #   - COUNTRIES
-#   - country_selectbox(T, key="country_sel") -> str (ISO2)
-#   - location_searchbox(T, iso2, key="place") -> (lat: float, lon: float, label: str)  <-- SEMPRE una tupla
-#   - place_search_ui(T, iso2, key_prefix="place") -> (lat, lon, label)  (opzionale)
+#   - country_selectbox(T, key="country_sel") -> str ISO2
+#   - location_searchbox(T, iso2, key="place") -> (lat: float, lon: float, label: str)
+#
+# NOTE:
+# - location_searchbox restituisce SEMPRE una tupla (mai None), usando valori persistiti o default (Champoluc)
+# - Popola anche st.session_state._options[token] = {lat, lon, label}
+# - Usa streamlit_searchbox se presente, altrimenti fallback nativo (text_input + selectbox)
 
 from __future__ import annotations
 import time
@@ -11,7 +15,7 @@ from typing import Dict, List, Tuple, Optional
 import requests
 import streamlit as st
 
-# ---------------- Config ----------------
+# ---------- Config ----------
 BASE_UA = "telemark-wax-pro/1.2 (+https://telemarkskihire.com)"
 HEADERS = {"User-Agent": BASE_UA, "Accept": "application/json"}
 EMAIL = st.secrets.get("NOMINATIM_EMAIL")
@@ -20,13 +24,13 @@ if EMAIL:
 HTTP_TIMEOUT = 8
 NOMINATIM_MIN_DELAY_S = 1.0
 
-# ---------------- Paesi (pubblici) ----------------
+# ---------- Paesi (pubblici) ----------
 COUNTRIES: Dict[str, str] = {
     "Italia": "IT", "Svizzera": "CH", "Francia": "FR", "Austria": "AT",
     "Germania": "DE", "Spagna": "ES", "Norvegia": "NO", "Svezia": "SE"
 }
 
-# ---------------- Utils ----------------
+# ---------- Utils ----------
 def _flag(cc: Optional[str]) -> str:
     try:
         if not cc: return "🏳️"
@@ -40,7 +44,7 @@ def _label_from_addr(addr: dict, fallback: str) -> str:
             or addr.get("town") or addr.get("city") or fallback)
     admin = addr.get("state") or addr.get("region") or addr.get("county") or ""
     parts = [p for p in [name, admin] if p]
-    core = ", ".join([p for p in parts if p])
+    core = ", ".join([p for p in parts if p]) or fallback
     cc = (addr.get("country_code") or "").upper()
     return f"{_flag(cc)}  {core}" if core else fallback
 
@@ -53,7 +57,7 @@ def _retry(fn, tries=2, base_sleep=0.8):
                 raise
             time.sleep(base_sleep * (1.5 ** i))
 
-# ---------------- Provider ricerca ----------------
+# ---------- Provider ricerca ----------
 def _search_nominatim(q: str, iso2: str) -> List[Tuple[str, dict]]:
     if not q or len(q.strip()) < 2:
         return []
@@ -86,7 +90,7 @@ def _search_nominatim(q: str, iso2: str) -> List[Tuple[str, dict]]:
         return []
 
 def _search_photon(q: str, iso2: str) -> List[Tuple[str, dict]]:
-    # fallback (Komoot Photon) con filtro client-side su countrycode
+    # Fallback (Komoot Photon) con filtro client-side su countrycode
     if not q or len(q.strip()) < 2:
         return []
     try:
@@ -106,7 +110,7 @@ def _search_photon(q: str, iso2: str) -> List[Tuple[str, dict]]:
                 continue
             name = props.get("name") or props.get("city") or props.get("state") or ""
             admin = props.get("state") or props.get("county") or ""
-            core = ", ".join([p for p in [name, admin] if p])
+            core = ", ".join([p for p in [name, admin] if p]) or name or ""
             lab = f"{_flag(cc)}  {core}" if core else (name or "—")
             lon, lat = f.get("geometry", {}).get("coordinates", [None, None])
             if lat is None or lon is None:
@@ -123,13 +127,13 @@ def _search_places(q: str, iso2: str) -> List[str]:
     results = _search_nominatim(q, iso2)
     if not results:
         results = _search_photon(q, iso2)
-    keys = []
+    keys: List[str] = []
     for key, payload in results:
         st.session_state._options[key] = payload
         keys.append(key)
     return keys
 
-# ---------------- Shim per st_searchbox ----------------
+# ---------- Shim per st_searchbox ----------
 try:
     from streamlit_searchbox import st_searchbox as _ext_st_searchbox
 except Exception:
@@ -165,7 +169,7 @@ def _shim_searchbox(search_function, key, placeholder="", clear_on_submit=False,
         return st.selectbox("Risultati", options=options, index=idx, key=sel_key)
     return None
 
-# ---------------- API pubbliche richieste ----------------
+# ---------- API pubbliche richieste dal main ----------
 def country_selectbox(T: Dict[str, str], key: str = "country_sel") -> str:
     """Disegna select paese e restituisce ISO2."""
     labels = list(COUNTRIES.keys())
@@ -181,7 +185,6 @@ def location_searchbox(T: Dict[str, str], iso2: str, key: str = "place") -> Tupl
     Mostra la casella di ricerca e restituisce SEMPRE (lat, lon, label).
     - Se l'utente seleziona un risultato, salva in session_state e ritorna quello.
     - Se non ha selezionato ancora nulla, ritorna i valori persistiti oppure i default (Champoluc).
-    Inoltre popola st.session_state._options[token] = {lat, lon, label}.
     """
     ph = T.get("search_ph", "Cerca…")
 
@@ -194,7 +197,7 @@ def location_searchbox(T: Dict[str, str], iso2: str, key: str = "place") -> Tupl
         default=None
     )
 
-    # default: Champoluc, se non c'è nulla in sessione
+    # default/persistiti
     lat = float(st.session_state.get("lat", 45.83100))
     lon = float(st.session_state.get("lon", 7.73000))
     label = st.session_state.get("place_label", "🇮🇹  Champoluc, Valle d’Aosta — IT")
@@ -207,13 +210,4 @@ def location_searchbox(T: Dict[str, str], iso2: str, key: str = "place") -> Tupl
             st.session_state["lon"] = lon
             st.session_state["place_label"] = label
 
-    return lat, lon, label
-
-def place_search_ui(T: Dict[str, str], iso2: str, key_prefix: str = "place") -> Tuple[float, float, str]:
-    """Variante comoda che disegna badge e ritorna (lat, lon, label)."""
-    lat, lon, label = location_searchbox(T, iso2, key=key_prefix)
-    st.markdown(
-        f"<div class='badge'>📍 <b>{label}</b> · lat <b>{lat:.5f}</b>, lon <b>{lon:.5f}</b></div>",
-        unsafe_allow_html=True
-    )
     return lat, lon, label
