@@ -1,108 +1,140 @@
 # core/maps.py
-import math, requests
+# Mappa Folium + click che aggiorna lat/lon/label e rimette alt_sync in AUTO
+
+from __future__ import annotations
+
+import math
+import requests
 import streamlit as st
 
-UA = {"User-Agent":"telemark-wax-pro/1.0"}
+# Folium opzionale
+HAS_FOLIUM = False
+try:
+    from streamlit_folium import st_folium
+    import folium
+    from folium import TileLayer, LayerControl, Marker
+    from folium.plugins import MousePosition
+    HAS_FOLIUM = True
+except Exception:
+    HAS_FOLIUM = False
 
-def _osm_tile(lat, lon, z=9):
-    n = 2**z
-    xtile = int((lon + 180.0) / 360.0 * n)
-    lat_rad = math.radians(lat)
-    ytile = int((1.0 - math.log(math.tan(lat_rad) + (1 / math.cos(lat_rad))) / math.pi) / 2.0 * n)
-    url = f"https://tile.openstreetmap.org/{z}/{xtile}/{ytile}.png"
-    r = requests.get(url, headers=UA, timeout=8); r.raise_for_status()
-   # ... codice esistente ...
-st.session_state["lat"] = new_lat
-st.session_state["lon"] = new_lon
-st.session_state["place_label"] = reverse_geocode(new_lat, new_lon)
 
-# NUOVO: quando clicchi, torna in modalità auto (altitudine da DEM/elevation)
-st.session_state["alt_sync_mode"] = "auto"
+UA = {"User-Agent": "telemark-wax-pro/1.0"}
 
-st.success(f"Posizione aggiornata: {st.session_state['place_label']}")
-st.rerun()
-    return r.content
 
-def render_map(T, ctx):
-    lat = float(ctx["lat"]); lon = float(ctx["lon"])
-    iso2 = ctx.get("iso2",""); place_label = ctx.get("place_label","")
-    # expander APERTO come nell’originale
-    with st.expander(T.get("map","Mappa")+" — clicca sulla mappa per selezionare", expanded=True):
-        HAS_FOLIUM = False
+def _retry(func, attempts: int = 2, sleep: float = 0.8):
+    import time
+
+    for i in range(attempts):
         try:
-            from streamlit_folium import st_folium
-            import folium
-            from folium import TileLayer, LayerControl, Marker
-            from folium.plugins import MousePosition
-            HAS_FOLIUM = True
+            return func()
         except Exception:
-            HAS_FOLIUM = False
+            if i == attempts - 1:
+                raise
+            time.sleep(sleep * (1.5**i))
 
-        if HAS_FOLIUM:
-            map_key = f"map_{round(lat,5)}_{round(lon,5)}_{iso2}"
-            m = folium.Map(location=[lat, lon], zoom_start=12, tiles=None,
-                           control_scale=True, prefer_canvas=True, zoom_control=True)
-            TileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",
-                      name="Strade", attr="© OSM", overlay=False, control=True).add_to(m)
-            try:
-                gj = fetch_pistes_geojson(lat, lon, dist_km=30)
-                if gj["features"]:
-                    folium.GeoJson(
-                        data=gj, name="Piste alpine (OSM)",
-                        tooltip=folium.GeoJsonTooltip(fields=["name","piste:type"],
-                                                      aliases=["Nome","Tipo"]),
-                        style_function=lambda f: {"color":"#3388ff","weight":3,"opacity":0.95}
-                    ).add_to(m)
-            except Exception:
-                pass
+
+def reverse_geocode(lat: float, lon: float) -> str:
+    try:
+        def go():
+            return requests.get(
+                "https://nominatim.openstreetmap.org/reverse",
+                params={"format": "json", "lat": lat, "lon": lon, "zoom": 12, "addressdetails": 1},
+                headers=UA,
+                timeout=8,
+            )
+
+        r = _retry(go)
+        r.raise_for_status()
+        j = r.json()
+        addr = j.get("address", {}) or {}
+        # etichetta concisa
+        name = (
+            addr.get("neighbourhood")
+            or addr.get("hamlet")
+            or addr.get("village")
+            or addr.get("town")
+            or addr.get("city")
+            or j.get("display_name", "")
+        )
+        admin1 = addr.get("state") or addr.get("region") or addr.get("county") or ""
+        cc = (addr.get("country_code") or "").upper()
+        core = ", ".join([p for p in [name, admin1] if p])
+        flag = chr(127397 + ord(cc[0])) + chr(127397 + ord(cc[1])) if len(cc) == 2 else "🏳️"
+        return f"{flag}  {core} — {cc}" if cc else core
+    except Exception:
+        return f"{lat:.5f}, {lon:.5f}"
+
+
+def osm_tile(lat: float, lon: float, z: int = 9) -> bytes | None:
+    try:
+        n = 2**z
+        xtile = int((lon + 180.0) / 360.0 * n)
+        lat_rad = math.radians(lat)
+        ytile = int((1.0 - math.log(math.tan(lat_rad) + (1 / math.cos(lat_rad))) / math.pi) / 2.0 * n)
+        url = f"https://tile.openstreetmap.org/{z}/{xtile}/{ytile}.png"
+        r = requests.get(url, headers=UA, timeout=8)
+        r.raise_for_status()
+        return r.content
+    except Exception:
+        return None
+
+
+def render_map(T: dict, ctx: dict):
+    lat = float(ctx["lat"])
+    lon = float(ctx["lon"])
+    iso2 = ctx.get("iso2", "IT")
+    place_label = ctx.get("place_label", f"📍 {lat:.5f}, {lon:.5f}")
+
+    if HAS_FOLIUM:
+        with st.expander(T["map"] + " — clicca sulla mappa per selezionare", expanded=True):
+            map_key = f"map_{round(lat, 5)}_{round(lon, 5)}_{iso2}"
+            m = folium.Map(
+                location=[lat, lon],
+                zoom_start=12,
+                tiles=None,
+                control_scale=True,
+                prefer_canvas=True,
+                zoom_control=True,
+            )
+            TileLayer(
+                "https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",
+                name="Strade",
+                attr="© OSM",
+                overlay=False,
+                control=True,
+            ).add_to(m)
+
             Marker([lat, lon], tooltip=place_label, icon=folium.Icon(color="lightgray")).add_to(m)
-            MousePosition().add_to(m); LayerControl(position="bottomleft", collapsed=True).add_to(m)
+            MousePosition().add_to(m)
+            LayerControl(position="bottomleft", collapsed=True).add_to(m)
 
-            out = st_folium(m, height=420, use_container_width=True, key=map_key,
-                            returned_objects=["last_clicked"])
+            out = st_folium(m, height=420, use_container_width=True, key=map_key, returned_objects=["last_clicked"])
             click = (out or {}).get("last_clicked") or {}
+
             if click:
-                new_lat = float(click.get("lat")); new_lon = float(click.get("lng"))
-                new_pair = (round(new_lat,5), round(new_lon,5))
+                new_lat = float(click.get("lat"))
+                new_lon = float(click.get("lng"))
+                new_pair = (round(new_lat, 5), round(new_lon, 5))
                 if st.session_state.get("_last_click") != new_pair:
                     st.session_state["_last_click"] = new_pair
                     st.session_state["lat"] = new_lat
                     st.session_state["lon"] = new_lon
-                    # etichetta aggiornata: la imposta il chiamante (reverse nel modulo meteo/orchestratore)
-                    st.toast("Posizione aggiornata dalla mappa.", icon="✅")
-        else:
-            try:
-                tile = _osm_tile(lat,lon, z=9)
-                st.image(tile, caption=T.get("map","Mappa"), width=220)
-            except Exception:
-                st.info("Mappa di base non disponibile ora.")
+                    st.session_state["place_label"] = reverse_geocode(new_lat, new_lon)
 
-def fetch_pistes_geojson(lat:float, lon:float, dist_km:int=30):
-    query = f"""
-    [out:json][timeout:25];
-    (
-      way(around:{int(dist_km*1000)},{lat},{lon})["piste:type"="downhill"];
-      relation(around:{int(dist_km*1000)},{lat},{lon})["piste:type"="downhill"];
-    );
-    out geom;
-    """
-    r = requests.post("https://overpass-api.de/api/interpreter", data=query, headers=UA, timeout=30)
-    r.raise_for_status()
-    data = r.json().get("elements", [])
-    feats=[]
-    for el in data:
-        props = {
-            "id": el.get("id"),
-            "piste:type": (el.get("tags") or {}).get("piste:type",""),
-            "name": (el.get("tags") or {}).get("name","")
-        }
-        if "geometry" in el:
-            coords = [(g["lon"], g["lat"]) for g in el["geometry"]]
-            geom = {"type":"LineString","coordinates":coords}
-            feats.append({"type":"Feature","geometry":geom,"properties":props})
-    return {"type":"FeatureCollection","features":feats}
+                    # IMPORTANTE: ritorna in modalità AUTO quando si clicca sulla mappa
+                    st.session_state["alt_sync_mode"] = "auto"
 
-# alias per orchestratore
-map_panel = render_map
-show_map  = render_map
-app = render = render_map
+                    st.success(f"Posizione aggiornata: {st.session_state['place_label']}")
+                    st.rerun()
+    else:
+        try:
+            tile = osm_tile(lat, lon, z=9)
+            if tile:
+                st.image(tile, caption=T["map"], width=220)
+        except Exception:
+            pass
+
+
+# alias
+render = render_map
