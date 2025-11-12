@@ -107,18 +107,8 @@ def _call_first(mod, names, *args, **kwargs):
 st.markdown("### 2) Moduli")
 
 MODULES = [
-    ("core.meteo",     ["render_meteo", "panel_meteo", "run_meteo", "show_meteo", "main", "app", "render"]),
-    ("core.wax_logic", ["render_wax",  "wax_panel",   "show_wax",   "main",      "app",  "render"]),
-    ("core.maps",      ["render_map",  "map_panel",   "show_map",   "main",      "app",  "render"]),
-    ("core.dem_tools", ["render_dem",  "dem_panel",   "show_dem",   "main",      "app",  "render"]),
+    ("core.maps",      ["render_map","map_panel","show_map","main","app","render"]),
+    ("core.dem_tools", ["render_dem","dem_panel","show_dem","main","app","render"]),
+    ("core.meteo",     ["render_meteo","panel_meteo","run_meteo","show_meteo","main","app","render"]),
+    ("core.wax_logic", ["render_wax","wax_panel","show_wax","main","app","render"]),
 ]
-
-loaded = []
-for modname, candidates in MODULES:
-    mod = _load(modname)
-    ok, used = _call_first(mod, candidates, T, ctx)
-    loaded.append((modname, ok, used))
-
-with st.expander("Stato moduli caricati", expanded=False):
-    for modname, ok, used in loaded:
-        st.markdown(f"- {'✅' if ok else '⏭️'} **{modname}** → `{used}`")
