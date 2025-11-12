@@ -1,9 +1,8 @@
-streamlit==1.51.0
-streamlit-folium==0.20.0
-streamlit-searchbox==0.3.2
-requests==2.32.3
-pandas==2.2.2
-numpy==1.26.4
-matplotlib==3.8.4
-python-dateutil==2.9.0.post0
-folium==0.17.0
+streamlit
+pandas
+requests
+python-dateutil
+matplotlib
+streamlit-searchbox
+folium
+streamlit-folium
