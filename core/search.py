@@ -11,7 +11,7 @@ from streamlit_searchbox import st_searchbox
 
 # ---------- Config ----------
 UA = {
-    # Nota: per Nominatim è consigliato includere un contatto (url o email)
+    # Per Nominatim è consigliato includere un contatto (url o email)
     "User-Agent": "telemark-wax-pro/1.2 (+https://telemarkskihire.com)"
 }
 NOMINATIM_MIN_DELAY_S = 1.0  # rate-limit suggerito da OSM
@@ -130,33 +130,42 @@ def _merge_results(a: List[Dict[str, Any]] | None,
             out.append(it)
     return out
 
-# ---------- callback per st_searchbox ----------
-def _search_callback_factory(iso2: str | None, lang_ui: str, key_prefix: str):
-    def _cb(q: str) -> List[str]:
-        if not q or len(q.strip()) < 2:
-            return []
-        # 1) OM (rapido) → 2) OSM (fallback)
-        try:
-            a = _om_geocode(q.strip(), iso2, lang_ui)
-        except Exception:
-            a = []
-        try:
-            b = _osm_geocode(q.strip(), iso2, lang_ui)
-        except Exception:
-            b = []
-        merged = _merge_results(a, b)
+# ---------- CALLBACK TOP-LEVEL (picklable) ----------
+def _search_callback(q: str) -> List[str]:
+    """
+    Callback top-level per st_searchbox: legge la config dal session_state,
+    in base al prefisso attivo, e ritorna le opzioni 'token  label'.
+    """
+    key_prefix = st.session_state.get("__ps_active_prefix", "place")
+    cfg: Dict[str, Any] = st.session_state.get(f"__ps_cfg__{key_prefix}") or {}
 
-        # salva mappa opzioni in sessione per risoluzione lat/lon
-        ss_key = f"{key_prefix}__search_opts"
-        st.session_state.setdefault(ss_key, {})
-        out_strings: List[str] = []
-        for it in merged:
-            token = f"om|{it['lat']:.6f}|{it['lon']:.6f}|{it['cc']}"
-            st.session_state[ss_key][token] = it
-            # Manteniamo il token nascosto all’utente, ma necessario per risalire ai dati
-            out_strings.append(f"{token}  {it['label']}")
-        return out_strings
-    return _cb
+    iso2 = cfg.get("iso2")
+    lang_ui = cfg.get("lang_ui", "en")
+
+    if not q or len(q.strip()) < 2:
+        return []
+
+    # 1) OM (rapido) → 2) OSM (fallback)
+    try:
+        a = _om_geocode(q.strip(), iso2, lang_ui)
+    except Exception:
+        a = []
+    try:
+        b = _osm_geocode(q.strip(), iso2, lang_ui)
+    except Exception:
+        b = []
+
+    merged = _merge_results(a, b)
+
+    # salva mappa opzioni in sessione per risoluzione lat/lon
+    OPTS_K = f"{key_prefix}__search_opts"
+    st.session_state.setdefault(OPTS_K, {})
+    out_strings: List[str] = []
+    for it in merged:
+        token = f"om|{it['lat']:.6f}|{it['lon']:.6f}|{it['cc']}"
+        st.session_state[OPTS_K][token] = it
+        out_strings.append(f"{token}  {it['label']}")
+    return out_strings
 
 # ---------- UI wrapper richiamabile dal main ----------
 def place_search_ui(T: Dict[str, str], iso2: str | None, key_prefix: str = "place") -> Tuple[float, float, str]:
@@ -164,13 +173,20 @@ def place_search_ui(T: Dict[str, str], iso2: str | None, key_prefix: str = "plac
     Disegna la searchbox e restituisce (lat, lon, label).
     Aggiorna anche st.session_state[f'{key_prefix}_lat'/'_lon'/'_label'].
     """
-    # placeholder in base alla lingua
+    # placeholder / lingua
     ph = T.get("search_ph", "Cerca località…")
-    # lingua dal dizionario (heuristic: 'it' se contiene parole italiane)
     lang_ui = "it" if ("Cerca" in ph or "Nazione" in (T.get("country", ""))) else "en"
 
+    # Registra config e prefisso attivo (letto dalla callback top-level)
+    st.session_state[f"__ps_cfg__{key_prefix}"] = {
+        "iso2": iso2,
+        "lang_ui": lang_ui,
+    }
+    st.session_state["__ps_active_prefix"] = key_prefix
+
+    # Searchbox
     selected = st_searchbox(
-        _search_callback_factory(iso2, lang_ui, key_prefix),
+        _search_callback,                 # <-- top-level, quindi picklable
         key=f"{key_prefix}_sb",
         placeholder=ph,
         clear_on_submit=False,
