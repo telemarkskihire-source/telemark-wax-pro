@@ -29,11 +29,30 @@ T = L["it"] if lang == "IT" else L["en"]
 
 st.title("Telemark · Pro Wax & Tune")
 
+# ---------- Helper compat: garantisce SEMPRE (lat, lon, label) ----------
+def _ensure_loc_tuple(res):
+    # Se è già una tupla valida (lat, lon, label)
+    if isinstance(res, tuple) and len(res) == 3:
+        return res
+    # Defaults/persistiti (Champoluc) se None o altro
+    ss = st.session_state
+    lat = float(ss.get("lat", 45.831))
+    lon = float(ss.get("lon", 7.730))
+    lab = ss.get("place_label", "🇮🇹  Champoluc, Valle d’Aosta — IT")
+    # Se è una chiave "label|||lat,lon" e abbiamo _options, risolviamola
+    if isinstance(res, str) and "|||" in res and "_options" in ss:
+        info = (ss._options or {}).get(res, {})
+        lat = float(info.get("lat", lat))
+        lon = float(info.get("lon", lon))
+        lab = str(info.get("label", lab))
+    return lat, lon, lab
+
 # ---------- 1) Ricerca località (modularizzata) ----------
 st.markdown(f"### 1) {T['search_ph']}")
 iso2 = country_selectbox(T)  # select paese (prefiltro)
 
-lat, lon, place_label = location_searchbox(T, iso2)  # searchbox rapido
+# Chiamata robusta: accetta tupla / chiave / None e restituisce sempre (lat, lon, label)
+lat, lon, place_label = _ensure_loc_tuple(location_searchbox(T, iso2))
 
 if lat is not None and lon is not None:
     st.markdown(
