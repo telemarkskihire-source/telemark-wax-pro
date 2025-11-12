@@ -1,18 +1,23 @@
 # streamlit_app.py
-# Telemark · Pro Wax & Tune — orchestratore modulare, con hard-reload del pacchetto core
+# Telemark · Pro Wax & Tune — orchestratore modulare pulito (ordine 2→3→4)
 
 import sys, os, importlib
 import streamlit as st
 
-# --- forza un reload pulito di tutto ciò che è "core.*" PRIMA degli import ---
+# --- hard-reload dei moduli core prima degli import ---
 importlib.invalidate_caches()
 for name in list(sys.modules.keys()):
     if name == "core" or name.startswith("core."):
         del sys.modules[name]
 
-# ora gli import vedranno i file aggiornati su disco
+# --- import core ---
 from core.i18n import L
 from core.search import COUNTRIES, country_selectbox, location_searchbox
+try:
+    # se disponibile, usiamo il reverse per aggiornare l’etichetta dopo click mappa
+    from core.search import reverse_geocode as _revgeo
+except Exception:
+    _revgeo = None
 
 # ---------- THEME ----------
 st.set_page_config(page_title="Telemark · Pro Wax & Tune", page_icon="❄️", layout="wide")
@@ -26,7 +31,6 @@ h1,h2,h3,h4 { color:#fff; letter-spacing:.2px }
 hr { border:none; border-top:1px solid var(--line); margin:.75rem 0 }
 .badge { display:inline-flex; align-items:center; gap:.5rem; background:#0b1220;
   border:1px solid #203045; color:#cce7f2; border-radius:12px; padding:.35rem .6rem; font-size:.85rem; }
-.note { color:#9aa4af; font-size:.9rem; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -41,27 +45,28 @@ T = L["it"] if lang == "IT" else L["en"]
 st.markdown(f"### 1) {T['search_ph']}")
 iso2 = country_selectbox(T)
 
-# normalizza in (lat,lon,label)
 _res = location_searchbox(T, iso2)
 lat = float(st.session_state.get("lat", 45.831))
 lon = float(st.session_state.get("lon", 7.730))
 place_label = st.session_state.get("place_label", "🇮🇹  Champoluc, Valle d’Aosta — IT")
 
+# normalizza risultati dal searchbox
 if isinstance(_res, tuple) and len(_res) == 3:
     try:
         lat, lon, place_label = float(_res[0]), float(_res[1]), str(_res[2])
-        st.session_state["lat"], st.session_state["lon"], st.session_state["place_label"] = lat, lon, place_label
     except Exception:
         pass
 elif isinstance(_res, str) and "|||" in _res and "_options" in st.session_state:
     info = (getattr(st.session_state, "_options", {}) or {}).get(_res, {})
     lat = float(info.get("lat", lat)); lon = float(info.get("lon", lon))
     place_label = str(info.get("label", place_label))
-    st.session_state["lat"], st.session_state["lon"], st.session_state["place_label"] = lat, lon, place_label
+
+st.session_state["lat"] = lat
+st.session_state["lon"] = lon
+st.session_state["place_label"] = place_label
 
 st.markdown(
-    f"<div class='badge'>📍 <b>{place_label}</b> · "
-    f"lat <b>{lat:.5f}</b>, lon <b>{lon:.5f}</b></div>",
+    f"<div class='badge'>📍 <b>{place_label}</b> · lat <b>{lat:.5f}</b>, lon <b>{lon:.5f}</b></div>",
     unsafe_allow_html=True
 )
 
@@ -69,20 +74,7 @@ st.markdown(
 ctx = {"lat": lat, "lon": lon, "place_label": place_label, "iso2": iso2, "lang": lang, "T": T}
 st.session_state["_ctx"] = ctx
 
-# ---------- Smoke test: core.utils aggiornato? ----------
-with st.expander("Debug pacchetto core", expanded=True):
-    st.code(f"sys.path[0]={sys.path[0]}")
-    try:
-        import core.utils as cu
-        importlib.reload(cu)  # ulteriore reload mirato
-        has_fn = hasattr(cu, "rh_from_t_td")
-        st.write("`core.utils` caricato, `rh_from_t_td` presente:", has_fn)
-        if not has_fn:
-            st.error("⚠️ In core/utils.py manca la funzione rh_from_t_td. Incolla il file aggiornato e premi Rerun.")
-    except Exception as e:
-        st.error(f"Import core.utils fallito: {e}")
-
-# ---------- Loader moduli ----------
+# ---------- helpers import/call ----------
 def _load(modname: str):
     try:
         importlib.invalidate_caches()
@@ -104,11 +96,45 @@ def _call_first(mod, names, *args, **kwargs):
                 return False, f"error:{n}"
     return False, "no-render-fn"
 
-st.markdown("### 2) Moduli")
+# ===========================================================
+# 2) METEO & CALCOLO
+# ===========================================================
+st.markdown("### 2) " + (T.get("status_title","Meteo & calcolo")))
+m_meteo = _load("core.meteo")
+_call_first(m_meteo, ["render_meteo","panel_meteo","run_meteo","show_meteo","main","app","render"], T, ctx)
 
-MODULES = [
-    ("core.maps",      ["render_map","map_panel","show_map","main","app","render"]),
-    ("core.dem_tools", ["render_dem","dem_panel","show_dem","main","app","render"]),
-    ("core.meteo",     ["render_meteo","panel_meteo","run_meteo","show_meteo","main","app","render"]),
-    ("core.wax_logic", ["render_wax","wax_panel","show_wax","main","app","render"]),
-]
+# ===========================================================
+# 3) SCIOLINE & TUNING
+# ===========================================================
+st.markdown("### 3) Scioline & tuning")
+m_wax = _load("core.wax_logic")
+_call_first(m_wax, ["render_wax","wax_panel","show_wax","main","app","render"], T, ctx)
+
+# ===========================================================
+# 4) MAPPA (selezione) — poi DEM
+# ===========================================================
+st.markdown("### 4) " + T.get("map","Mappa"))
+m_maps = _load("core.maps")
+_call_first(m_maps, ["render_map","map_panel","show_map","main","app","render"], T, ctx)
+
+# se la mappa ha aggiornato lat/lon, aggiorna anche label (reverse) e badge
+if st.session_state.get("_last_click"):
+    lat = float(st.session_state.get("lat", lat))
+    lon = float(st.session_state.get("lon", lon))
+    if callable(_revgeo):
+        try:
+            place_label = _revgeo(lat, lon)
+            st.session_state["place_label"] = place_label
+        except Exception:
+            pass
+    st.markdown(
+        f"<div class='badge'>📍 <b>{st.session_state.get('place_label', place_label)}</b> · "
+        f"lat <b>{lat:.5f}</b>, lon <b>{lon:.5f}</b></div>",
+        unsafe_allow_html=True
+    )
+
+# ===========================================================
+# 5) DEM / ESPOSIZIONE & PENDENZA
+# ===========================================================
+m_dem = _load("core.dem_tools")
+_call_first(m_dem, ["render_dem","dem_panel","show_dem","main","app","render"], T, ctx)
