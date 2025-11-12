@@ -12,11 +12,11 @@ st.set_page_config(page_title="Telemark · Pro Wax & Tune", page_icon="❄️", 
 st.markdown("""
 <style>
 :root { --bg:#0b0f13; --panel:#121821; --muted:#9aa4af; --fg:#e5e7eb; --line:#1f2937; }
-html, body, .stApp { background:var(--bg); color:var(--fg); }
+html, body, .stApp { background:var(--bg); color:#e5e7eb; }
 [data-testid="stHeader"] { background:transparent; }
 section.main > div { padding-top: 0.6rem; }
 h1,h2,h3,h4 { color:#fff; letter-spacing:.2px }
-hr { border:none; border-top:1px solid var(--line); margin:.75rem 0 }
+hr { border:none; border-top:1px solid #1f2937; margin:.75rem 0 }
 .badge { display:inline-flex; align-items:center; gap:.5rem; background:#0b1220;
   border:1px solid #203045; color:#cce7f2; border-radius:12px; padding:.35rem .6rem; font-size:.85rem; }
 </style>
@@ -29,38 +29,42 @@ T = L["it"] if lang == "IT" else L["en"]
 
 st.title("Telemark · Pro Wax & Tune")
 
-# ---------- Helper compat: garantisce SEMPRE (lat, lon, label) ----------
-def _ensure_loc_tuple(res):
-    # Se è già una tupla valida (lat, lon, label)
-    if isinstance(res, tuple) and len(res) == 3:
-        return res
-    # Defaults/persistiti (Champoluc) se None o altro
-    ss = st.session_state
-    lat = float(ss.get("lat", 45.831))
-    lon = float(ss.get("lon", 7.730))
-    lab = ss.get("place_label", "🇮🇹  Champoluc, Valle d’Aosta — IT")
-    # Se è una chiave "label|||lat,lon" e abbiamo _options, risolviamola
-    if isinstance(res, str) and "|||" in res and "_options" in ss:
-        info = (ss._options or {}).get(res, {})
-        lat = float(info.get("lat", lat))
-        lon = float(info.get("lon", lon))
-        lab = str(info.get("label", lab))
-    return lat, lon, lab
-
 # ---------- 1) Ricerca località (modularizzata) ----------
 st.markdown(f"### 1) {T['search_ph']}")
 iso2 = country_selectbox(T)  # select paese (prefiltro)
 
-# Chiamata robusta: accetta tupla / chiave / None e restituisce sempre (lat, lon, label)
-lat, lon, place_label = _ensure_loc_tuple(location_searchbox(T, iso2))
+# Chiamata TOLLERANTE: non facciamo unpack diretto
+_res = location_searchbox(T, iso2)  # può essere (lat,lon,label) oppure chiave stringa oppure None
 
-if lat is not None and lon is not None:
-    st.markdown(
-        f"<div class='badge'>📍 <b>{place_label}</b> · "
-        f"lat <b>{lat:.5f}</b>, lon <b>{lon:.5f}</b></div>",
-        unsafe_allow_html=True
-    )
-else:
-    st.info("Digita almeno 2–3 caratteri per vedere i suggerimenti.")
+# Defaults/persistiti (Champoluc)
+_lat = float(st.session_state.get("lat", 45.831))
+_lon = float(st.session_state.get("lon", 7.730))
+_lab = st.session_state.get("place_label", "🇮🇹  Champoluc, Valle d’Aosta — IT")
+
+# 1) Caso tupla valida
+if isinstance(_res, tuple) and len(_res) == 3:
+    try:
+        _lat, _lon, _lab = float(_res[0]), float(_res[1]), str(_res[2])
+    except Exception:
+        pass
+# 2) Caso chiave "label|||lat,lon" risolvibile da _options
+elif isinstance(_res, str) and "|||" in _res and "_options" in st.session_state:
+    info = (getattr(st.session_state, "_options", {}) or {}).get(_res, {})
+    _lat = float(info.get("lat", _lat))
+    _lon = float(info.get("lon", _lon))
+    _lab = str(info.get("label", _lab))
+# 3) Caso None/altro → restano i defaults/persistiti
+
+# Salva comunque in sessione per coerenza
+st.session_state["lat"] = _lat
+st.session_state["lon"] = _lon
+st.session_state["place_label"] = _lab
+
+# Badge
+st.markdown(
+    f"<div class='badge'>📍 <b>{_lab}</b> · "
+    f"lat <b>{_lat:.5f}</b>, lon <b>{_lon:.5f}</b></div>",
+    unsafe_allow_html=True
+)
 
 # Nota: nelle prossime iterazioni potrai importare da core/ anche meteo, mappe, tabelle, ecc.
