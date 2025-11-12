@@ -90,3 +90,9 @@ def render_map(T, ctx):
     st.markdown("**[map]** pronto (stub).")
 
 render = render_map
+# --- export di fallback ---
+if not any(k in globals() for k in ("render_map","map_panel","show_map","render")):
+    def render_map(T, ctx):
+        import streamlit as st
+        st.markdown("**[maps]** pronto (stub).")
+    render = render_map
