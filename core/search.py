@@ -1,19 +1,16 @@
 # core/search.py
-import unicodedata, requests, streamlit as st
+# Modulo ricerca località: Nominatim + Open-Meteo fallback, caching, retry
+import time, math, requests
+import streamlit as st
 from streamlit_searchbox import st_searchbox
 
-UA = {"User-Agent": "telemark-wax-pro/1.0", "Accept-Language": "it,en;q=0.8"}
-
+# ---------- Paesi (prefiltro) ----------
 COUNTRIES = {
-    "Italia": "IT","Svizzera":"CH","Francia":"FR","Austria":"AT",
-    "Germania":"DE","Spagna":"ES","Norvegia":"NO","Svezia":"SE"
+    "Italia": "IT", "Svizzera": "CH", "Francia": "FR", "Austria": "AT",
+    "Germania": "DE", "Spagna": "ES", "Norvegia": "NO", "Svezia": "SE"
 }
 
-def _norm(s:str)->str:
-    if not s: return ""
-    s = unicodedata.normalize("NFKD", s)
-    s = "".join([c for c in s if not unicodedata.combining(c)])
-    return s.strip()
+UA = {"User-Agent": "telemark-wax-pro/1.1"}
 
 def flag(cc: str) -> str:
     try:
@@ -23,103 +20,152 @@ def flag(cc: str) -> str:
         return "🏳️"
 
 def concise_label(addr: dict, fallback: str) -> str:
-    name = (addr.get("village") or addr.get("town") or addr.get("city") or
-            addr.get("municipality") or fallback)
-    admin1 = addr.get("region") or addr.get("state") or addr.get("county") or ""
+    name = (addr.get("neighbourhood") or addr.get("hamlet") or addr.get("village")
+            or addr.get("town") or addr.get("city") or fallback)
+    admin1 = addr.get("state") or addr.get("region") or addr.get("county") or ""
     cc = (addr.get("country_code") or "").upper()
-    parts = [p for p in [name, admin1] if p]
-    s = ", ".join(parts)
+    s = ", ".join([p for p in [name, admin1] if p])
     return f"{s} — {cc}" if cc else s
 
-# ---------- GEOCODING: Open-Meteo (fast) ----------
-@st.cache_data(ttl=6*3600, show_spinner=False)
-def _om_geocode(q: str, iso2: str):
-    params = {
-        "name": q, "count": 12, "language": "it",
-        "format": "json", "filter": "city,locality,village,town",
-    }
-    # bias al paese
-    if iso2: params["country"] = iso2.upper()
-    r = requests.get("https://geocoding-api.open-meteo.com/v1/search",
-                     params=params, headers=UA, timeout=6)
-    r.raise_for_status()
-    js = r.json()
-    out = []
-    for it in js.get("results", []) or []:
-        cc = (it.get("country_code") or "").upper()
-        lab = f"{it.get('name','')}, {it.get('admin1','')}".strip(", ")
-        lab2 = f"{flag(cc)}  {lab}"
-        lat, lon = float(it["latitude"]), float(it["longitude"])
-        key = f"{lab2}|||{lat:.6f},{lon:.6f}"
-        out.append((key, {"lat":lat,"lon":lon,"label":lab2,"addr":{"country_code":cc}}))
-    return out
-
-# ---------- GEOCODING: Nominatim (fallback) ----------
-@st.cache_data(ttl=6*3600, show_spinner=False)
-def _nominatim_geocode(q: str, iso2: str):
-    r = requests.get(
-        "https://nominatim.openstreetmap.org/search",
-        params={
-            "q": q, "format":"json", "limit":12, "addressdetails":1,
-            "countrycodes": (iso2 or "").lower(), "dedupe": 1
-        },
-        headers=UA, timeout=8
-    )
-    r.raise_for_status()
-    out=[]
-    for it in r.json():
-        addr = it.get("address",{}) or {}
-        lab  = concise_label(addr, it.get("display_name",""))
-        cc   = addr.get("country_code","") or (iso2 or "").lower()
-        lab2 = f"{flag(cc)}  {lab}"
-        lat  = float(it.get("lat",0)); lon=float(it.get("lon",0))
-        key  = f"{lab2}|||{lat:.6f},{lon:.6f}"
-        out.append((key, {"lat":lat,"lon":lon,"label":lab2,"addr":addr}))
-    return out
-
-def _search_backend(q: str, iso2: str):
-    qn = _norm(q)
-    if not qn or len(qn) < 2:
-        return []
-    # se l’utente non ha messo il paese, lo aggiungiamo per aiutare (es. “Courmayeur IT”)
-    q_bias = f"{qn} {iso2}" if iso2 and iso2.lower() not in qn.lower() else qn
-    try:
-        rows = _om_geocode(q_bias, iso2)
-        if not rows:
-            rows = _nominatim_geocode(q_bias, iso2)
-    except Exception:
-        rows = []
+def _retry(func, attempts=3, sleep=0.5):
+    for i in range(attempts):
         try:
-            rows = _nominatim_geocode(q_bias, iso2)
+            return func()
         except Exception:
-            pass
-    # esito -> lista chiavi per st_searchbox
-    st.session_state._options = {k:v for k,v in rows}
-    return [k for k,_ in rows]
+            if i == attempts - 1:
+                raise
+            time.sleep(sleep * (1.6 ** i))
 
-def location_search_ui(T):
-    col = st.columns([2,1])
-    with col[1]:
-        sel_country = st.selectbox(T["country"], list(COUNTRIES.keys()), index=0, key="country_sel")
-        iso2 = COUNTRIES[sel_country]
-    with col[0]:
-        selected = st_searchbox(
-            lambda q: _search_backend(q, iso2),
-            key="place",
-            placeholder=T["search_ph"],
-            clear_on_submit=False,
-            default=None,
-        )
-    # applica selezione
-    if selected and "|||" in selected and "_options" in st.session_state:
-        info = st.session_state._options.get(selected)
-        if info:
-            st.session_state["lat"] = info["lat"]
-            st.session_state["lon"] = info["lon"]
-            st.session_state["place_label"] = info["label"]
+# ---------- Data sources ----------
+@st.cache_data(ttl=60*60, show_spinner=False)
+def nominatim_search_api(q: str, iso2: str):
+    r = _retry(lambda: requests.get(
+        "https://nominatim.openstreetmap.org/search",
+        params={"q": q, "format": "json", "limit": 12, "addressdetails": 1,
+                "countrycodes": iso2.lower() if iso2 else None},
+        headers=UA, timeout=8
+    ))
+    r.raise_for_status()
+    return r.json()
 
-    # badge (se presente)
-    if all(k in st.session_state for k in ["lat","lon","place_label"]):
-        st.markdown(
-            f"📍 {st.session_state['place_label']} · lat {st.session_state['lat']:.5f}, lon {st.session_state['lon']:.5f}"
-        )
+@st.cache_data(ttl=60*60, show_spinner=False)
+def openmeteo_geocode_api(q: str, iso2: str):
+    # Fallback molto veloce e con toponimi alpini (Courmayeur incluso)
+    r = _retry(lambda: requests.get(
+        "https://geocoding-api.open-meteo.com/v1/search",
+        params={"name": q, "language": "it", "count": 10, "format": "json",
+                "filter": "country", "country": iso2.upper() if iso2 else None},
+        headers=UA, timeout=8
+    ))
+    r.raise_for_status()
+    return r.json()
+
+def _options_from_nominatim(js):
+    out = []
+    for it in js or []:
+        addr = it.get("address", {}) or {}
+        lab = concise_label(addr, it.get("display_name", ""))
+        cc = addr.get("country_code", "")
+        lab = f"{flag(cc)}  {lab}"
+        lat = float(it.get("lat", 0)); lon = float(it.get("lon", 0))
+        key = f"osm|{lat:.6f}|{lon:.6f}|{lab}"
+        out.append({"key": key, "lat": lat, "lon": lon, "label": lab, "source": "osm"})
+    return out
+
+def _options_from_openmeteo(js):
+    out = []
+    for it in (js or {}).get("results", []) or []:
+        cc = (it.get("country_code") or "").upper()
+        name = it.get("name") or ""
+        admin1 = it.get("admin1") or it.get("admin2") or ""
+        lab = f"{flag(cc)}  {name}, {admin1} — {cc}".strip().replace(" ,", ",")
+        lat = float(it.get("latitude", 0)); lon = float(it.get("longitude", 0))
+        key = f"om|{lat:.6f}|{lon:.6f}|{lab}"
+        out.append({"key": key, "lat": lat, "lon": lon, "label": lab, "source": "om"})
+    return out
+
+# ---------- UI helpers ----------
+def country_selectbox(T):
+    sel = st.selectbox(T["country"], list(COUNTRIES.keys()), index=0, key="country_sel")
+    return COUNTRIES[sel]
+
+def location_searchbox(T, iso2):
+    """
+    Renderizza lo searchbox e salva la selezione in st.session_state:
+    keys: lat, lon, place_label, place_source
+    Ritorna il dict della selezione (o None).
+    """
+    st.session_state.setdefault("_search_options", {})
+
+    def provider(query: str):
+        if not query or len(query.strip()) < 2:
+            return []
+        q = query.strip()
+        # 1) Nominatim (preciso su numeri civici)
+        try:
+            js1 = nominatim_search_api(q, iso2)
+            opts1 = _options_from_nominatim(js1)
+        except Exception:
+            opts1 = []
+        # 2) Open-Meteo Geocoding (veloce su toponimi montani — es. Courmayeur)
+        try:
+            js2 = openmeteo_geocode_api(q, iso2)
+            opts2 = _options_from_openmeteo(js2)
+        except Exception:
+            opts2 = []
+        # merge evitando duplicati (lat/lon)
+        merged = []
+        seen = set()
+        for src in (opts1 + opts2):
+            k = (round(src["lat"], 5), round(src["lon"], 5))
+            if k in seen:
+                continue
+            seen.add(k)
+            merged.append(src)
+        # mappa chiave -> oggetto per recupero dopo la scelta
+        st.session_state["_search_options"] = {it["key"]: it for it in merged}
+        # valori mostrati nella tendina
+        return [it["key"] for it in merged]
+
+    # searchbox
+    selected_key = st_searchbox(
+        provider,
+        key="place",
+        placeholder=T["search_ph"],
+        clear_on_submit=False,
+        default=None
+    )
+
+    if selected_key and selected_key in st.session_state["_search_options"]:
+        info = st.session_state["_search_options"][selected_key]
+        st.session_state["lat"] = info["lat"]
+        st.session_state["lon"] = info["lon"]
+        st.session_state["place_label"] = info["label"]
+        st.session_state["place_source"] = info["source"]
+        return info
+
+    # default (Champoluc) la prima volta
+    if "lat" not in st.session_state:
+        st.session_state["lat"] = 45.83333
+        st.session_state["lon"] = 7.73333
+        st.session_state["place_label"] = "🇮🇹  Champoluc-Champlan, Valle d’Aosta — IT"
+        st.session_state["place_source"] = "default"
+        return {
+            "lat": st.session_state["lat"],
+            "lon": st.session_state["lon"],
+            "label": st.session_state["place_label"],
+            "source": st.session_state["place_source"],
+        }
+
+    # niente selezione nuova
+    return None
+
+def get_current_selection():
+    if "lat" in st.session_state and "place_label" in st.session_state:
+        return {
+            "lat": float(st.session_state["lat"]),
+            "lon": float(st.session_state["lon"]),
+            "label": st.session_state["place_label"],
+            "source": st.session_state.get("place_source", "state"),
+        }
+    return None
