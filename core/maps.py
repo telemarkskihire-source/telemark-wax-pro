@@ -11,6 +11,16 @@ def _osm_tile(lat, lon, z=9):
     ytile = int((1.0 - math.log(math.tan(lat_rad) + (1 / math.cos(lat_rad))) / math.pi) / 2.0 * n)
     url = f"https://tile.openstreetmap.org/{z}/{xtile}/{ytile}.png"
     r = requests.get(url, headers=UA, timeout=8); r.raise_for_status()
+   # ... codice esistente ...
+st.session_state["lat"] = new_lat
+st.session_state["lon"] = new_lon
+st.session_state["place_label"] = reverse_geocode(new_lat, new_lon)
+
+# NUOVO: quando clicchi, torna in modalità auto (altitudine da DEM/elevation)
+st.session_state["alt_sync_mode"] = "auto"
+
+st.success(f"Posizione aggiornata: {st.session_state['place_label']}")
+st.rerun()
     return r.content
 
 def render_map(T, ctx):
