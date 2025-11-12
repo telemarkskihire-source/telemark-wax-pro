@@ -211,3 +211,38 @@ def location_searchbox(T: Dict[str, str], iso2: str, key: str = "place") -> Tupl
             st.session_state["place_label"] = label
 
     return lat, lon, label
+
+# --- COMPAT SHIM: garantisce che location_searchbox ritorni SEMPRE (lat, lon, label) ---
+def __loc_tuple_wrapper(T, iso2, key: str = "place"):
+    try:
+        res = _location_searchbox_impl(T, iso2, key)  # se esiste l'impl reale
+    except NameError:
+        # se non c'è un'impl separata, prova a chiamare l'attuale location_searchbox
+        try:
+            res = location_searchbox(T, iso2, key)  # type: ignore
+        except Exception:
+            res = None
+
+    if isinstance(res, tuple) and len(res) == 3:
+        return res
+
+    # gestisci key/None -> fallback ai persistiti/default
+    if isinstance(res, str) and "|||" in res and "_options" in st.session_state:
+        info = (st.session_state._options or {}).get(res, {})
+        lat = float(info.get("lat", st.session_state.get("lat", 45.831)))
+        lon = float(info.get("lon", st.session_state.get("lon", 7.730)))
+        lab = info.get("label", st.session_state.get("place_label", "🇮🇹  Champoluc, Valle d’Aosta — IT"))
+        return lat, lon, lab
+
+    # fallback duro
+    lat = float(st.session_state.get("lat", 45.831))
+    lon = float(st.session_state.get("lon", 7.730))
+    lab = st.session_state.get("place_label", "🇮🇹  Champoluc, Valle d’Aosta — IT")
+    return lat, lon, lab
+
+# conserva l'impl attuale (se c'è) e poi SOSTITUISCI l'export con wrapper
+try:
+    _location_searchbox_impl = location_searchbox  # salva l’originale
+except NameError:
+    pass
+location_searchbox = __loc_tuple_wrapper  # <-- da qui in poi ritorna sempre una tupla
