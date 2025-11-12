@@ -1,10 +1,9 @@
 # core/search.py
-# API esposte (compatibili con streamlit_app.py):
+# API pubbliche (compatibili con streamlit_app.py):
 #   - COUNTRIES
-#   - country_selectbox(T, key="country_sel") -> str ISO2
-#   - location_searchbox(T, iso2, key="place") -> str|None
-#       (popola st.session_state._options[token] = {lat, lon, label})
-#   - place_search_ui(T, iso2, key_prefix="place") -> (lat, lon, label)
+#   - country_selectbox(T, key="country_sel") -> str (ISO2)
+#   - location_searchbox(T, iso2, key="place") -> (lat: float, lon: float, label: str)  <-- SEMPRE una tupla
+#   - place_search_ui(T, iso2, key_prefix="place") -> (lat, lon, label)  (opzionale)
 
 from __future__ import annotations
 import time
@@ -41,7 +40,9 @@ def _label_from_addr(addr: dict, fallback: str) -> str:
             or addr.get("town") or addr.get("city") or fallback)
     admin = addr.get("state") or addr.get("region") or addr.get("county") or ""
     parts = [p for p in [name, admin] if p]
-    return ", ".join([p for p in parts if p])
+    core = ", ".join([p for p in parts if p])
+    cc = (addr.get("country_code") or "").upper()
+    return f"{_flag(cc)}  {core}" if core else fallback
 
 def _retry(fn, tries=2, base_sleep=0.8):
     for i in range(tries):
@@ -76,9 +77,7 @@ def _search_nominatim(q: str, iso2: str) -> List[Tuple[str, dict]]:
         out = []
         for it in js:
             addr = it.get("address", {}) or {}
-            lab_core = _label_from_addr(addr, it.get("display_name", ""))
-            cc = (addr.get("country_code") or "").upper()
-            lab = f"{_flag(cc)}  {lab_core}" if cc else lab_core
+            lab = _label_from_addr(addr, it.get("display_name", ""))
             lat = float(it.get("lat", 0)); lon = float(it.get("lon", 0))
             key = f"{lab}|||{lat:.6f},{lon:.6f}"
             out.append((key, {"lat": lat, "lon": lon, "label": lab, "addr": addr}))
@@ -107,8 +106,8 @@ def _search_photon(q: str, iso2: str) -> List[Tuple[str, dict]]:
                 continue
             name = props.get("name") or props.get("city") or props.get("state") or ""
             admin = props.get("state") or props.get("county") or ""
-            label_core = ", ".join([p for p in [name, admin] if p])
-            lab = f"{_flag(cc)}  {label_core}" if cc else label_core
+            core = ", ".join([p for p in [name, admin] if p])
+            lab = f"{_flag(cc)}  {core}" if core else (name or "—")
             lon, lat = f.get("geometry", {}).get("coordinates", [None, None])
             if lat is None or lon is None:
                 continue
@@ -177,14 +176,16 @@ def country_selectbox(T: Dict[str, str], key: str = "country_sel") -> str:
     sel = st.selectbox(T.get("country", "Country"), labels, index=default_idx, key=key)
     return COUNTRIES[sel]
 
-def location_searchbox(T: Dict[str, str], iso2: str, key: str = "place") -> Optional[str]:
+def location_searchbox(T: Dict[str, str], iso2: str, key: str = "place") -> Tuple[float, float, str]:
     """
-    Mostra la casella di ricerca e restituisce la *chiave selezionata* (stringa),
-    es. '🇮🇹  Champoluc, Valle d’Aosta — IT|||45.831000,7.730000'.
-    Popola anche st.session_state._options[token] = {lat, lon, label}.
+    Mostra la casella di ricerca e restituisce SEMPRE (lat, lon, label).
+    - Se l'utente seleziona un risultato, salva in session_state e ritorna quello.
+    - Se non ha selezionato ancora nulla, ritorna i valori persistiti oppure i default (Champoluc).
+    Inoltre popola st.session_state._options[token] = {lat, lon, label}.
     """
     ph = T.get("search_ph", "Cerca…")
-    return _shim_searchbox(
+
+    selected = _shim_searchbox(
         search_function=lambda q: _search_places(q, iso2),
         key=key,
         placeholder=ph,
@@ -193,18 +194,26 @@ def location_searchbox(T: Dict[str, str], iso2: str, key: str = "place") -> Opti
         default=None
     )
 
-def place_search_ui(T: Dict[str, str], iso2: str, key_prefix: str = "place") -> Tuple[float, float, str]:
-    """Variante comoda che ritorna (lat, lon, label) e aggiorna lo stato."""
-    selected = location_searchbox(T, iso2, key=key_prefix)
+    # default: Champoluc, se non c'è nulla in sessione
     lat = float(st.session_state.get("lat", 45.83100))
     lon = float(st.session_state.get("lon", 7.73000))
     label = st.session_state.get("place_label", "🇮🇹  Champoluc, Valle d’Aosta — IT")
+
     if selected and "|||" in selected and "_options" in st.session_state:
         info = st.session_state._options.get(selected)
         if info:
-            lat, lon, label = info["lat"], info["lon"], info["label"]
+            lat, lon, label = float(info["lat"]), float(info["lon"]), str(info["label"])
             st.session_state["lat"] = lat
             st.session_state["lon"] = lon
             st.session_state["place_label"] = label
-    st.markdown(f"<div class='badge'>📍 <b>{label}</b> · lat <b>{lat:.5f}</b>, lon <b>{lon:.5f}</b></div>", unsafe_allow_html=True)
+
+    return lat, lon, label
+
+def place_search_ui(T: Dict[str, str], iso2: str, key_prefix: str = "place") -> Tuple[float, float, str]:
+    """Variante comoda che disegna badge e ritorna (lat, lon, label)."""
+    lat, lon, label = location_searchbox(T, iso2, key=key_prefix)
+    st.markdown(
+        f"<div class='badge'>📍 <b>{label}</b> · lat <b>{lat:.5f}</b>, lon <b>{lon:.5f}</b></div>",
+        unsafe_allow_html=True
+    )
     return lat, lon, label
