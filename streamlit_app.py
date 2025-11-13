@@ -12,7 +12,7 @@ for name in list(sys.modules.keys()):
 
 # --- import puliti dal core ---
 from core.i18n import L
-from core.search import COUNTRIES, country_selectbox, location_searchbox
+from core.search import location_searchbox
 
 # ---------- THEME ----------
 st.set_page_config(page_title="Telemark · Pro Wax & Tune", page_icon="❄️", layout="wide")
@@ -40,27 +40,9 @@ show_info = st.sidebar.toggle("Mostra info tecniche", value=False)
 
 # ---------- 1) RICERCA LOCALITÀ ----------
 st.markdown(f"### 1) {T['search_ph']}")
-iso2 = country_selectbox(T)
 
-_res = location_searchbox(T, iso2)  # può essere (lat,lon,label) oppure chiave del searchbox
-
-# Defaults persistiti
-lat = float(st.session_state.get("lat", 45.831))
-lon = float(st.session_state.get("lon", 7.730))
-place_label = st.session_state.get("place_label", "🇮🇹  Champoluc, Valle d’Aosta — IT")
-
-# Normalizzazione output
-if isinstance(_res, tuple) and len(_res) == 3:
-    try:
-        lat, lon, place_label = float(_res[0]), float(_res[1]), str(_res[2])
-        st.session_state["lat"], st.session_state["lon"], st.session_state["place_label"] = lat, lon, place_label
-    except Exception:
-        pass
-elif isinstance(_res, str) and "|||" in _res and "_options" in st.session_state:
-    info = (getattr(st.session_state, "_options", {}) or {}).get(_res, {})
-    lat = float(info.get("lat", lat)); lon = float(info.get("lon", lon))
-    place_label = str(info.get("label", place_label))
-    st.session_state["lat"], st.session_state["lon"], st.session_state["place_label"] = lat, lon, place_label
+# nuova API: niente paese, solo searchbox globale
+lat, lon, place_label = location_searchbox(T)
 
 # Badge posizione
 st.markdown(
@@ -69,7 +51,8 @@ st.markdown(
 )
 
 # ---------- CONTEXT condiviso per i moduli ----------
-ctx = {"lat": lat, "lon": lon, "place_label": place_label, "iso2": iso2, "lang": lang, "T": T}
+# iso2 non c'è più → lo mettiamo vuoto per compatibilità con moduli già scritti
+ctx = {"lat": lat, "lon": lon, "place_label": place_label, "iso2": "", "lang": lang, "T": T}
 st.session_state["_ctx"] = ctx
 
 # ---------- 2) MODULI ----------
@@ -98,7 +81,7 @@ def _call_first(mod, candidates, *args, **kwargs):
     return False, "no-render-fn"
 
 MODULES = [
-    ("core.site_meta", ["render_site_meta","render"]),            # <- nuovo step “Altitudine/TZ/DEM”
+    ("core.site_meta", ["render_site_meta","render"]),            # Altitudine/TZ/DEM
     ("core.maps",      ["render_map","map_panel","show_map","main","app","render"]),
     ("core.dem_tools", ["render_dem","dem_panel","show_dem","main","app","render"]),
     ("core.meteo",     ["render_meteo","panel_meteo","run_meteo","show_meteo","main","app","render"]),
@@ -108,7 +91,7 @@ MODULES = [
 for modname, candidates in MODULES:
     mod = _load(modname)
     ok, used = _call_first(mod, candidates, T, ctx)
-    # niente banner: se tutto ok non stampiamo nulla; in caso di errore un’unica riga rossa sopra.
+    # nessun banner: se tutto ok, silenzio; errori mostrati riga rossa
 
 # ---------- nota tecnica opzionale ----------
 if show_info:
