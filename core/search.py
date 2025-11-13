@@ -1,10 +1,11 @@
 # core/search.py
-# Ricerca località globale snella (Nominatim + Photon)
+# Ricerca località usando Open-Meteo Geocoding (robusto) + fallback Photon
 
 import time
 import requests
 import streamlit as st
 from streamlit_searchbox import st_searchbox
+
 
 # -------------------- Helpers --------------------
 
@@ -17,16 +18,6 @@ def _flag(cc: str) -> str:
 
 
 BASE_UA = "telemark-wax-pro/1.0 (+https://telemarkskihire.com)"
-NOMINATIM_EMAIL = st.secrets.get("NOMINATIM_EMAIL", None)
-
-HEADERS_NOM = {
-    "User-Agent": BASE_UA,
-    "Accept": "application/json",
-    "Accept-Language": "it,en;q=0.8",
-    "Referer": "https://telemarkskihire.com",
-}
-if NOMINATIM_EMAIL:
-    HEADERS_NOM["From"] = NOMINATIM_EMAIL
 
 
 def _retry(func, attempts=2, delay=0.8):
@@ -39,56 +30,49 @@ def _retry(func, attempts=2, delay=0.8):
             time.sleep(delay * (1.5 ** i))
 
 
-def _concise_label(addr: dict, fallback: str) -> str:
-    """Riduce display_name → 'località, regione'."""
-    name = (
-        addr.get("neighbourhood")
-        or addr.get("hamlet")
-        or addr.get("village")
-        or addr.get("town")
-        or addr.get("city")
-        or fallback
-    )
-    admin = addr.get("state") or addr.get("region") or addr.get("county") or ""
-    return ", ".join([p for p in [name, admin] if p])
+# -------------------- OPEN-METEO GEOCODING --------------------
 
-
-# -------------------- Search providers --------------------
-
-def _search_nominatim(q: str):
+def _search_openmeteo(q: str):
     q = (q or "").strip()
     if len(q) < 2:
         return []
 
     try:
-        r = _retry(lambda: requests.get(
-            "https://nominatim.openstreetmap.org/search",
-            params={
-                "q": q,
-                "format": "json",
-                "limit": 10,
-                "addressdetails": 1
-            },
-            headers=HEADERS_NOM,
-            timeout=7
-        ))
+        r = _retry(
+            lambda: requests.get(
+                "https://geocoding-api.open-meteo.com/v1/search",
+                params={
+                    "name": q,
+                    "count": 10,
+                    "language": "it",
+                    "format": "json",
+                },
+                headers={"User-Agent": BASE_UA},
+                timeout=7,
+            )
+        )
         r.raise_for_status()
-        js = r.json() or []
+        js = r.json() or {}
+        results = js.get("results") or []
     except Exception:
         return []
 
     out = []
-    for it in js:
-        addr = it.get("address", {}) or {}
-        display = _concise_label(addr, it.get("display_name", ""))
-        cc = (addr.get("country_code") or "").upper()
-        label = f"{_flag(cc)}  {display}" if cc else display
-        lat = float(it.get("lat", 0.0))
-        lon = float(it.get("lon", 0.0))
+    for rec in results:
+        name = rec.get("name", "")
+        admin1 = rec.get("admin1") or rec.get("admin2") or ""
+        cc = (rec.get("country_code") or "").upper()
+        pieces = [p for p in [name, admin1] if p]
+        base = ", ".join(pieces) if pieces else name
+        label = f"{_flag(cc)}  {base}" if cc else base
+        lat = float(rec.get("latitude"))
+        lon = float(rec.get("longitude"))
         key = f"{label}|||{lat:.6f},{lon:.6f}"
         out.append((key, {"lat": lat, "lon": lon, "label": label}))
     return out
 
+
+# -------------------- PHOTON (fallback) --------------------
 
 def _search_photon(q: str):
     q = (q or "").strip()
@@ -96,12 +80,14 @@ def _search_photon(q: str):
         return []
 
     try:
-        r = _retry(lambda: requests.get(
-            "https://photon.komoot.io/api",
-            params={"q": q, "limit": 10, "lang": "it"},
-            headers={"User-Agent": BASE_UA},
-            timeout=7
-        ))
+        r = _retry(
+            lambda: requests.get(
+                "https://photon.komoot.io/api",
+                params={"q": q, "limit": 10, "lang": "it"},
+                headers={"User-Agent": BASE_UA},
+                timeout=7,
+            )
+        )
         r.raise_for_status()
         feats = (r.json() or {}).get("features", []) or []
     except Exception:
@@ -112,31 +98,33 @@ def _search_photon(q: str):
         props = f.get("properties", {}) or {}
         cc = (props.get("countrycode") or "").upper()
         name = props.get("name") or props.get("city") or props.get("state") or ""
-        admin = props.get("state") or props.get("county") or ""
-        disp = ", ".join([p for p in [name, admin] if p])
+        admin1 = props.get("state") or props.get("county") or ""
+        disp = ", ".join([p for p in [name, admin1] if p])
 
         geom = f.get("geometry", {}) or {}
         lon, lat = geom.get("coordinates", [None, None])
         if lat is None or lon is None:
             continue
 
-        label = f"{_flag(cc)}  {disp}"
+        label = f"{_flag(cc)}  {disp}" if disp else _flag(cc)
         key = f"{label}|||{lat:.6f},{lon:.6f}"
         out.append((key, {"lat": float(lat), "lon": float(lon), "label": label}))
     return out
 
 
-# -------------------- Searchbox wrapper --------------------
+# -------------------- Funzione usata da st_searchbox --------------------
 
 def _search_function(q: str):
-    """Usato da st_searchbox."""
     q = (q or "").strip()
     st.session_state["_options"] = {}
 
     if len(q) < 2:
         return []
 
-    res = _search_nominatim(q)
+    # 1) Open-Meteo (più affidabile nel tuo ambiente)
+    res = _search_openmeteo(q)
+
+    # 2) Se proprio nulla, prova Photon
     if not res:
         res = _search_photon(q)
 
@@ -147,19 +135,22 @@ def _search_function(q: str):
     return keys
 
 
-# -------------------- Public API --------------------
+# -------------------- API pubblica --------------------
 
-def location_searchbox(T, key="place"):
-    """Ritorna sempre (lat, lon, label)."""
+def location_searchbox(T, key: str = "place"):
+    """
+    Mostra il searchbox e restituisce SEMPRE (lat, lon, label)
+    usando i valori salvati in sessione come default.
+    """
     selected = st_searchbox(
         search_function=_search_function,
         key=key,
         placeholder=T["search_ph"],
         clear_on_submit=False,
-        debounce=350
+        debounce=350,
     )
 
-    # valori persistiti
+    # default / persistiti
     lat = float(st.session_state.get("lat", 45.831))
     lon = float(st.session_state.get("lon", 7.730))
     label = st.session_state.get("place_label", "Champoluc")
