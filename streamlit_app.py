@@ -73,10 +73,10 @@ show_info = st.sidebar.toggle("Mostra info tecniche", value=False)
 tab_wax, tab_race = st.tabs(["🧊 Wax & Tune", "🏁 Race / Gare"])
 
 # ============================================================
-# TAB 1 — WAX & TUNE (quello che avevi, solo incapsulato)
+# TAB 1 — WAX & TUNE
 # ============================================================
 with tab_wax:
-    # 1) RICERCA LOCALITÀ — SOLO SEARCHBOX (Open-Meteo + Photon)
+    # 1) RICERCA LOCALITÀ — SOLO SEARCHBOX
     st.markdown(f"### 1) {T['search_ph']}")
 
     # location_searchbox gestisce internamente persistenza di lat/lon/label
@@ -94,17 +94,17 @@ with tab_wax:
         "lat": float(lat),
         "lon": float(lon),
         "place_label": place_label,
-        "iso2": "",
+        "iso2": "",          # per eventuale compatibilità backward
         "lang": lang,
         "T": T,
     }
     st.session_state["_ctx"] = ctx
 
-    # ---------- MODULI ESISTENTI ----------
+    # ---------- MODULI ----------
     st.markdown("### 2) Moduli")
 
     def _load(modname: str):
-        """Import semplice con messaggio di errore in UI."""
+        """Import di un modulo core.* con messaggio di errore in UI."""
         try:
             importlib.invalidate_caches()
             return importlib.import_module(modname)
@@ -130,13 +130,14 @@ with tab_wax:
                     return False, f"error:{name}"
         return False, "no-render-fn"
 
-
     MODULES = [
         ("core.site_meta", ["render_site_meta", "render"]),
-        ("core.maps", ["render_map", "map_panel", "show_map", "main", "app", "render"]),
-        ("core.dem_tools", ["render_dem", "dem_panel", "show_dem", "main", "app", "render"]),
         ("core.meteo", ["render_meteo", "panel_meteo", "run_meteo", "show_meteo", "main", "app", "render"]),
         ("core.wax_logic", ["render_wax", "wax_panel", "show_wax", "main", "app", "render"]),
+        ("core.maps", ["render_map", "map_panel", "show_map", "main", "app", "render"]),
+        ("core.dem_tools", ["render_dem", "dem_panel", "show_dem", "main", "app", "render"]),
+        # modulo POV video (se esiste)
+        ("core.pov_video", ["render_pov_video", "render", "main", "app"]),
     ]
 
     for modname, candidates in MODULES:
@@ -159,23 +160,44 @@ with tab_race:
     # ---------- servizio calendari con cache ----------
     @st.cache_resource
     def get_calendar_service() -> RaceCalendarService:
-        # client HTTP base (puoi personalizzare headers se FIS/FISI lo richiedono)
+        # client HTTP per FIS
         def http_client_fis(url: str, params: dict) -> str:
             r = requests.get(url, params=params, timeout=10)
             r.raise_for_status()
             return r.text
 
+        # client HTTP per FISI con User-Agent da browser + gestione 403
         def http_client_fisi(url: str, params_or_none) -> str:
+            headers = {
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/120.0 Safari/537.36"
+                ),
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "it-IT,it;q=0.9,en-US;q=0.8,en;q=0.7",
+                "Referer": "https://www.fisi.org/",
+            }
+
             if params_or_none is None:
-                r = requests.get(url, timeout=10)
+                r = requests.get(url, headers=headers, timeout=10)
             else:
-                r = requests.get(url, params=params_or_none, timeout=10)
+                r = requests.get(url, params=params_or_none, headers=headers, timeout=10)
+
+            if r.status_code == 403:
+                # Messaggio chiaro se FISI blocca l'accesso dal server
+                raise RuntimeError(
+                    "Accesso al calendario FISI negato (403). "
+                    "Probabilmente il sito blocca le richieste dal server: "
+                    "per ora è necessario caricare i calendari FISI in modo offline (file CSV/JSON)."
+                )
+
             r.raise_for_status()
             return r.text
 
         # DA COMPLETARE: slug reali dei comitati FISI.
         fisi_committee_slugs = {
-            # "VALLE_D_AOSTA": "valdostano",   # <--- verifica lo slug corretto sul sito FISI
+            # "VALLE_D_AOSTA": "valdostano",
             # "PIEMONTE": "piemonte",
             # "ALPI_CENTRALI": "alpi-centrali",
             # "TRENTINO": "trentino",
@@ -258,7 +280,7 @@ with tab_race:
             st.info(
                 "Nessuna gara trovata con questi filtri.\n\n"
                 "Possibili cause: parser FISI/FIS da adattare alla struttura HTML reale "
-                "oppure comitati/slug non ancora configurati."
+                "oppure comitati/slug non ancora configurati, oppure accesso FISI bloccato (403)."
             )
         else:
             st.success(f"Trovate {len(events)} gare.")
