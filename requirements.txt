@@ -6,3 +6,4 @@ matplotlib
 streamlit-searchbox
 folium
 streamlit-folium
+beautifulsoup 4
