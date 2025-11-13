@@ -1,60 +1,98 @@
-class FISCalendarProvider(BaseCalendarProvider):
-    """
-    Provider per i calendari FIS (WC, EC, FIS, ENL, ecc.)
-    usando direttamente la pagina DB 'calendar-results.html'.
-    """
+import requests
+from dataclasses import dataclass
+from datetime import date, datetime
+from typing import Optional, List, Callable, Dict
 
+from bs4 import BeautifulSoup
+
+# ---------------------------------------------------------
+# ENUM / COSTANTI BASE
+# ---------------------------------------------------------
+
+class Federation:
+    FIS = "FIS"
+    FISI = "FISI"
+
+class Discipline:
+    SL = "SL"
+    GS = "GS"
+    SG = "SG"
+    DH = "DH"
+
+# ---------------------------------------------------------
+# DATACLASS EVENTO
+# ---------------------------------------------------------
+
+@dataclass
+class RaceEvent:
+    federation: str
+    season: int
+    discipline: Optional[str]
+    code: str
+    name: str
+    nation: Optional[str]
+    region: Optional[str]
+    place: str
+    resort: Optional[str]
+    start_date: date
+    end_date: date
+    category: Optional[str]
+    level: Optional[str]
+    gender: Optional[str]
+    source_url: str
+
+# ---------------------------------------------------------
+# PROVIDER BASE
+# ---------------------------------------------------------
+
+class BaseCalendarProvider:
+    federation: str = ""
+
+    def fetch_events(
+        self,
+        season: int,
+        discipline: Optional[str] = None,
+        nation: Optional[str] = None,
+        region: Optional[str] = None,
+        category: Optional[str] = None,
+        level: Optional[str] = None,
+    ) -> List[RaceEvent]:
+        raise NotImplementedError
+
+# ---------------------------------------------------------
+# FIS — FULL REAL-TIME PARSER
+# ---------------------------------------------------------
+
+class FISCalendarProvider(BaseCalendarProvider):
     federation = Federation.FIS
 
     BASE_URL = "https://www.fis-ski.com/DB/alpine-skiing/calendar-results.html"
 
-    def __init__(
-        self,
-        http_client: Optional[Callable[[str, dict], str]] = None,
-    ) -> None:
-        """
-        http_client: callable opzionale per effettuare richieste.
-        Firma attesa: (url: str, params: dict) -> str (HTML).
-        """
+    def __init__(self, http_client: Callable[[str, dict], str]):
         self.http_client = http_client
 
     def fetch_events(
         self,
         season: int,
-        discipline: Optional[Discipline] = None,
+        discipline: Optional[str] = None,
         nation: Optional[str] = None,
-        region: Optional[str] = None,  # non usato per FIS
+        region: Optional[str] = None,
         category: Optional[str] = None,
         level: Optional[str] = None,
     ) -> List[RaceEvent]:
-        """
-        Chiamata real-time al calendario FIS.
 
-        Nota: FIS richiede almeno un filtro (category/place/nation/codex),
-        quindi qui imponiamo SEMPRE un categorycode:
-
-        - se 'level' passato → usiamo quello (es. 'WC', 'EC', 'FIS')
-        - altrimenti default 'WC' (World Cup)
-        """
-        if self.http_client is None:
-            raise NotImplementedError(
-                "FISCalendarProvider.fetch_events: manca http_client."
-            )
-
-        # mapping level -> categorycode FIS
+        # categorycode obbligatorio per FIS
         if level:
             categorycode = level.upper()
         elif category:
             categorycode = category.upper()
         else:
-            categorycode = "WC"  # default: World Cup
-
-        disciplinecode = "" if discipline is None else discipline.value
+            categorycode = "WC"
 
         params = {
             "categorycode": categorycode,
-            "disciplinecode": disciplinecode,
-            "eventselection": "",         # tutte
+            "disciplinecode": "" if discipline is None else discipline,
+            "eventselection": "",
             "gendercode": "",
             "nationcode": "" if nation is None else nation,
             "place": "",
@@ -62,137 +100,104 @@ class FISCalendarProvider(BaseCalendarProvider):
             "racedate": "",
             "saveselection": "-1",
             "seasoncode": str(season),
-            "seasonmonth": f"X-{season}",  # "all months" pattern usato da FIS
+            "seasonmonth": f"X-{season}",
             "seasonselection": "",
-            "sectorcode": "AL",           # Sci alpino
+            "sectorcode": "AL",
         }
 
         html = self.http_client(self.BASE_URL, params)
+        return self._parse_fis_html(html, season, discipline, categorycode)
 
-        return self._parse_fis_calendar_html(
-            html=html,
-            season=season,
-            discipline=discipline,
-            category=categorycode,
-        )
-
-    # ---------- PARSER HTML FIS ----------
-
-    def _parse_fis_calendar_html(
+    def _parse_fis_html(
         self,
         html: str,
         season: int,
-        discipline: Optional[Discipline],
-        category: Optional[str],
+        discipline_filter: Optional[str],
+        category: str,
     ) -> List[RaceEvent]:
-        """
-        Parser per la tabella 'Calendar & Results' FIS.
 
-        Colonne (tipico):
-        - Date
-        - Place
-        - Place, Category, Event
-        - NSA
-        - Disc.
-        - Category & Event
-        - Gender
-        - ...
-        (e a volte Codex)
-        """
         soup = BeautifulSoup(html, "html.parser")
-        events: List[RaceEvent] = []
-
         table = soup.find("table")
-        if table is None:
-            return events
+        if not table:
+            return []
 
-        header_row = table.find("tr")
-        if not header_row:
-            return events
+        rows = table.find_all("tr")
+        if len(rows) <= 1:
+            return []
 
+        # header
         headers = [
             h.get_text(strip=True).lower()
-            for h in header_row.find_all(["th", "td"])
+            for h in rows[0].find_all(["td", "th"])
         ]
 
-        def col_index(name_substring: str) -> Optional[int]:
+        def col(name):
             for i, h in enumerate(headers):
-                if name_substring.lower() in h:
+                if name in h:
                     return i
             return None
 
-        idx_date = col_index("date")
-        idx_place = col_index("place")
-        idx_nsa = col_index("nsa")
-        idx_cat_evt = (
-            col_index("category & event")
-            or col_index("place, category, event")
-            or col_index("category")
-        )
-        idx_gender = col_index("gender")
-        idx_codex = col_index("codex")
+        idx_date = col("date")
+        idx_place = col("place")
+        idx_nsa = col("nsa")
+        idx_cat_evt = col("category") or col("event")
+        idx_gender = col("gender")
+        idx_codex = col("codex")
 
-        if idx_date is None or idx_place is None:
-            return events
+        events = []
 
-        for row in table.find_all("tr")[1:]:
+        for row in rows[1:]:
             cells = [c.get_text(strip=True) for c in row.find_all("td")]
             if len(cells) < len(headers):
                 continue
 
-            raw_date = cells[idx_date]
-            raw_place = cells[idx_place]
+            raw_date = cells[idx_date] if idx_date is not None else ""
+            raw_place = cells[idx_place] if idx_place is not None else ""
             raw_nsa = cells[idx_nsa] if idx_nsa is not None else ""
             raw_cat_evt = cells[idx_cat_evt] if idx_cat_evt is not None else ""
             raw_gender = cells[idx_gender] if idx_gender is not None else ""
             raw_codex = cells[idx_codex] if idx_codex is not None else ""
 
-            # --- parse data: es. "26-27 Oct 2024" → prendo il primo giorno ---
-            parts = raw_date.split()
-            if len(parts) >= 3:
-                day_token = parts[0].split("-")[0]  # "26-27" → "26"
-                month_token = parts[1]
-                year_token = parts[2]
-                try:
-                    d = datetime.strptime(
-                        f"{day_token} {month_token} {year_token}", "%d %b %Y"
-                    ).date()
-                except ValueError:
-                    continue
-            else:
+            # parse data
+            try:
+                parts = raw_date.split()
+                day = parts[0].split("-")[0]
+                month = parts[1]
+                year = parts[2]
+                d = datetime.strptime(
+                    f"{day} {month} {year}", "%d %b %Y"
+                ).date()
+            except:
                 continue
 
-            # --- disciplina da 'cat_evt' (es. "WC 2xSL", "FIS GS", ecc.) ---
-            disc_enum: Optional[Discipline] = None
-            up_evt = raw_cat_evt.upper()
+            # disciplina
+            up = raw_cat_evt.upper()
+            disc = None
+            if "SL" in up and not "PSL" in up:
+                disc = "SL"
+            elif "GS" in up:
+                disc = "GS"
+            elif "SG" in up:
+                disc = "SG"
+            elif "DH" in up or "DOWNHILL" in up:
+                disc = "DH"
 
-            if " SL" in up_evt or up_evt.endswith("SL"):
-                disc_enum = Discipline.SL
-            elif " GS" in up_evt or "G.S" in up_evt or up_evt.endswith("GS"):
-                disc_enum = Discipline.GS
-            elif " SG" in up_evt or up_evt.endswith("SG"):
-                disc_enum = Discipline.SG
-            elif " DH" in up_evt or "DOWNHILL" in up_evt or up_evt.endswith("DH"):
-                disc_enum = Discipline.DH
-
-            # filtro per disciplina richiesta
-            if discipline is not None and disc_enum is not None and disc_enum != discipline:
+            if discipline_filter and disc and disc != discipline_filter:
                 continue
 
-            # livello/categoria (WC / EC / FIS / ENL / NJR / CIT ...)
+            # livello
             level = None
             for code in ["WC", "EC", "FIS", "ENL", "NJR", "CIT", "NC"]:
-                if code in up_evt:
+                if code in up:
                     level = code
                     break
 
-            # se non abbiamo codex, inventiamo un id stabile
-            code = raw_codex or f"{season}-{raw_place}-{raw_cat_evt}-{raw_date}"
+            code = raw_codex or f"{season}-{raw_place}-{raw_date}"
 
             ev = RaceEvent(
                 federation=self.federation,
                 season=season,
-                discipline=disc_enum,
+                discipline=disc,
                 code=code,
                 name=raw_cat_evt or raw_place,
                 nation=raw_nsa or None,
@@ -201,7 +206,7 @@ class FISCalendarProvider(BaseCalendarProvider):
                 resort=None,
                 start_date=d,
                 end_date=d,
-                category=category or level,
+                category=category,
                 level=level,
                 gender=raw_gender or None,
                 source_url=self.BASE_URL,
@@ -209,3 +214,66 @@ class FISCalendarProvider(BaseCalendarProvider):
             events.append(ev)
 
         return events
+
+# ---------------------------------------------------------
+# FISI — BLOCCATO (403) → placeholder per ora
+# ---------------------------------------------------------
+
+class FISICalendarProvider(BaseCalendarProvider):
+    federation = Federation.FISI
+
+    def __init__(
+        self,
+        http_client,
+        committee_slugs: Dict[str, str],
+    ):
+        self.http_client = http_client
+        self.committee_slugs = committee_slugs
+
+    def fetch_events(
+        self,
+        season,
+        discipline=None,
+        nation=None,
+        region=None,
+        category=None,
+        level=None,
+    ):
+        # temporaneo fino al backend offline
+        return []
+
+# ---------------------------------------------------------
+# SERVIZIO UNIFICATO
+# ---------------------------------------------------------
+
+class RaceCalendarService:
+    def __init__(self, fis_provider, fisi_provider):
+        self.fis = fis_provider
+        self.fisi = fisi_provider
+
+    def list_events(
+        self,
+        season,
+        federation: Optional[str],
+        discipline: Optional[str],
+        nation: Optional[str],
+        region: Optional[str],
+    ) -> List[RaceEvent]:
+
+        result = []
+
+        if federation in (Federation.FIS, None):
+            try:
+                result += self.fis.fetch_events(season, discipline, nation)
+            except Exception:
+                pass
+
+        if federation in (Federation.FISI, None):
+            try:
+                result += self.fisi.fetch_events(season, discipline, nation, region)
+            except Exception:
+                pass
+
+        # ordina per data
+        result.sort(key=lambda ev: ev.start_date)
+        return result
