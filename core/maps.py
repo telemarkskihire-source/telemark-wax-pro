@@ -1,40 +1,31 @@
 # core/maps.py
-# Mappa + piste da sci (OSM/Overpass) + selezione pista
-
+# Mappa interattiva + lista piste da Overpass (solo piste downhill)
 import math
 import requests
 import streamlit as st
 
-from core.search import BASE_UA, HEADERS_NOM, _flag, _concise_label, _retry
+BASE_UA = "telemark-wax-pro/1.0 (+https://telemarkskihire.com)"
 
-# -----------------------------------------------------------------------------
-# Config comuni
-# -----------------------------------------------------------------------------
-
-UA = {"User-Agent": BASE_UA}
-
-# Proviamo a caricare folium, altrimenti fallback immagine statica
+# Proviamo ad usare folium, altrimenti semplice fallback
 HAS_FOLIUM = False
 try:
     from streamlit_folium import st_folium
     import folium
     from folium import TileLayer, LayerControl, Marker
     from folium.plugins import MousePosition
-
     HAS_FOLIUM = True
 except Exception:
     HAS_FOLIUM = False
 
 
-# -----------------------------------------------------------------------------
-# Helpers OSM / Overpass
-# -----------------------------------------------------------------------------
-
+# --------------------------------------------------------------------
+# Overpass: piste downhill vicino alla località
+# --------------------------------------------------------------------
 @st.cache_data(ttl=3 * 3600, show_spinner=False)
 def fetch_pistes_geojson(lat: float, lon: float, dist_km: int = 30):
     """
-    Scarica piste da sci alpino da Overpass in un raggio dist_km.
-    Ritorna un GeoJSON FeatureCollection.
+    Scarica piste alpine (piste:type=downhill) entro dist_km km dalla località.
+    Ritorna un GeoJSON {type:'FeatureCollection', features:[…]}
     """
     query = f"""
     [out:json][timeout:25];
@@ -45,95 +36,92 @@ def fetch_pistes_geojson(lat: float, lon: float, dist_km: int = 30):
     out geom;
     """
 
-    r = requests.post(
-        "https://overpass-api.de/api/interpreter",
-        data=query,
-        headers=UA,
-        timeout=30,
-    )
-    r.raise_for_status()
-    data = r.json().get("elements", [])
+    try:
+        r = requests.post(
+            "https://overpass-api.de/api/interpreter",
+            data=query,
+            headers={"User-Agent": BASE_UA},
+            timeout=30,
+        )
+        r.raise_for_status()
+        data = r.json().get("elements", [])
+    except Exception:
+        return {"type": "FeatureCollection", "features": []}
+
     feats = []
     for el in data:
+        tags = el.get("tags", {}) or {}
         props = {
             "id": el.get("id"),
-            "piste:type": (el.get("tags") or {}).get("piste:type", ""),
-            "name": (el.get("tags") or {}).get("name", ""),
+            "piste:type": tags.get("piste:type", ""),
+            "name": tags.get("name", ""),
         }
-        if "geometry" in el:
-            coords = [(g["lon"], g["lat"]) for g in el["geometry"]]
-            geom = {"type": "LineString", "coordinates": coords}
-            feats.append({"type": "Feature", "geometry": geom, "properties": props})
+
+        geom = el.get("geometry")
+        if not geom:
+            continue
+
+        coords = [(g["lon"], g["lat"]) for g in geom]
+        feats.append(
+            {
+                "type": "Feature",
+                "geometry": {"type": "LineString", "coordinates": coords},
+                "properties": props,
+            }
+        )
+
     return {"type": "FeatureCollection", "features": feats}
 
 
-@st.cache_data(ttl=6 * 3600, show_spinner=False)
-def osm_tile(lat: float, lon: float, z: int = 9):
-    """Piccolo fallback: scarica una singola tile OSM come immagine."""
-    n = 2 ** z
-    xtile = int((lon + 180.0) / 360.0 * n)
-    lat_rad = math.radians(lat)
-    ytile = int(
-        (1.0 - math.log(math.tan(lat_rad) + (1 / math.cos(lat_rad))) / math.pi) / 2.0
-        * n
-    )
-    url = f"https://tile.openstreetmap.org/{z}/{xtile}/{ytile}.png"
-    r = requests.get(url, headers=UA, timeout=8)
-    r.raise_for_status()
-    return r.content
-
-
-def reverse_geocode(lat: float, lon: float) -> str:
-    """Da coordinate a etichetta leggibile, usando Nominatim."""
-    try:
-        def go():
-            return requests.get(
-                "https://nominatim.openstreetmap.org/reverse",
-                params={
-                    "format": "json",
-                    "lat": lat,
-                    "lon": lon,
-                    "zoom": 12,
-                    "addressdetails": 1,
-                },
-                headers=HEADERS_NOM,
-                timeout=8,
-            )
-
-        r = _retry(go)
-        r.raise_for_status()
-        j = r.json()
-        addr = j.get("address", {}) or {}
-        lab = _concise_label(addr, j.get("display_name", ""))
-        cc = addr.get("country_code", "")
-        return f"{_flag(cc)}  {lab}"
-    except Exception:
-        return f"{lat:.5f}, {lon:.5f}"
-
-
-# -----------------------------------------------------------------------------
-# UI: selezione pista da lista
-# -----------------------------------------------------------------------------
-
+# --------------------------------------------------------------------
+# UI: selezione pista a partire dai features di Overpass
+# --------------------------------------------------------------------
 def _piste_select_ui(features):
     """
     Mostra la selectbox delle piste trovate e salva la scelta in session_state.
+
+    Logica:
+    - Se ci sono nomi OSM → un'opzione per ogni nome distinto.
+    - Se tutte le piste sono senza nome ma >1 → generiamo Pista #1, Pista #2, ...
     """
+
     if not features:
-        st.info("Nessun comprensorio sciistico trovato entro 30 km dalla località scelta.")
+        st.info("Nessun comprensorio sciistico trovato entro 30 km dalla località.")
         return
 
-    piste_labels = []
-    piste_ids = []
+    # 1) raggruppa per nome
+    by_name = {}
+    unnamed = []
 
     for f in features:
         props = f.get("properties", {}) or {}
         pid = props.get("id")
-        name = props.get("name") or f"Pista ID {pid}"
         if pid is None:
             continue
-        piste_ids.append(pid)
-        piste_labels.append(name)
+        name = (props.get("name") or "").strip()
+        if name:
+            by_name.setdefault(name, []).append(pid)
+        else:
+            unnamed.append(pid)
+
+    piste_labels = []
+    piste_ids = []
+
+    if by_name:
+        # Abbiamo nomi veri: usiamo quelli
+        for name in sorted(by_name.keys()):
+            piste_labels.append(name)
+            # come id associamo il primo della lista, ci basta un rappresentante
+            piste_ids.append(by_name[name][0])
+    else:
+        # Tutto senza nome: creiamo nomi sintetici se ce n'è più di una
+        if len(unnamed) == 1:
+            piste_labels = [f"Pista ID {unnamed[0]}"]
+            piste_ids = [unnamed[0]]
+        else:
+            for i, pid in enumerate(unnamed, start=1):
+                piste_labels.append(f"Pista #{i} (ID {pid})")
+                piste_ids.append(pid)
 
     if not piste_ids:
         st.info("Nessuna pista 'downhill' disponibile in questa zona.")
@@ -158,135 +146,116 @@ def _piste_select_ui(features):
     )
 
 
-# -----------------------------------------------------------------------------
-# ENTRYPOINT PRINCIPALE
-# -----------------------------------------------------------------------------
+# --------------------------------------------------------------------
+# UI: mappa interattiva (folium)
+# --------------------------------------------------------------------
+def _render_folium_map(lat, lon, place_label, features):
+    # chiave dinamica per reinit quando cambia località
+    map_key = f"map_{round(lat,5)}_{round(lon,5)}"
 
+    m = folium.Map(
+        location=[lat, lon],
+        zoom_start=12,
+        tiles=None,
+        control_scale=True,
+        prefer_canvas=True,
+        zoom_control=True,
+    )
+
+    TileLayer(
+        "https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",
+        name="Strade",
+        attr="© OpenStreetMap",
+        overlay=False,
+        control=True,
+    ).add_to(m)
+
+    # layer piste
+    if features:
+        folium.GeoJson(
+            data={"type": "FeatureCollection", "features": features},
+            name="Piste alpine (OSM)",
+            tooltip=folium.GeoJsonTooltip(
+                fields=["name", "piste:type"],
+                aliases=["Nome", "Tipo"],
+            ),
+            style_function=lambda f: {"color": "#3388ff", "weight": 3, "opacity": 0.95},
+        ).add_to(m)
+
+    Marker(
+        [lat, lon],
+        tooltip=place_label,
+        icon=folium.Icon(color="lightgray"),
+    ).add_to(m)
+
+    MousePosition().add_to(m)
+    LayerControl(position="bottomleft", collapsed=True).add_to(m)
+
+    out = st_folium(
+        m,
+        height=420,
+        use_container_width=True,
+        key=map_key,
+        returned_objects=["last_clicked"],
+    )
+
+    click = (out or {}).get("last_clicked") or {}
+    if click:
+        new_lat = float(click.get("lat"))
+        new_lon = float(click.get("lng"))
+        new_pair = (round(new_lat, 5), round(new_lon, 5))
+
+        if st.session_state.get("_last_click") != new_pair:
+            st.session_state["_last_click"] = new_pair
+            st.session_state["lat"] = new_lat
+            st.session_state["lon"] = new_lon
+            # il label viene aggiornato altrove (site_meta o search); qui ci limitiamo al cambio coordinate
+            st.success("Posizione aggiornata dal click sulla mappa. Rilancia il meteo per usare le nuove coordinate.")
+
+
+# --------------------------------------------------------------------
+# Entrypoint pubblico per il modulo
+# --------------------------------------------------------------------
 def render_map(T, ctx):
     """
-    Pannello mappa + piste:
-    - mostra la mappa centrata su ctx["lat"], ctx["lon"]
-    - consente click per aggiornare la posizione
-    - carica piste OSM e permette la selezione della pista
+    Punto di ingresso chiamato da streamlit_app.py
+    ctx: dict con lat, lon, place_label, iso2, lang, T
     """
-    lat = float(ctx["lat"])
-    lon = float(ctx["lon"])
-    place_label = ctx["place_label"]
-    iso2 = ctx["iso2"]
+    lat = ctx.get("lat", 45.831)
+    lon = ctx.get("lon", 7.730)
+    place_label = ctx.get("place_label", "Località")
+    lang = ctx.get("lang", "IT")
 
-    st.markdown("### 4) Mappa & piste")
+    # Titolo sezione
+    st.markdown("### Mappa & piste")
 
-    # Carichiamo subito le piste per poter usare la stessa lista sia su mappa che su selectbox
-    try:
+    # 1) Fetch piste (solo downhill) una volta per località
+    with st.spinner("Carico piste da OpenStreetMap…"):
         gj = fetch_pistes_geojson(lat, lon, dist_km=30)
-        features = gj.get("features", []) or []
-    except Exception:
-        gj = {"type": "FeatureCollection", "features": []}
-        features = []
-        st.warning("Impossibile contattare Overpass per le piste da sci in questo momento.")
+    features = gj.get("features", []) or []
 
-    # ------------------ Mappa interattiva / fallback --------------------------
-    if HAS_FOLIUM:
-        with st.expander(T["map"] + " — clicca sulla mappa per selezionare", expanded=True):
-            # chiave dinamica per reinit quando cambia località/paese
-            map_key = f"map_{round(lat,5)}_{round(lon,5)}_{iso2}"
-
-            m = folium.Map(
-                location=[lat, lon],
-                zoom_start=12,
-                tiles=None,
-                control_scale=True,
-                prefer_canvas=True,
-                zoom_control=True,
-            )
-            TileLayer(
-                "https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",
-                name="Strade",
-                attr="© OpenStreetMap contributors",
-                overlay=False,
-                control=True,
-            ).add_to(m)
-
-            # Piste come overlay GeoJson
-            if features:
-                sel_id = st.session_state.get("pista_id")
-
-                def style_fn(f):
-                    fid = (f.get("properties") or {}).get("id")
-                    if sel_id and fid == sel_id:
-                        return {"color": "#ff4b4b", "weight": 4, "opacity": 0.95}
-                    return {"color": "#3388ff", "weight": 3, "opacity": 0.95}
-
-                folium.GeoJson(
-                    data=gj,
-                    name="Piste alpine (OSM)",
-                    tooltip=folium.GeoJsonTooltip(
-                        fields=["name", "piste:type"],
-                        aliases=["Nome", "Tipo"],
-                    ),
-                    style_function=style_fn,
-                ).add_to(m)
-
-            # Marker posizione attuale
-            Marker(
-                [lat, lon],
-                tooltip=place_label,
-                icon=folium.Icon(color="lightgray"),
-            ).add_to(m)
-
-            MousePosition().add_to(m)
-            LayerControl(position="bottomleft", collapsed=True).add_to(m)
-
-            out = st_folium(
-                m,
-                height=420,
-                use_container_width=True,
-                key=map_key,
-                returned_objects=["last_clicked"],
-            )
-            click = (out or {}).get("last_clicked") or {}
-
-            # Click → aggiorna coordinate e label
-            if click:
-                new_lat = float(click.get("lat"))
-                new_lon = float(click.get("lng"))
-                new_pair = (round(new_lat, 5), round(new_lon, 5))
-                if st.session_state.get("_last_click") != new_pair:
-                    st.session_state["_last_click"] = new_pair
-                    st.session_state["lat"] = new_lat
-                    st.session_state["lon"] = new_lon
-                    new_label = reverse_geocode(new_lat, new_lon)
-                    st.session_state["place_label"] = new_label
-                    # aggiorniamo anche ctx usato dagli altri moduli
-                    ctx["lat"] = new_lat
-                    ctx["lon"] = new_lon
-                    ctx["place_label"] = new_label
-                    st.success(f"Posizione aggiornata: {new_label}")
-                    st.rerun()
-    else:
-        # Fallback: sola immagine tile
-        try:
-            tile = osm_tile(lat, lon, z=9)
-            st.image(tile, caption=T["map"], use_container_width=True)
-        except Exception:
-            st.info("Mappa non disponibile (manca streamlit-folium e il download tile è fallito).")
-
-    # ------------------ Coordinate manuali -----------------------------------
-    with st.expander("➕ Imposta coordinate manuali / Set precise coordinates", expanded=False):
-        c_lat, c_lon = st.columns(2)
-        new_lat = c_lat.number_input("Lat", value=float(lat), format="%.6f")
-        new_lon = c_lon.number_input("Lon", value=float(lon), format="%.6f")
-        if st.button("Imposta / Set"):
-            st.session_state["_last_click"] = None
-            st.session_state["lat"] = float(new_lat)
-            st.session_state["lon"] = float(new_lon)
-            new_label = reverse_geocode(float(new_lat), float(new_lon))
-            st.session_state["place_label"] = new_label
-            ctx["lat"] = float(new_lat)
-            ctx["lon"] = float(new_lon)
-            ctx["place_label"] = new_label
-            st.rerun()
-
-    # ------------------ Selettore piste --------------------------------------
-    st.markdown("#### Piste disponibili nella zona")
+    # 2) Selettore piste
+    st.markdown("#### Piste nella zona selezionata")
     _piste_select_ui(features)
+
+    # 3) Mappa interattiva opzionale
+    if HAS_FOLIUM:
+        with st.expander("Mostra mappa interattiva (sperimentale)", expanded=False):
+            _render_folium_map(lat, lon, place_label, features)
+    else:
+        st.info(
+            "Modulo mappa interattiva non disponibile (dipendenza folium mancante). "
+            "Le piste sono comunque elencate sopra."
+        )
+
+    # Hint finale (in italiano/inglese)
+    if lang == "IT":
+        st.caption(
+            "Suggerimento: dopo aver scelto una pista qui, imposta la quota di partenza nel modulo altitudine "
+            "e poi esegui il meteo/wax per quella configurazione."
+        )
+    else:
+        st.caption(
+            "Tip: after choosing a run here, set the start altitude in the altitude module, "
+            "then run the meteo/wax computation for that configuration."
+        )
