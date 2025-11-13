@@ -1,25 +1,15 @@
 # core/search.py
 # Ricerca località snella:
-# - Nominatim + fallback Photon
-# - usa country_selectbox per ISO2
-# - location_searchbox mantiene lat/lon/label in session_state
+# - Nominatim globale + fallback Photon
+# - NESSUN filtro per paese
+# - mantiene lat/lon/label in session_state
 
 import time
 import requests
 import streamlit as st
 from streamlit_searchbox import st_searchbox
 
-# -------------------- Costanti & helpers --------------------
-COUNTRIES = {
-    "Italia":   "IT",
-    "Svizzera": "CH",
-    "Francia":  "FR",
-    "Austria":  "AT",
-    "Germania": "DE",
-    "Spagna":   "ES",
-    "Norvegia": "NO",
-    "Svezia":   "SE",
-}
+# -------------------- Helpers --------------------
 
 def _flag(cc: str) -> str:
     try:
@@ -51,18 +41,6 @@ def _retry(func, attempts: int = 2, sleep: float = 0.8):
             time.sleep(sleep * (1.5 ** i))
 
 
-# -------------------- UI: scelta paese --------------------
-def country_selectbox(T):
-    label = st.selectbox(
-        T["country"],
-        list(COUNTRIES.keys()),
-        index=0,
-        key="country_sel",
-    )
-    return COUNTRIES[label]
-
-
-# -------------------- SEARCH: Nominatim + Photon --------------------
 def _concise_label(addr: dict, fallback: str) -> str:
     name = (
         addr.get("neighbourhood")
@@ -77,7 +55,9 @@ def _concise_label(addr: dict, fallback: str) -> str:
     return ", ".join(parts)
 
 
-def _search_nominatim(q: str, iso2: str):
+# -------------------- SEARCH: Nominatim + Photon --------------------
+
+def _search_nominatim(q: str):
     q = (q or "").strip()
     if len(q) < 2:
         return []
@@ -91,7 +71,7 @@ def _search_nominatim(q: str, iso2: str):
                     "format": "json",
                     "limit": 10,
                     "addressdetails": 1,
-                    "countrycodes": iso2.lower(),
+                    # niente countrycodes → ricerca globale
                 },
                 headers=HEADERS_NOM,
                 timeout=8,
@@ -115,7 +95,7 @@ def _search_nominatim(q: str, iso2: str):
     return out
 
 
-def _search_photon(q: str, iso2: str):
+def _search_photon(q: str):
     q = (q or "").strip()
     if len(q) < 2:
         return []
@@ -139,11 +119,6 @@ def _search_photon(q: str, iso2: str):
     for f in feats:
         props = f.get("properties", {}) or {}
         cc = (props.get("countrycode") or props.get("country", "")).upper()
-
-        # filtro paese: se c'è e non è quello selezionato, saltiamo
-        if cc and iso2 and cc != iso2.upper():
-            continue
-
         name = props.get("name") or props.get("city") or props.get("state") or ""
         admin1 = props.get("state") or props.get("county") or ""
         label_core = ", ".join([p for p in [name, admin1] if p])
@@ -161,42 +136,40 @@ def _search_photon(q: str, iso2: str):
     return out
 
 
-def _search_function_factory(iso2: str):
+def _search_function(q: str):
     """
-    Funzione che viene passata a st_searchbox.
-    Usa Nominatim e, se non trova nulla, Photon.
-    Popola st.session_state["_options"] con i payload.
+    Funzione passata a st_searchbox.
+    Usa Nominatim prima, poi Photon se non trova niente.
+    Popola st.session_state["_options"].
     """
-    def _search(q: str):
-        q = (q or "").strip()
-        st.session_state["_options"] = {}
+    q = (q or "").strip()
+    st.session_state["_options"] = {}
 
-        if len(q) < 2:
-            return []
+    if len(q) < 2:
+        return []
 
-        results = _search_nominatim(q, iso2)
-        if not results:
-            results = _search_photon(q, iso2)
+    results = _search_nominatim(q)
+    if not results:
+        results = _search_photon(q)
 
-        keys = []
-        for key, payload in results:
-            st.session_state["_options"][key] = payload
-            keys.append(key)
-        return keys
-
-    return _search
+    keys = []
+    for key, payload in results:
+        st.session_state["_options"][key] = payload
+        keys.append(key)
+    return keys
 
 
 # -------------------- API principale: location_searchbox --------------------
-def location_searchbox(T, iso2: str, key: str = "place"):
+
+def location_searchbox(T, key: str = "place"):
     """
     Widget di ricerca località.
-    - Nominatim + Photon
+    - Nominatim + Photon, ricerca globale
     - Mantiene in sessione lat/lon/label.
     Ritorna sempre (lat, lon, label).
     """
     selected = st_searchbox(
-        search_function=_search_function_factory(iso2),
+        search_function=_search_function,
         key=key,
         placeholder=T["search_ph"],
         debounce=400,
@@ -219,7 +192,6 @@ def location_searchbox(T, iso2: str, key: str = "place"):
             st.session_state["lat"] = lat
             st.session_state["lon"] = lon
             st.session_state["place_label"] = label
-            # reset di eventuali click sulla mappa
-            st.session_state["_last_click"] = None
+            st.session_state["_last_click"] = None  # reset mappa
 
     return lat, lon, label
