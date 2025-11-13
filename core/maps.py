@@ -1,396 +1,285 @@
 # core/maps.py
-# Mappa & piste da sci (OSM / Overpass) + selezione pista e filtro per comprensorio
+# Mappa & piste (OSM / Overpass) per Telemark · Pro Wax & Tune
 
 import math
+from typing import List, Dict, Any
+
 import requests
 import streamlit as st
 
+# Folium opzionale (app gira anche senza)
+HAS_FOLIUM = False
 try:
     from streamlit_folium import st_folium
     import folium
-    from folium import TileLayer, LayerControl, Marker, GeoJson, GeoJsonTooltip
     HAS_FOLIUM = True
 except Exception:
     HAS_FOLIUM = False
 
-UA = {"User-Agent": "telemark-wax-pro/1.0 (+https://telemarkskihire.com)"}
+# ---------- Costanti ----------
+UA = {
+    "User-Agent": "telemark-wax-pro/1.0 (+https://telemarkskihire.com)",
+    "Accept": "application/json",
+}
+
+OVERPASS_URL = "https://overpass.kumi.systems/api/interpreter"   # più veloce/stabile
+MAX_RADIUS_KM = 10  # raggio ridotto per evitare comprensori vicini (es. niente Zermatt da Champoluc)
 
 
-# ---------- util geometrici ----------
-
-def _haversine_km(lat1, lon1, lat2, lon2):
-    """Distanza approssimata in km tra due punti (lat/lon in gradi)."""
+# ---------- Helper geografici ----------
+def _haversine(lat1, lon1, lat2, lon2) -> float:
+    """Distanza in km tra due coordinate."""
     R = 6371.0
-    dlat = math.radians(lat2 - lat1)
-    dlon = math.radians(lon2 - lon1)
-    a = (math.sin(dlat/2) ** 2 +
-         math.cos(math.radians(lat1)) *
-         math.cos(math.radians(lat2)) *
-         math.sin(dlon/2) ** 2)
-    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
-    return R * c
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dl   = math.radians(lon2 - lon1)
+    a = math.sin(dphi/2)**2 + math.cos(p1)*math.cos(p2)*math.sin(dl/2)**2
+    return 2 * R * math.asin(math.sqrt(a))
 
 
-def _feature_centroid(feat):
-    coords = (feat.get("geometry", {}) or {}).get("coordinates", []) or []
-    if not coords:
-        return None, None
-    xs = [c[0] for c in coords]
-    ys = [c[1] for c in coords]
-    return sum(ys) / len(ys), sum(xs) / len(xs)
+def _line_length_km(coords: List[Dict[str, float]]) -> float:
+    """Lunghezza approssimata (km) di una polyline (lat/lon)."""
+    if not coords or len(coords) < 2:
+        return 0.0
+    total = 0.0
+    for i in range(1, len(coords)):
+        p0, p1 = coords[i-1], coords[i]
+        total += _haversine(p0["lat"], p0["lon"], p1["lat"], p1["lon"])
+    return total
 
 
-# ---------- download piste ----------
-
-@st.cache_data(ttl=3 * 3600, show_spinner=False)
-def _fetch_pistes_raw(lat: float, lon: float, dist_km: int = 22):
+# ---------- Fetch piste da Overpass ----------
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_pistes(lat: float, lon: float, dist_km: int = MAX_RADIUS_KM) -> List[Dict[str, Any]]:
     """
-    Scarica piste alpine (piste:type=downhill) in un raggio dist_km.
-    Ritorna una lista di Feature (GeoJSON-like) arricchite con:
-      props["center_lat"], props["center_lon"], props["center_dist_km"], props["length_km"]
+    Restituisce una lista di piste (ways/relations OSM) nel raggio dist_km:
+    [
+      {
+        "id": 123,
+        "osm_type": "way" | "relation",
+        "name": "Pista ...",
+        "difficulty": "red",
+        "length_km": 1.8,
+        "center_lat": ...,
+        "center_lon": ...,
+        "coords": [ {"lat":..,"lon":..}, ... ]
+      },
+      ...
+    ]
     """
+    radius_m = int(dist_km * 1000)
+
     query = f"""
     [out:json][timeout:25];
     (
-      way(around:{int(dist_km*1000)},{lat},{lon})["piste:type"="downhill"];
-      relation(around:{int(dist_km*1000)},{lat},{lon})["piste:type"="downhill"];
+      way(around:{radius_m},{lat},{lon})["piste:type"="downhill"];
+      relation(around:{radius_m},{lat},{lon})["piste:type"="downhill"];
     );
-    out geom;
+    out tags geom center;
     """
-    r = requests.post(
-        "https://overpass-api.de/api/interpreter",
-        data=query,
-        headers=UA,
-        timeout=40,
-    )
-    r.raise_for_status()
-    data = r.json().get("elements", [])
 
-    feats = []
+    r = requests.post(OVERPASS_URL, data=query.encode("utf-8"), headers=UA, timeout=35)
+    r.raise_for_status()
+    data = r.json().get("elements", []) or []
+
+    pistes: List[Dict[str, Any]] = []
     for el in data:
         tags = el.get("tags", {}) or {}
-        name = tags.get("name", "")
-        geom = el.get("geometry")
+        piste_type = tags.get("piste:type") or tags.get("piste:type:1") or ""
+        if piste_type != "downhill":
+            continue
+
+        name = tags.get("name") or tags.get("piste:name") or ""
+        difficulty = tags.get("piste:difficulty", "")
+        geom = el.get("geometry") or []
         if not geom:
             continue
-        coords = [(g["lon"], g["lat"]) for g in geom]
-        if len(coords) < 2:
-            continue
 
-        # lunghezza
-        length_km = 0.0
-        for (x1, y1), (x2, y2) in zip(coords[:-1], coords[1:]):
-            length_km += _haversine_km(y1, x1, y2, x2)
+        coords = [{"lat": g["lat"], "lon": g["lon"]} for g in geom]
+        length_km = _line_length_km(coords)
 
-        cy, cx = _feature_centroid({"geometry": {"coordinates": coords}})
-        dist_center = _haversine_km(lat, lon, cy, cx) if cy is not None else 999.0
-
-        feat = {
-            "type": "Feature",
-            "geometry": {"type": "LineString", "coordinates": coords},
-            "properties": {
-                "id": el.get("id"),
-                "name": name,
-                "piste:type": tags.get("piste:type", ""),
-                "length_km": round(length_km, 1),
-                "center_lat": cy,
-                "center_lon": cx,
-                "center_dist_km": round(dist_center, 2),
-            },
-        }
-        feats.append(feat)
-
-    return feats
-
-
-def _cluster_same_resort(feats, resort_lat, resort_lon,
-                         seed_radius_km=5.0, link_radius_km=5.0):
-    """
-    Heuristica: tiene solo il 'comprensorio' collegato alla località.
-
-    1. Trova piste seed con centro entro seed_radius_km dalla località.
-    2. Costruisce un grafo di adiacenza tra piste con centri entro link_radius_km.
-    3. Prende la componente connessa che contiene le seed.
-    """
-    if not feats:
-        return []
-
-    # seed = piste vicino al punto di località
-    seed_idx = []
-    for i, f in enumerate(feats):
-        props = f.get("properties", {}) or {}
-        d = props.get("center_dist_km", 999)
-        if d <= seed_radius_km:
-            seed_idx.append(i)
-
-    if not seed_idx:
-        # fallback: tieni solo quelle entro 10 km
-        return [f for f in feats
-                if (f.get("properties", {}) or {}).get("center_dist_km", 999) <= 10.0]
-
-    n = len(feats)
-    adj = [[] for _ in range(n)]
-    centers = [
-        (f["properties"].get("center_lat"), f["properties"].get("center_lon"))
-        for f in feats
-    ]
-
-    for i in range(n):
-        lat1, lon1 = centers[i]
-        if lat1 is None:
-            continue
-        for j in range(i + 1, n):
-            lat2, lon2 = centers[j]
-            if lat2 is None:
-                continue
-            d = _haversine_km(lat1, lon1, lat2, lon2)
-            if d <= link_radius_km:
-                adj[i].append(j)
-                adj[j].append(i)
-
-    # BFS dalle seed
-    visited = set(seed_idx)
-    stack = list(seed_idx)
-    while stack:
-        i = stack.pop()
-        for j in adj[i]:
-            if j not in visited:
-                visited.add(j)
-                stack.append(j)
-
-    return [feats[i] for i in sorted(visited)]
-
-
-def _make_geojson(feats):
-    return {"type": "FeatureCollection", "features": feats}
-
-
-# ---------- lista piste per selectbox ----------
-
-def _build_piste_options(geojson, resort_hint: str | None = None):
-    feats = geojson.get("features", []) if geojson else []
-    opts = []
-    for f in feats:
-        props = f.get("properties", {}) or {}
-        pid = props.get("id")
-        name = props.get("name", "") or ""
-        length = props.get("length_km", 0.0)
-        dist_km = props.get("center_dist_km", None)
-
-        label_core = name if name else f"{pid}"
-        if dist_km is not None:
-            label = f"{label_core} · {length:.1f} km · {dist_km:.1f} km"
+        center = el.get("center") or {}
+        if center:
+            c_lat, c_lon = float(center["lat"]), float(center["lon"])
         else:
-            label = f"{label_core} · {length:.1f} km"
+            # fallback: media delle coordinate
+            c_lat = sum(p["lat"] for p in coords) / len(coords)
+            c_lon = sum(p["lon"] for p in coords) / len(coords)
 
-        opts.append((pid, label, f))
-
-    # se abbiamo un hint (nome località) mettiamo in alto le piste che lo contengono
-    if resort_hint:
-        hint = resort_hint.lower()
-        opts.sort(
-            key=lambda t: (
-                0 if hint in (t[2].get("properties", {}).get("name", "").lower()) else 1,
-                t[2].get("properties", {}).get("name", ""),
+        pistes.append(
+            dict(
+                id=el.get("id"),
+                osm_type=el.get("type", "way"),
+                name=name,
+                difficulty=difficulty,
+                length_km=round(length_km, 2),
+                center_lat=c_lat,
+                center_lon=c_lon,
+                coords=coords,
             )
         )
-    else:
-        opts.sort(key=lambda t: t[2].get("properties", {}).get("name", ""))
 
-    return opts
+    # ordina per nome, poi lunghezza
+    pistes.sort(key=lambda p: (p["name"] or "zzzz", p["length_km"]))
+    return pistes
 
 
-# ---------- UI principale ----------
+def _difficulty_label(diff: str, lang: str) -> str:
+    if not diff:
+        return ""
+    if lang == "IT":
+        it = {
+            "green": "verde",
+            "blue": "blu",
+            "red": "rossa",
+            "black": "nera",
+        }
+        return it.get(diff, diff)
+    return diff
 
-def render_map(T, ctx):
+
+def _piste_option_label(p: Dict[str, Any], lang: str) -> str:
+    name = p["name"] or (f"Pista {p['id']}")
+    diff = _difficulty_label(p["difficulty"], lang)
+    diff_part = f" · {diff}" if diff else ""
+    len_part = f" · {p['length_km']:.1f} km" if p["length_km"] > 0 else ""
+    return f"{name}{diff_part}{len_part}"
+
+
+# ---------- RENDER PRINCIPALE ----------
+def render_map(T, ctx: Dict[str, Any]):
     """
-    Pannello "4) Mappa & piste".
-    ctx: {"lat","lon","place_label","iso2","lang","T"}
+    Pannello "Mappa & piste".
+    Usa ctx = {"lat","lon","place_label","iso2","lang",...}
+    e aggiorna ctx / st.session_state quando l'utente seleziona una pista.
     """
-    lat = float(ctx["lat"])
-    lon = float(ctx["lon"])
-    place_label = ctx.get("place_label", "")
-    resort_hint = place_label.split(",")[0].strip() if place_label else None
+    lang = ctx.get("lang", "IT")
+    lat = float(ctx.get("lat", 45.831))
+    lon = float(ctx.get("lon", 7.730))
+    place_label = ctx.get("place_label", "Località")
 
     st.markdown("### 4) Mappa & piste")
 
-    if not HAS_FOLIUM:
-        st.warning(
-            "Modulo mappe (folium) non disponibile in questo ambiente. "
-            "La mappa interattiva non può essere mostrata."
-        )
-        return
+    show_pistes = st.checkbox("Mostra piste sulla mappa", value=True, key="show_pistes")
 
-    show_pistes = st.checkbox(
-        "Mostra piste sulla mappa",
-        value=True,
-        key="show_pistes",
-    )
-
-    geojson = None
-    piste_opts = []
-
+    pistes: List[Dict[str, Any]] = []
     if show_pistes:
         try:
-            raw_feats = _fetch_pistes_raw(lat, lon, dist_km=22)
-            cluster = _cluster_same_resort(raw_feats, lat, lon,
-                                           seed_radius_km=5.0,
-                                           link_radius_km=5.0)
-            geojson = _make_geojson(cluster)
-            piste_opts = _build_piste_options(geojson, resort_hint=resort_hint)
-        except Exception as e:
+            with st.spinner("Carico le piste da OpenStreetMap / Overpass…"):
+                pistes = fetch_pistes(lat, lon, dist_km=MAX_RADIUS_KM)
+        except requests.exceptions.Timeout:
+            st.error("Errore caricando le piste (OSM/Overpass): timeout del servizio.")
+        except requests.exceptions.HTTPError as e:
             st.error(f"Errore caricando le piste (OSM/Overpass): {e}")
+        except Exception as e:
+            st.error(f"Errore imprevisto caricando le piste (OSM/Overpass): {e}")
 
-    selected_feat = None
-
-    # ---------- Ricerca & selectbox ----------
-    if piste_opts:
-        name_query = st.text_input("Cerca pista per nome", key="piste_name_query")
-
-        if name_query:
-            q = name_query.lower().strip()
-            filtered = [
-                (pid, lbl, f)
-                for (pid, lbl, f) in piste_opts
-                if q in (f.get("properties", {}).get("name", "").lower())
-            ]
-            piste_opts_view = filtered or piste_opts
-        else:
-            piste_opts_view = piste_opts
-
-        labels = [lbl for (_, lbl, _) in piste_opts_view]
-        ids = [pid for (pid, _, _) in piste_opts_view]
-
-        prev_id = st.session_state.get("selected_piste_id")
-        try:
-            default_index = ids.index(prev_id) if prev_id in ids else 0
-        except Exception:
-            default_index = 0
-
-        chosen_label = st.selectbox(
-            "Seleziona pista",
-            labels,
-            index=default_index if labels else 0,
-            key="piste_selectbox",
-        )
-
-        if labels:
-            chosen_idx = labels.index(chosen_label)
-            chosen_id, _, chosen_feat = piste_opts_view[chosen_idx]
-            selected_feat = chosen_feat
-
-            if chosen_id != prev_id:
-                _set_selected_piste(chosen_feat, chosen_id, place_label)
-                return  # _set_selected_piste fa st.rerun()
-    else:
+    if show_pistes and not pistes:
         st.info("Nessuna pista trovata in questo comprensorio (OSM/Overpass).")
 
-    # ---------- Mappa interattiva ----------
-    lat = float(st.session_state.get("lat", lat))
-    lon = float(st.session_state.get("lon", lon))
-    place_label = st.session_state.get("place_label", place_label)
+    # ---------- Ricerca / selezione pista ----------
+    selected_piste = None
+    if pistes:
+        search_txt = st.text_input(
+            "Cerca pista per nome",
+            value="",
+            key="piste_search",
+            placeholder="es. Del Bosco, Bettaforca, Sarezza…",
+        ).strip()
+
+        # filtra la lista per nome
+        filtered = []
+        for p in pistes:
+            name_norm = (p["name"] or "").lower()
+            if not search_txt or search_txt.lower() in name_norm:
+                filtered.append(p)
+
+        if not filtered:
+            st.warning("Nessuna pista corrisponde alla ricerca. Mostro l'elenco completo.")
+            filtered = pistes
+
+        options = [_piste_option_label(p, lang) for p in filtered]
+        label_to_piste = { _piste_option_label(p, lang): p for p in filtered }
+
+        default_label = options[0] if options else None
+        chosen_label = st.selectbox(
+            "Seleziona pista",
+            options=options,
+            index=0 if options else None,
+            key="piste_select",
+        ) if options else None
+
+        if chosen_label:
+            selected_piste = label_to_piste.get(chosen_label)
+
+            # aggiorna ctx e sessione sulla pista scelta → DEM/meteo useranno questa posizione
+            ctx_lat = float(selected_piste["center_lat"])
+            ctx_lon = float(selected_piste["center_lon"])
+            ctx_label = f"{place_label.split('—')[0].strip()} · {selected_piste['name'] or 'pista'}"
+
+            ctx["lat"] = ctx_lat
+            ctx["lon"] = ctx_lon
+            ctx["place_label"] = ctx_label
+
+            st.session_state["lat"] = ctx_lat
+            st.session_state["lon"] = ctx_lon
+            st.session_state["place_label"] = ctx_label
+
+    # ---------- Mappa ----------
+    if not HAS_FOLIUM:
+        st.info("Modulo mappa avanzata richiede 'folium' e 'streamlit-folium' installati.")
+        return
+
+    # centro mappa: se c'è una pista selezionata, usa il suo centro
+    map_lat = float(ctx.get("lat", lat))
+    map_lon = float(ctx.get("lon", lon))
 
     m = folium.Map(
-        location=[lat, lon],
+        location=[map_lat, map_lon],
         zoom_start=13,
         tiles=None,
         control_scale=True,
         prefer_canvas=True,
-        zoom_control=True,
     )
 
-    TileLayer(
-        "https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",
-        name="Strade",
+    folium.TileLayer(
+        tiles="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",
+        name="OSM",
         attr="© OpenStreetMap contributors",
         overlay=False,
         control=True,
     ).add_to(m)
 
-    if show_pistes and geojson and geojson.get("features"):
-        def _style(f):
-            pid = f.get("properties", {}).get("id")
-            if selected_feat and pid == selected_feat.get("properties", {}).get("id"):
-                return {"color": "#ff9900", "weight": 5, "opacity": 0.96}
-        # default style
-            return {"color": "#3388ff", "weight": 3, "opacity": 0.9}
-
-        GeoJson(
-            data=geojson,
-            name="Piste alpine (OSM)",
-            tooltip=GeoJsonTooltip(
-                fields=["name", "piste:type", "length_km"],
-                aliases=["Nome", "Tipo", "Lunghezza (km)"],
-                localize=True,
-            ),
-            style_function=_style,
-        ).add_to(m)
-
-    Marker(
-        [lat, lon],
-        tooltip=place_label,
-        icon=folium.Icon(color="lightgray"),
+    # marker della località / centro
+    folium.Marker(
+        [map_lat, map_lon],
+        tooltip=ctx.get("place_label", place_label),
+        icon=folium.Icon(color="lightgray", icon="info-sign"),
     ).add_to(m)
 
-    LayerControl(position="bottomleft", collapsed=True).add_to(m)
+    # disegna piste se presenti
+    if pistes:
+        selected_id = selected_piste["id"] if selected_piste else None
 
-    out = st_folium(
-        m,
-        height=420,
-        use_container_width=True,
-        key=f"map_{round(lat, 5)}_{round(lon, 5)}",
-        returned_objects=["last_clicked"],
-    )
-    click = (out or {}).get("last_clicked") or {}
+        for p in pistes:
+            coords = [(c["lat"], c["lon"]) for c in p["coords"]]
+            if not coords:
+                continue
 
-    # ---------- Selezione pista via click ----------
-    if click and show_pistes and piste_opts:
-        click_lat = float(click.get("lat"))
-        click_lon = float(click.get("lng"))
-        nearest_id, nearest_feat = _nearest_piste_to_point(
-            click_lat, click_lon, piste_opts
-        )
-        if nearest_feat is not None:
-            prev_id = st.session_state.get("selected_piste_id")
-            if nearest_id != prev_id:
-                _set_selected_piste(nearest_feat, nearest_id, place_label)
-                return  # _set_selected_piste fa st.rerun()
+            color = "#ff4b4b" if p["id"] == selected_id else "#3388ff"
+            weight = 5 if p["id"] == selected_id else 3
+            name = p["name"] or f"Pista {p['id']}"
+            diff = _difficulty_label(p["difficulty"], lang)
+            diff_txt = f" ({diff})" if diff else ""
+            popup_txt = f"{name}{diff_txt} · {p['length_km']:.1f} km"
 
+            folium.PolyLine(
+                locations=coords,
+                color=color,
+                weight=weight,
+                opacity=0.95,
+                tooltip=popup_txt,
+            ).add_to(m)
 
-def _nearest_piste_to_point(lat, lon, piste_opts):
-    best_id = None
-    best_feat = None
-    best_d = 9999.0
-    for pid, _lbl, feat in piste_opts:
-        props = feat.get("properties", {}) or {}
-        cy = props.get("center_lat")
-        cx = props.get("center_lon")
-        if cy is None or cx is None:
-            continue
-        d = _haversine_km(lat, lon, cy, cx)
-        if d < best_d:
-            best_d = d
-            best_id = pid
-            best_feat = feat
-    return best_id, best_feat
-
-
-def _set_selected_piste(feat, piste_id, old_place_label):
-    """
-    Aggiorna lat/lon/label/session_state quando cambia la pista selezionata,
-    poi fa st.rerun().
-    """
-    cy = feat["properties"].get("center_lat")
-    cx = feat["properties"].get("center_lon")
-    pname = feat["properties"].get("name") or f"Pista {piste_id}"
-
-    # estrai solo la parte 'località' dall'etichetta precedente, se possibile
-    base_loc = old_place_label.split("—")[-1].strip() if "—" in old_place_label else old_place_label
-
-    st.session_state["lat"] = float(cy)
-    st.session_state["lon"] = float(cx)
-    st.session_state["place_label"] = f"{pname} — {base_loc}"
-    st.session_state["selected_piste_id"] = piste_id
-    # forza ricalcolo DEM collegato ad altitudine/esposizione
-    st.session_state.pop("_alt_sync_key", None)
-    st.rerun()
+    # mostra mappa
+    st_folium(m, height=420, use_container_width=True, key=f"map_{round(map_lat,5)}_{round(map_lon,5)}")
