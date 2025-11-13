@@ -1,13 +1,12 @@
 # core/search.py
-# Ricerca località "snella" con prefiltri paese e gestione errori silenziosa
+# Ricerca località con Nominatim + Photon, robusta e con country prefilter
 
 import time
 import requests
 import streamlit as st
 from streamlit_searchbox import st_searchbox
 
-# ---- Costanti & helpers -----------------------------------------------------
-
+# ---- Costanti & helpers ----
 COUNTRIES = {
     "Italia":   "IT",
     "Svizzera": "CH",
@@ -20,7 +19,6 @@ COUNTRIES = {
 }
 
 def _flag(cc: str) -> str:
-    """Trasforma il country code ISO2 nella bandierina Unicode."""
     try:
         c = cc.upper()
         return chr(127397 + ord(c[0])) + chr(127397 + ord(c[1]))
@@ -41,7 +39,7 @@ if NOMINATIM_EMAIL:
 
 
 def _retry(func, attempts: int = 2, sleep: float = 0.8):
-    """Piccolo helper per retry esponenziale."""
+    """Piccolo retry helper: se esauriti i tentativi, rilancia l'ultimo errore."""
     for i in range(attempts):
         try:
             return func()
@@ -51,8 +49,16 @@ def _retry(func, attempts: int = 2, sleep: float = 0.8):
             time.sleep(sleep * (1.5 ** i))
 
 
+# --------------------------------------------------------------------
+# UI widgets
+# --------------------------------------------------------------------
+def country_selectbox(T):
+    """Selectbox paese → ritorna codice ISO2 (IT, FR, …)."""
+    label = st.selectbox(T["country"], list(COUNTRIES.keys()), index=0, key="country_sel")
+    return COUNTRIES[label]
+
+
 def _concise_label(addr: dict, fallback: str) -> str:
-    """Crea una label compatta tipo 'Champoluc, Valle d'Aosta'."""
     name = (
         addr.get("neighbourhood")
         or addr.get("hamlet")
@@ -66,13 +72,14 @@ def _concise_label(addr: dict, fallback: str) -> str:
     return ", ".join(parts)
 
 
-# ---- Nominatim + Photon -----------------------------------------------------
-
+# --------------------------------------------------------------------
+# sorgenti ricerca
+# --------------------------------------------------------------------
 def _search_nominatim(q: str, iso2: str):
-    """Ricerca primaria con Nominatim, con gestione errori -> []"""
+    """Ricerca principale (Nominatim). Non alza mai eccezioni → [] in caso di problemi."""
     q = (q or "").strip()
-    if len(q) < 3:
-        return []  # minimo 3 caratteri per evitare flood
+    if len(q) < 2:
+        return []
 
     try:
         def go():
@@ -81,7 +88,7 @@ def _search_nominatim(q: str, iso2: str):
                 params={
                     "q": q,
                     "format": "json",
-                    "limit": 5,            # pochi risultati -> più veloce
+                    "limit": 10,
                     "addressdetails": 1,
                     "countrycodes": iso2.lower(),
                 },
@@ -93,7 +100,7 @@ def _search_nominatim(q: str, iso2: str):
         r.raise_for_status()
         js = r.json() or []
     except Exception:
-        # fallisce? nessun risultato, ci penserà Photon come fallback
+        # rate limit / errore → nessuna opzione ma niente blocchi rossi
         return []
 
     out = []
@@ -113,70 +120,58 @@ def _search_nominatim(q: str, iso2: str):
 
 
 def _search_photon(q: str, iso2: str):
-    """Fallback leggero (Photon) se Nominatim non risponde."""
+    """Fallback Photon (Komoot). Anche qui: mai errori mostrati a schermo."""
     q = (q or "").strip()
-    if len(q) < 3:
+    if len(q) < 2:
         return []
 
     try:
         r = requests.get(
             "https://photon.komoot.io/api",
-            params={"q": q, "limit": 5, "lang": "it"},
+            params={"q": q, "limit": 10, "lang": "it"},
             headers={"User-Agent": BASE_UA},
             timeout=8,
         )
         r.raise_for_status()
-        js = r.json() or {}
+        feats = (r.json() or {}).get("features", []) or []
     except Exception:
         return []
 
-    feats = js.get("features", []) or []
     out = []
     for f in feats:
         props = f.get("properties", {}) or {}
         cc = (props.get("countrycode") or props.get("country", "")).upper()
         if cc and cc != iso2.upper():
             continue
+
         name = props.get("name") or props.get("city") or props.get("state") or ""
         admin1 = props.get("state") or props.get("county") or ""
         label_core = ", ".join([p for p in (name, admin1) if p])
+
         geom = f.get("geometry", {}) or {}
-        coords = geom.get("coordinates", [None, None])
-        if coords is None or len(coords) < 2:
-            continue
-        lon, lat = coords
+        lon, lat = (geom.get("coordinates") or [None, None])[:2]
         if lat is None or lon is None:
             continue
+
         lab = f"{_flag(cc)}  {label_core}" if cc else label_core
         key = f"{lab}|||{lat:.6f},{lon:.6f}"
-        out.append(
-            (
-                key,
-                {"lat": float(lat), "lon": float(lon), "label": lab, "addr": {}},
-            )
-        )
+        out.append((key, {"lat": float(lat), "lon": float(lon), "label": lab, "addr": {}}))
     return out
 
 
-# ---- UI widgets -------------------------------------------------------------
-
-def country_selectbox(T):
-    """Selectbox paese -> ritorna ISO2."""
-    label = T["country"]
-    country_name = st.selectbox(label, list(COUNTRIES.keys()), index=0, key="country_sel")
-    return COUNTRIES[country_name]
-
-
 def _search_function_factory(iso2: str):
-    """Factory usata da st_searchbox, incapsula Nominatim+Photon."""
+    """Factory per la funzione da passare a st_searchbox (chiude iso2)."""
 
     def _search(q: str):
-        # ogni volta ricreiamo la mappa opzioni per la chiave scelta
+        # reset mappa risultati
         st.session_state._options = {}
-
-        res = _search_nominatim(q, iso2)
-        if not res:
-            res = _search_photon(q, iso2)
+        try:
+            res = _search_nominatim(q, iso2)
+            if not res:
+                res = _search_photon(q, iso2)
+        except Exception:
+            # estrema difesa: nessun errore in UI
+            res = []
 
         keys = []
         for key, payload in res:
@@ -187,13 +182,13 @@ def _search_function_factory(iso2: str):
     return _search
 
 
+# --------------------------------------------------------------------
+# Searchbox pubblico
+# --------------------------------------------------------------------
 def location_searchbox(T, iso2: str, key: str = "place"):
     """
-    Searchbox località.
-
-    Ritorna sempre una tripla (lat, lon, label) usando:
-    - ultima selezione valida in sessione se non c'è scelta nuova
-    - nuova selezione da searchbox se l'utente clicca un suggerimento
+    Widget di ricerca località.
+    Ritorna sempre una terna (lat, lon, label), usando session_state come fallback.
     """
 
     selected = st_searchbox(
@@ -205,27 +200,24 @@ def location_searchbox(T, iso2: str, key: str = "place"):
         default=None,
     )
 
-    # default/persistito (Champoluc)
+    # Defaults/persistiti
     lat = float(st.session_state.get("lat", 45.831))
     lon = float(st.session_state.get("lon", 7.730))
-    label = st.session_state.get(
-        "place_label", "🇮🇹  Champoluc, Valle d’Aosta — IT"
-    )
+    label = st.session_state.get("place_label", "🇮🇹  Champoluc, Valle d’Aosta — IT")
 
-    # se l'utente sceglie un'opzione dal menu
+    # Se l'utente sceglie un suggerimento, aggiorniamo
     if selected and "|||" in selected and "_options" in st.session_state:
-        info = (st.session_state._options or {}).get(selected, {})
+        info = st.session_state._options.get(selected)
         if info:
             try:
-                lat = float(info.get("lat", lat))
-                lon = float(info.get("lon", lon))
-                label = str(info.get("label", label))
+                lat = float(info["lat"])
+                lon = float(info["lon"])
+                label = str(info["label"])
             except Exception:
                 pass
             st.session_state["lat"] = lat
             st.session_state["lon"] = lon
             st.session_state["place_label"] = label
-            # azzera eventuale click precedente sulla mappa
-            st.session_state["_last_click"] = None
+            st.session_state["_last_click"] = None  # reset mappa
 
     return lat, lon, label
