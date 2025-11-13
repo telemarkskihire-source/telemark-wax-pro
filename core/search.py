@@ -1,15 +1,15 @@
 # core/search.py
 # Ricerca località snella:
 # - Nominatim + fallback Photon
-# - filtro paese "soft"
-# - controllo impianti/piste via Overpass alla selezione
+# - usa country_selectbox per ISO2
+# - location_searchbox mantiene lat/lon/label in session_state
 
 import time
 import requests
 import streamlit as st
 from streamlit_searchbox import st_searchbox
 
-# -------------------- Costanti & helpers base --------------------
+# -------------------- Costanti & helpers --------------------
 COUNTRIES = {
     "Italia":   "IT",
     "Svizzera": "CH",
@@ -78,9 +78,6 @@ def _concise_label(addr: dict, fallback: str) -> str:
 
 
 def _search_nominatim(q: str, iso2: str):
-    """
-    Nominatim con filtro paese; in caso di errore torna [] senza esplodere.
-    """
     q = (q or "").strip()
     if len(q) < 2:
         return []
@@ -111,19 +108,14 @@ def _search_nominatim(q: str, iso2: str):
         lab_core = _concise_label(addr, it.get("display_name", ""))
         cc = (addr.get("country_code") or "").upper()
         lab = f"{_flag(cc)}  {lab_core}" if cc else lab_core
-        lat = float(it.get("lat", 0))
-        lon = float(it.get("lon", 0))
+        lat = float(it.get("lat", 0.0))
+        lon = float(it.get("lon", 0.0))
         key = f"{lab}|||{lat:.6f},{lon:.6f}"
         out.append((key, {"lat": lat, "lon": lon, "label": lab, "addr": addr}))
     return out
 
 
 def _search_photon(q: str, iso2: str):
-    """
-    Photon (Komoot), filtro paese *soft*:
-    - se cc presente e diverso da iso2 → scartato
-    - se cc mancante → tenuto (per non perdere risultati utili)
-    """
     q = (q or "").strip()
     if len(q) < 2:
         return []
@@ -148,7 +140,7 @@ def _search_photon(q: str, iso2: str):
         props = f.get("properties", {}) or {}
         cc = (props.get("countrycode") or props.get("country", "")).upper()
 
-        # filtro paese: se c'è e non è quello selezionato, skip
+        # filtro paese: se c'è e non è quello selezionato, saltiamo
         if cc and iso2 and cc != iso2.upper():
             continue
 
@@ -171,82 +163,36 @@ def _search_photon(q: str, iso2: str):
 
 def _search_function_factory(iso2: str):
     """
-    Funzione per st_searchbox: combina Nominatim + Photon e popola _options.
+    Funzione che viene passata a st_searchbox.
+    Usa Nominatim e, se non trova nulla, Photon.
+    Popola st.session_state["_options"] con i payload.
     """
     def _search(q: str):
         q = (q or "").strip()
-        st.session_state._options = {}
+        st.session_state["_options"] = {}
 
         if len(q) < 2:
             return []
 
-        # 1) Nominatim
-        res_nom = _search_nominatim(q, iso2)
-
-        # 2) Photon (fallback / complemento)
-        res_ph = _search_photon(q, iso2)
-
-        # merge + dedupe mantenendo l’ordine (prima Nominatim poi Photon)
-        merged = []
-        seen = set()
-        for src in (res_nom, res_ph):
-            for key, payload in src:
-                if key in seen:
-                    continue
-                seen.add(key)
-                merged.append((key, payload))
+        results = _search_nominatim(q, iso2)
+        if not results:
+            results = _search_photon(q, iso2)
 
         keys = []
-        for key, payload in merged:
-            st.session_state._options[key] = payload
+        for key, payload in results:
+            st.session_state["_options"][key] = payload
             keys.append(key)
-
         return keys
 
     return _search
 
 
-# -------------------- Controllo “ha impianti/piste?” --------------------
-@st.cache_data(ttl=6 * 3600, show_spinner=False)
-def has_ski_infrastructure(lat: float, lon: float, radius_km: int = 25) -> bool:
-    """
-    True se entro radius_km ci sono impianti o piste alpine.
-    """
-    radius_m = int(radius_km * 1000)
-    query = f"""
-    [out:json][timeout:25];
-    (
-      way(around:{radius_m},{lat},{lon})["piste:type"="downhill"];
-      relation(around:{radius_m},{lat},{lon})["piste:type"="downhill"];
-      way(around:{radius_m},{lat},{lon})["aerialway"];
-      relation(around:{radius_m},{lat},{lon})["aerialway"];
-      node(around:{radius_m},{lat},{lon})["aerialway"];
-    );
-    out center;
-    """
-
-    try:
-        r = requests.post(
-            "https://overpass-api.de/api/interpreter",
-            data=query,
-            headers={"User-Agent": BASE_UA},
-            timeout=30,
-        )
-        r.raise_for_status()
-        elements = (r.json() or {}).get("elements", []) or []
-        return len(elements) > 0
-    except Exception:
-        # se Overpass va giù, non blocchiamo: meglio True che rompere la UX
-        return True
-
-
-# -------------------- API principale per l’app --------------------
+# -------------------- API principale: location_searchbox --------------------
 def location_searchbox(T, iso2: str, key: str = "place"):
     """
     Widget di ricerca località.
-    - Nominatim + Photon.
+    - Nominatim + Photon
     - Mantiene in sessione lat/lon/label.
-    - Applica filtro “solo località con impianti/piste” quando selezioni.
     Ritorna sempre (lat, lon, label).
     """
     selected = st_searchbox(
@@ -265,27 +211,15 @@ def location_searchbox(T, iso2: str, key: str = "place"):
 
     # se l’utente ha scelto un suggerimento, aggiorniamo
     if selected and "|||" in selected and "_options" in st.session_state:
-        info = (st.session_state._options or {}).get(selected)
+        info = (st.session_state["_options"] or {}).get(selected)
         if info:
-            new_lat = float(info.get("lat", lat))
-            new_lon = float(info.get("lon", lon))
-            new_label = str(info.get("label", label))
-
-            # filtro “solo località con impianti/piste”
-            with st.spinner("Controllo presenza impianti/piste…"):
-                ok_ski = has_ski_infrastructure(new_lat, new_lon, radius_km=25)
-
-            if not ok_ski:
-                st.warning(
-                    "Questa località non risulta avere impianti/piste nelle vicinanze. "
-                    "Scegli un’altra località sciistica."
-                )
-            else:
-                lat, lon, label = new_lat, new_lon, new_label
-                st.session_state["lat"] = lat
-                st.session_state["lon"] = lon
-                st.session_state["place_label"] = label
-                st.session_state["_last_click"] = None
-                st.session_state["pista_id"] = None
+            lat = float(info.get("lat", lat))
+            lon = float(info.get("lon", lon))
+            label = str(info.get("label", label))
+            st.session_state["lat"] = lat
+            st.session_state["lon"] = lon
+            st.session_state["place_label"] = label
+            # reset di eventuali click sulla mappa
+            st.session_state["_last_click"] = None
 
     return lat, lon, label
