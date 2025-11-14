@@ -1,104 +1,339 @@
 # streamlit_app.py
-# Telemark · Pro Wax & Tune + Modalità Gara (Neveitalia)
+# Telemark · Pro Wax & Tune — modalità standard + modalità gara (FIS via Neveitalia)
 
-import sys
-import os
+from __future__ import annotations
+
 import importlib
+import os
+import sys
+
+import requests
 import streamlit as st
 
-# reload core
+# -----------------------------------------------------------
+# HARD RELOAD core.* → niente cache sporca sui moduli
+# -----------------------------------------------------------
 importlib.invalidate_caches()
-for m in list(sys.modules.keys()):
-    if m.startswith("core."):
-        del sys.modules[m]
+for _name in list(sys.modules.keys()):
+    if _name == "core" or _name.startswith("core."):
+        del sys.modules[_name]
 
+# -----------------------------------------------------------
+# IMPORT DAL CORE
+# -----------------------------------------------------------
 from core.i18n import L
 from core.search import location_searchbox
-from core.get_calendar import get_fis_worldcup_races
-from core.race_integration import get_wc_tuning
 
+from core.race_events import (
+    Federation,
+    FISCalendarProvider,
+    FISICalendarProvider,
+    RaceCalendarService,
+)
+from core.race_integration import get_wc_tuning_for_event
+from core.race_tuning import SkierLevel
 
-# ---------------- UI ----------------
+# -----------------------------------------------------------
+# THEME
+# -----------------------------------------------------------
+st.set_page_config(
+    page_title="Telemark · Pro Wax & Tune",
+    page_icon="❄️",
+    layout="wide",
+)
 
-st.set_page_config(page_title="Telemark PRO — Wax & Race", layout="wide")
+st.markdown(
+    """
+<style>
+:root {
+  --bg:#0b0f13;
+  --panel:#121821;
+  --muted:#9aa4af;
+  --fg:#e5e7eb;
+  --line:#1f2937;
+}
+html, body, .stApp { background:var(--bg); color:var(--fg); }
+[data-testid="stHeader"] { background:transparent; }
+section.main > div { padding-top:.6rem; }
+
+h1,h2,h3,h4 {
+  color:#fff;
+  letter-spacing:.2px;
+}
+
+hr {
+  border:none;
+  border-top:1px solid var(--line);
+  margin:.75rem 0;
+}
+
+.badge {
+  display:inline-flex;
+  align-items:center;
+  gap:.5rem;
+  background:#0b1220;
+  border:1px solid #203045;
+  color:#cce7f2;
+  border-radius:12px;
+  padding:.35rem .6rem;
+  font-size:.85rem;
+}
+
+.small {
+  color:#9aa4af;
+  font-size:.9rem;
+}
+</style>
+""",
+    unsafe_allow_html=True,
+)
 
 st.title("Telemark · Pro Wax & Tune")
 
+# -----------------------------------------------------------
+# LINGUA / SIDEBAR
+# -----------------------------------------------------------
+st.sidebar.markdown("### ⚙️")
 
-lang = st.sidebar.selectbox("Lingua", ["IT", "EN"], index=0)
-T = L["it"] if lang == "IT" else L["en"]
+it_lang_label = L.get("it", {}).get("lang", "Italiano")
+en_lang_label = L.get("en", {}).get("lang", "English")
 
-tab_wax, tab_race = st.tabs(["🧊 Wax & Tune", "🏁 Race"])
+lang = st.sidebar.selectbox(
+    f"{it_lang_label} / {en_lang_label}",
+    ["IT", "EN"],
+    index=0,
+)
 
+T = L.get("it" if lang == "IT" else "en", {})
 
-# ---------------- TAB 1 ----------------
+show_info = st.sidebar.toggle("Mostra info tecniche", value=False)
 
+# -----------------------------------------------------------
+# TABS PRINCIPALI
+# -----------------------------------------------------------
+tab_wax, tab_race = st.tabs(["🧊 Wax & Tune", "🏁 Race / Gare"])
+
+# ============================================================
+# TAB 1 — WAX & TUNE
+# ============================================================
 with tab_wax:
-    st.header("Wax & Tune · Località")
+    st.markdown(f"### 1) {T.get('search_ph', 'Cerca località')}")
 
-    lat, lon, place = location_searchbox(T)
-    st.write(f"📍 **{place}**  — lat `{lat}` lon `{lon}`")
+    lat, lon, place_label = location_searchbox(T)
 
-    st.info("Qui rimane il tuo modulo meteo + wax + dem + map + pov già implementato.")
+    st.markdown(
+        f"<div class='badge'>📍 <b>{place_label}</b> · "
+        f"lat <b>{float(lat):.5f}</b>, lon <b>{float(lon):.5f}</b></div>",
+        unsafe_allow_html=True,
+    )
 
+    ctx = {
+        "lat": float(lat),
+        "lon": float(lon),
+        "place_label": place_label,
+        "iso2": "",
+        "lang": lang,
+        "T": T,
+    }
+    st.session_state["_ctx"] = ctx
 
-# ---------------- TAB 2 (GARE) ----------------
+    st.markdown("### 2) Moduli")
 
-with tab_race:
-    st.header("Calendario Gare — FIS World Cup (Neveitalia)")
+    # --- helper per caricare/chiammare i vari pannelli core.* ---
+    def _load(modname: str):
+        try:
+            importlib.invalidate_caches()
+            return importlib.import_module(modname)
+        except Exception as e:
+            st.error(f"Import fallito {modname}: {e}")
+            return None
 
-    col1, col2, col3 = st.columns(3)
+    def _call_first(mod, candidates, *args, **kwargs):
+        if not mod:
+            return False, "missing"
+        for name in candidates:
+            fn = getattr(mod, name, None)
+            if callable(fn):
+                try:
+                    fn(*args, **kwargs)
+                    return True, name
+                except Exception as e:
+                    st.error(f"{mod.__name__}.{name} → errore: {e}")
+                    return False, f"error:{name}"
+        return False, "no-render-fn"
 
-    with col1:
-        season = st.number_input("Stagione (anno di inizio)", 2024, 2035, 2025)
+    MODULES = [
+        ("core.site_meta", ["render_site_meta", "render"]),
+        (
+            "core.meteo",
+            ["render_meteo", "panel_meteo", "run_meteo", "show_meteo", "main", "app", "render"],
+        ),
+        ("core.wax_logic", ["render_wax", "wax_panel", "show_wax", "main", "app", "render"]),
+        ("core.maps", ["render_map", "map_panel", "show_map", "main", "app", "render"]),
+        ("core.dem_tools", ["render_dem", "dem_panel", "show_dem", "main", "app", "render"]),
+        ("core.pov_video", ["render_pov_video", "render", "main", "app"]),
+    ]
 
-    with col2:
-        gender = st.selectbox("Categoria", ["Maschile (M)", "Femminile (F)", "Entrambi"])
+    for modname, candidates in MODULES:
+        mod = _load(modname)
+        _ok, _used = _call_first(mod, candidates, T, ctx)
 
-    with col3:
-        disc = st.selectbox("Disciplina", ["Tutte", "SL", "GS", "SG", "DH"])
-
-    if gender.startswith("Mas"):
-        g = "M"
-    elif gender.startswith("Fem"):
-        g = "F"
-    else:
-        g = None
-
-    disc_filter = None if disc == "Tutte" else disc
-
-    if st.button("🔍 Carica gare"):
-        st.info("Scarico calendario da Neveitalia...")
-        events = get_fis_worldcup_races(
-            season=season,
-            gender=g,
-            discipline=disc_filter
+    if show_info:
+        here = os.path.abspath(__file__)
+        st.markdown(
+            f"<div class='small'>Entrypoint: <code>{here}</code></div>",
+            unsafe_allow_html=True,
         )
 
-        if not events:
-            st.warning("Nessuna gara trovata.")
-        else:
-            st.success(f"{len(events)} gare trovate")
+# ============================================================
+# TAB 2 — RACE / GARE (FIS via Neveitalia → tuning WC)
+# ============================================================
+with tab_race:
+    st.markdown("### Modalità Gara · FIS (Neveitalia) → Tuning World Cup")
 
-            sel = st.selectbox(
-                "Seleziona gara",
-                events,
-                format_func=lambda e: f"{e['date']} — {e['location']} — {e['event']}",
+    @st.cache_resource
+    def get_calendar_service() -> RaceCalendarService:
+        def http_client_neve(url: str, params: dict | None) -> str:
+            if params is None:
+                params = {}
+            r = requests.get(url, params=params, timeout=10)
+            r.raise_for_status()
+            return r.text
+
+        fisi_committee_slugs: dict[str, str] = {}
+
+        return RaceCalendarService(
+            fis_provider=FISCalendarProvider(http_client=http_client_neve),
+            fisi_provider=FISICalendarProvider(
+                http_client=http_client_neve,
+                committee_slugs=fisi_committee_slugs,
+            ),
+        )
+
+    calendar_service = get_calendar_service()
+
+    col1, col2 = st.columns(2)
+    with col1:
+        season = st.number_input(
+            "Stagione (anno di inizio)",
+            min_value=2024,
+            max_value=2035,
+            value=2025,
+            step=1,
+        )
+
+    with col2:
+        fed_label = st.radio(
+            "Federazione",
+            ["FIS (World Cup via Neveitalia)", "FISI (non attivo)", "Entrambe"],
+            index=0,
+            horizontal=True,
+        )
+
+    if fed_label.startswith("FIS"):
+        federation = Federation.FIS
+    elif fed_label.startswith("FISI"):
+        federation = Federation.FISI
+    else:
+        federation = None
+
+    col3, col4 = st.columns(2)
+    with col3:
+        disc_label = st.selectbox(
+            "Disciplina",
+            ["Tutte", "SL", "GS", "SG", "DH"],
+            index=1,
+        )
+        if disc_label == "Tutte":
+            discipline = None
+        else:
+            discipline = disc_label
+
+    with col4:
+        region = st.text_input(
+            "Regione FISI (ignorata per FIS/Neveitalia)",
+            value="",
+        )
+
+    st.markdown("---")
+
+    if st.button("🔍 Carica gare"):
+        with st.spinner("Carico calendari gare da Neveitalia..."):
+            try:
+                events = calendar_service.list_events(
+                    season=season,
+                    federation=federation,
+                    discipline=discipline,
+                    nation=None,
+                    region=region or None,
+                )
+            except Exception as e:
+                st.error(f"Errore nel caricamento delle gare: {e}")
+                events = []
+
+        if not events:
+            st.info(
+                "Nessuna gara trovata con questi filtri.\n\n"
+                "Per ora FIS è basato sul calendario di Neveitalia "
+                "(Coppa del Mondo maschile + femminile). "
+                "FISI è ancora disattivato in attesa di una sorgente stabile."
+            )
+        else:
+            st.success(f"Trovate {len(events)} gare.")
+
+            selected_event = st.selectbox(
+                "Seleziona una gara",
+                options=events,
+                format_func=lambda ev: f"{ev.start_date.isoformat()} · {ev.place} · {ev.name}",
             )
 
-            if st.button("🎯 Calcola Tuning WC"):
-                res = get_wc_tuning(sel)
-
-                if "error" in res:
-                    st.error(res["error"])
+            if selected_event and st.button("🎯 Calcola tuning WC per questa gara"):
+                res = get_wc_tuning_for_event(
+                    selected_event,
+                    skier_level=SkierLevel.WC,
+                )
+                if res is None:
+                    st.warning("Questa gara non ha una disciplina riconosciuta (SL/GS/SG/DH).")
                 else:
-                    st.subheader("Tuning World Cup")
-                    st.metric("Base Bevel", f"{res['base_bevel']:.2f}°")
-                    st.metric("Side Bevel", f"{res['side_bevel']:.2f}°")
-                    st.write(f"**Struttura:** {res['structure']}")
-                    st.write(f"**Sciolina:** {res['wax']} — Rischio: **{res['risk']}**")
-                    st.write("### Dettagli neve")
-                    st.json(res["snow"])
+                    params, data = res
+                    st.subheader("Tuning World Cup suggerito")
 
-                    st.write("### Evento completo")
-                    st.json(res["event"])
+                    c1, c2, c3 = st.columns(3)
+                    c1.metric("Base bevel", f"{data['base_bevel_deg']:.2f}°")
+                    c2.metric("Side bevel", f"{data['side_bevel_deg']:.2f}°")
+                    c3.metric("Rischio", data["risk_level"])
+
+                    st.markdown("#### Struttura & Sciolina")
+                    st.write(f"**Struttura soletta:** {data['structure_pattern']}")
+                    st.write(f"**Wax consigliato:** {data['wax_group']}")
+
+                    st.markdown("#### Dettagli neve (stimati)")
+                    st.write(
+                        f"Neve: **{data['snow_type']}**, "
+                        f"T neve ≈ **{data['snow_temp_c']}°C**, "
+                        f"T aria ≈ **{data['air_temp_c']}°C**, "
+                        f"Injected: **{data['injected']}**"
+                    )
+
+                    st.markdown("#### Note tecniche")
+                    st.write(data["notes"])
+
+                    if show_info:
+                        st.markdown("#### Debug evento")
+                        st.json(
+                            {
+                                "event": {
+                                    "federation": selected_event.federation.value,
+                                    "name": selected_event.name,
+                                    "discipline": selected_event.discipline,
+                                    "place": selected_event.place,
+                                    "nation": selected_event.nation,
+                                    "date": selected_event.start_date.isoformat(),
+                                    "source_url": selected_event.source_url,
+                                },
+                                "params": params,
+                                "data": data,
+                            }
+                        )
+    else:
+        st.info("Imposta i filtri e premi **“Carica gare”** per vedere il calendario.")
