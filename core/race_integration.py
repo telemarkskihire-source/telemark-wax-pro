@@ -1,10 +1,16 @@
 # core/race_integration.py
+#
+# Bridge tra:
+# - calendari gare (RaceCalendarService / RaceEvent)
+# - motore di tuning (get_tuning_recommendation)
+#
+# Per ogni gara → stima condizioni neve → parametri WC → output serializzabile.
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date
-from typing import Optional
+from typing import Optional, Tuple
 
 from core.race_events import RaceEvent, RaceCalendarService, Federation
 from core.race_tuning import (
@@ -20,7 +26,7 @@ from core.race_tuning import (
 class SnowConditions:
     """
     Condizioni neve stimate per la gara.
-    Questi valori arrivano dal tuo motore meteo/NOAA.
+    TODO: agganciare il tuo algoritmo meteo/NOAA per avere valori reali.
     """
     snow_temp_c: float
     air_temp_c: Optional[float]
@@ -32,23 +38,25 @@ def estimate_snow_conditions_for_event(
     event: RaceEvent,
 ) -> SnowConditions:
     """
-    QUI AGGANCI IL TUO ALGORITMO METEO/NOAA.
+    QUI si deve agganciare il tuo motore meteo (Open-Meteo/NOAA ecc.).
+    Per ora: placeholder molto semplice, ma già pensato in ottica WC.
 
-    Per ora metto una versione ultra semplificata, da sostituire
-    collegando il tuo modulo che già calcola temperatura neve ecc.
+    - neve secca fredda
+    - aria leggermente meno fredda
+    - injected=True per WC/EC su SL/GS
     """
-    # Placeholder molto semplice: neve fredda sopra 1500 m in inverno
-    # Potresti usare: place/resort → altitudine → NOAA/ICON → temp neve.
-    # Per ora ipotizziamo neve secca fredda:
     snow_temp = -6.0
     air_temp = -4.0
     snow_type = SnowType.DRY
     injected = False
 
-    # euristica: se livello è WC/EC FIS, probabile neve iniettata su SL/GS
-    if event.level and ("WC" in event.level or "EC" in event.level):
-        if event.discipline in (Discipline.SL, Discipline.GS):
-            injected = True
+    # euristica: WC/EC tecniche spesso iniettate
+    level = (event.level or "").upper() if event.level else ""
+    disc_code = _normalize_discipline_code(event.discipline)
+
+    if level in ("WC", "EC") and disc_code in (Discipline.SL.value if hasattr(Discipline.SL, "value") else "SL",
+                                               Discipline.GS.value if hasattr(Discipline.GS, "value") else "GS"):
+        injected = True
 
     return SnowConditions(
         snow_temp_c=snow_temp,
@@ -58,23 +66,56 @@ def estimate_snow_conditions_for_event(
     )
 
 
+def _normalize_discipline_code(disc) -> Optional[str]:
+    """
+    Converte discipline da:
+    - Enum Discipline
+    - stringa "SL"/"GS"/"SG"/"DH"
+    a stringa codice 'SL','GS','SG','DH'.
+    """
+    if disc is None:
+        return None
+    # Enum?
+    if hasattr(disc, "value"):
+        return str(disc.value)
+    # stringa
+    return str(disc).upper()
+
+
+def _discipline_enum_from_event(disc) -> Optional[Discipline]:
+    """
+    Ritorna un Discipline (Enum) partendo da stringa/Enum.
+    Se non è mappabile → None.
+    """
+    if disc is None:
+        return None
+    if isinstance(disc, Discipline):
+        return disc
+    code = _normalize_discipline_code(disc)
+    try:
+        return Discipline[code]
+    except Exception:
+        return None
+
+
 def get_wc_tuning_for_event(
     event: RaceEvent,
     skier_level: SkierLevel = SkierLevel.WC,
-) -> Optional[tuple[TuningParamsInput, dict]]:
+) -> Optional[Tuple[TuningParamsInput, dict]]:
     """
     Dato un RaceEvent, costruisce i parametri tuning WC e restituisce
     sia i parametri che un dict serializzabile col risultato.
 
-    Ritorna None se non ha disciplina.
+    Ritorna None se non ha disciplina mappabile.
     """
-    if event.discipline is None:
+    disc_enum = _discipline_enum_from_event(event.discipline)
+    if disc_enum is None:
         return None
 
     conditions = estimate_snow_conditions_for_event(event)
 
     params = TuningParamsInput(
-        discipline=event.discipline,
+        discipline=disc_enum,
         snow_temp_c=conditions.snow_temp_c,
         air_temp_c=conditions.air_temp_c,
         snow_type=conditions.snow_type,
@@ -84,21 +125,26 @@ def get_wc_tuning_for_event(
 
     rec = get_tuning_recommendation(params)
 
+    # valori "stringa" anche se federation/discipline sono Enum
+    federation_val = getattr(event.federation, "value", event.federation)
+    discipline_val = getattr(disc_enum, "value", str(disc_enum))
+    snow_type_val = getattr(conditions.snow_type, "value", str(conditions.snow_type))
+
     result = {
         "event_code": event.code,
         "event_name": event.name,
-        "federation": event.federation.value,
+        "federation": federation_val,
         "place": event.place,
         "nation": event.nation,
         "region": event.region,
         "start_date": event.start_date.isoformat(),
         "end_date": event.end_date.isoformat(),
-        "discipline": event.discipline.value,
+        "discipline": discipline_val,
         "category": event.category,
         "level": event.level,
         "snow_temp_c": conditions.snow_temp_c,
         "air_temp_c": conditions.air_temp_c,
-        "snow_type": conditions.snow_type.value,
+        "snow_type": snow_type_val,
         "injected": conditions.injected,
         "base_bevel_deg": rec.base_bevel_deg,
         "side_bevel_deg": rec.side_bevel_deg,
@@ -111,21 +157,28 @@ def get_wc_tuning_for_event(
     return params, result
 
 
-# Esempio di funzione di alto livello che userai dalla UI
+# ---------------------------------------------------------
+# Funzione di alto livello per la UI
+# ---------------------------------------------------------
 
 def find_and_tune_event(
     calendar_service: RaceCalendarService,
     season: int,
     code: str,
-    federation: Optional[Federation] = None,
+    federation: Optional[str] = None,
 ) -> Optional[dict]:
     """
-    Trova una gara per codice (FIS code/FISI code) e restituisce
-    direttamente il tuning WC pronto da mostrare in app.
+    Trova una gara per codice (es. codice sintetico NEVE-... o FIS code)
+    e restituisce direttamente il tuning WC pronto per la UI.
+
+    Se non trova nulla o la disciplina non è mappabile → None.
     """
     events = calendar_service.list_events(
         season=season,
         federation=federation,
+        discipline=None,
+        nation=None,
+        region=None,
     )
 
     target: Optional[RaceEvent] = None
