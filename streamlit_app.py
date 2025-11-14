@@ -1,5 +1,5 @@
 # streamlit_app.py
-# Telemark · Pro Wax & Tune — modalità standard + modalità gara FIS/FISI
+# Telemark · Pro Wax & Tune — modalità standard + modalità gara FIS/FISI (Neveitalia)
 
 import sys
 import os
@@ -152,7 +152,7 @@ with tab_wax:
         )
 
 # ============================================================
-# TAB 2 — RACE / GARE (FIS / FISI → tuning WC)
+# TAB 2 — RACE / GARE (FIS via Neveitalia → tuning WC)
 # ============================================================
 with tab_race:
     st.markdown("### Modalità Gara · FIS / FISI → Tuning World Cup")
@@ -160,25 +160,20 @@ with tab_race:
     # ---------- servizio calendari con cache ----------
     @st.cache_resource
     def get_calendar_service() -> RaceCalendarService:
-        # client HTTP per FIS → passa dal proxy sul tuo dominio
-        def http_client_fis(url: str, params: dict) -> str:
-            proxy_url = "https://telemarkskihire.com/api/fis_proxy.php"
-            r = requests.get(proxy_url, params=params, timeout=15)
+        # client HTTP unico per Neveitalia (usato sia da FIS che FISI placeholder)
+        def http_client_neve(url: str, params: dict | None) -> str:
+            if params is None:
+                params = {}
+            r = requests.get(url, params=params, timeout=10)
             r.raise_for_status()
             return r.text
 
-        # client HTTP per FISI (per ora non usato: FISI blocca l’accesso diretto)
-        def http_client_fisi(url: str, params_or_none) -> str:
-            # Non viene chiamato perché FISICalendarProvider al momento restituisce []
-            # Lo teniamo solo per interfaccia compatibile.
-            return ""
-
-        fisi_committee_slugs = {}
+        fisi_committee_slugs: dict[str, str] = {}
 
         return RaceCalendarService(
-            fis_provider=FISCalendarProvider(http_client=http_client_fis),
+            fis_provider=FISCalendarProvider(http_client=http_client_neve),
             fisi_provider=FISICalendarProvider(
-                http_client=http_client_fisi,
+                http_client=http_client_neve,
                 committee_slugs=fisi_committee_slugs,
             ),
         )
@@ -199,14 +194,15 @@ with tab_race:
     with col2:
         fed_label = st.radio(
             "Federazione",
-            ["FISI (Italia)", "FIS (World)", "Entrambe"],
+            ["FIS (World Cup via Neveitalia)", "FISI (non attivo)", "Entrambe"],
+            index=0,
             horizontal=True,
         )
 
-    if fed_label.startswith("FISI"):
-        federation = Federation.FISI
-    elif fed_label.startswith("FIS (World)"):
+    if fed_label.startswith("FIS"):
         federation = Federation.FIS
+    elif fed_label.startswith("FISI"):
+        federation = Federation.FISI
     else:
         federation = None  # entrambe
 
@@ -220,20 +216,19 @@ with tab_race:
     if disc_label == "Tutte":
         discipline = None
     else:
-        discipline = Discipline[disc_label]
+        discipline = disc_label  # qui usiamo stringhe "SL"/"GS"/...
 
     with col4:
         region = st.text_input(
-            "Regione FISI (opzionale, es. VALLE_D_AOSTA)",
+            "Regione FISI (non usato per FIS/Neveitalia)",
             value="",
-            help="Usata solo per FISI / comitati. Lascia vuoto per tutte.",
         )
 
     st.markdown("---")
 
     # ---------- carica gare ----------
     if st.button("🔍 Carica gare"):
-        with st.spinner("Carico calendari gare..."):
+        with st.spinner("Carico calendari gare da Neveitalia..."):
             try:
                 events = calendar_service.list_events(
                     season=season,
@@ -249,9 +244,8 @@ with tab_race:
         if not events:
             st.info(
                 "Nessuna gara trovata con questi filtri.\n\n"
-                "Per FIS usiamo il proxy su telemarkskihire.com; se non vedi gare verifica che il file "
-                "`api/fis_proxy.php` sia caricato e raggiungibile, e che FIS mostri la tabella per i parametri scelti. "
-                "Per FISI l’accesso diretto è ancora disattivato (403 dal sito)."
+                "Per ora FIS è basato sul calendario di Neveitalia (WC maschile + femminile). "
+                "FISI è ancora disattivato in attesa di una sorgente stabile."
             )
         else:
             st.success(f"Trovate {len(events)} gare.")
@@ -260,7 +254,7 @@ with tab_race:
             selected_event = st.selectbox(
                 "Seleziona una gara",
                 options=events,
-                format_func=lambda ev: f"[{ev.code}] {ev.name} · {ev.place} · {ev.start_date.isoformat()}",
+                format_func=lambda ev: f"{ev.start_date.isoformat()} · {ev.place} · {ev.name}",
             )
 
             if selected_event:
