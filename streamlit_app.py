@@ -1,5 +1,5 @@
 # streamlit_app.py
-# Telemark · Pro Wax & Tune — modalità standard + modalità gara FIS/FISI (Neveitalia)
+# Telemark · Pro Wax & Tune — modalità standard + modalità gara (FIS via Neveitalia)
 
 import sys
 import os
@@ -25,7 +25,7 @@ from core.race_events import (
     FISICalendarProvider,
     Federation,
 )
-from core.race_tuning import Discipline, SkierLevel
+from core.race_tuning import SkierLevel
 from core.race_integration import get_wc_tuning_for_event
 
 # ---------- THEME ----------
@@ -76,35 +76,29 @@ tab_wax, tab_race = st.tabs(["🧊 Wax & Tune", "🏁 Race / Gare"])
 # TAB 1 — WAX & TUNE
 # ============================================================
 with tab_wax:
-    # 1) RICERCA LOCALITÀ — SOLO SEARCHBOX
     st.markdown(f"### 1) {T['search_ph']}")
 
-    # location_searchbox gestisce internamente persistenza di lat/lon/label
     lat, lon, place_label = location_searchbox(T)
 
-    # Badge posizione
     st.markdown(
         f"<div class='badge'>📍 <b>{place_label}</b> · "
         f"lat <b>{lat:.5f}</b>, lon <b>{lon:.5f}</b></div>",
         unsafe_allow_html=True,
     )
 
-    # ---------- CONTEXT condiviso per i moduli ----------
     ctx = {
         "lat": float(lat),
         "lon": float(lon),
         "place_label": place_label,
-        "iso2": "",          # per eventuale compatibilità backward
+        "iso2": "",
         "lang": lang,
         "T": T,
     }
     st.session_state["_ctx"] = ctx
 
-    # ---------- MODULI ----------
     st.markdown("### 2) Moduli")
 
     def _load(modname: str):
-        """Import di un modulo core.* con messaggio di errore in UI."""
         try:
             importlib.invalidate_caches()
             return importlib.import_module(modname)
@@ -113,10 +107,6 @@ with tab_wax:
             return None
 
     def _call_first(mod, candidates, *args, **kwargs):
-        """
-        Cerca nel modulo la prima funzione disponibile tra 'candidates'
-        e la chiama con (*args, **kwargs).
-        """
         if not mod:
             return False, "missing"
         for name in candidates:
@@ -136,7 +126,6 @@ with tab_wax:
         ("core.wax_logic", ["render_wax", "wax_panel", "show_wax", "main", "app", "render"]),
         ("core.maps", ["render_map", "map_panel", "show_map", "main", "app", "render"]),
         ("core.dem_tools", ["render_dem", "dem_panel", "show_dem", "main", "app", "render"]),
-        # modulo POV video (se esiste)
         ("core.pov_video", ["render_pov_video", "render", "main", "app"]),
     ]
 
@@ -155,12 +144,10 @@ with tab_wax:
 # TAB 2 — RACE / GARE (FIS via Neveitalia → tuning WC)
 # ============================================================
 with tab_race:
-    st.markdown("### Modalità Gara · FIS / FISI → Tuning World Cup")
+    st.markdown("### Modalità Gara · FIS (Neveitalia) → Tuning World Cup")
 
-    # ---------- servizio calendari con cache ----------
     @st.cache_resource
     def get_calendar_service() -> RaceCalendarService:
-        # client HTTP unico per Neveitalia (usato sia da FIS che FISI placeholder)
         def http_client_neve(url: str, params: dict | None) -> str:
             if params is None:
                 params = {}
@@ -180,7 +167,6 @@ with tab_race:
 
     calendar_service = get_calendar_service()
 
-    # ---------- filtri base ----------
     col1, col2 = st.columns(2)
     with col1:
         season = st.number_input(
@@ -204,7 +190,7 @@ with tab_race:
     elif fed_label.startswith("FISI"):
         federation = Federation.FISI
     else:
-        federation = None  # entrambe
+        federation = None
 
     col3, col4 = st.columns(2)
     with col3:
@@ -216,17 +202,16 @@ with tab_race:
     if disc_label == "Tutte":
         discipline = None
     else:
-        discipline = disc_label  # qui usiamo stringhe "SL"/"GS"/...
+        discipline = disc_label  # stringa "SL"/"GS"/...
 
     with col4:
         region = st.text_input(
-            "Regione FISI (non usato per FIS/Neveitalia)",
+            "Regione FISI (ignorata per FIS/Neveitalia)",
             value="",
         )
 
     st.markdown("---")
 
-    # ---------- carica gare ----------
     if st.button("🔍 Carica gare"):
         with st.spinner("Carico calendari gare da Neveitalia..."):
             try:
@@ -234,7 +219,7 @@ with tab_race:
                     season=season,
                     federation=federation,
                     discipline=discipline,
-                    nation="ITA" if federation in (None, Federation.FISI) else None,
+                    nation=None,
                     region=region or None,
                 )
             except Exception as e:
@@ -250,47 +235,45 @@ with tab_race:
         else:
             st.success(f"Trovate {len(events)} gare.")
 
-            # select gara
             selected_event = st.selectbox(
                 "Seleziona una gara",
                 options=events,
                 format_func=lambda ev: f"{ev.start_date.isoformat()} · {ev.place} · {ev.name}",
             )
 
-            if selected_event:
-                if st.button("🎯 Calcola tuning WC per questa gara"):
-                    res = get_wc_tuning_for_event(
-                        selected_event,
-                        skier_level=SkierLevel.WC,
+            if selected_event and st.button("🎯 Calcola tuning WC per questa gara"):
+                res = get_wc_tuning_for_event(
+                    selected_event,
+                    skier_level=SkierLevel.WC,
+                )
+                if res is None:
+                    st.warning("Questa gara non ha una disciplina riconosciuta (SL/GS/SG/DH).")
+                else:
+                    params, data = res
+                    st.subheader("Tuning World Cup suggerito")
+
+                    c1, c2, c3 = st.columns(3)
+                    c1.metric("Base bevel", f"{data['base_bevel_deg']:.2f}°")
+                    c2.metric("Side bevel", f"{data['side_bevel_deg']:.2f}°")
+                    c3.metric("Rischio", data["risk_level"])
+
+                    st.markdown("#### Struttura & Sciolina")
+                    st.write(f"**Struttura soletta:** {data['structure_pattern']}")
+                    st.write(f"**Wax consigliato:** {data['wax_group']}")
+
+                    st.markdown("#### Dettagli neve")
+                    st.write(
+                        f"Neve: **{data['snow_type']}**, "
+                        f"T neve ≈ **{data['snow_temp_c']}°C**, "
+                        f"T aria ≈ **{data['air_temp_c']}°C**, "
+                        f"Injected: **{data['injected']}**"
                     )
-                    if res is None:
-                        st.warning("Questa gara non ha una disciplina riconosciuta (SL/GS/SG/DH).")
-                    else:
-                        params, data = res
-                        st.subheader("Tuning World Cup suggerito")
 
-                        c1, c2, c3 = st.columns(3)
-                        c1.metric("Base bevel", f"{data['base_bevel_deg']:.2f}°")
-                        c2.metric("Side bevel", f"{data['side_bevel_deg']:.2f}°")
-                        c3.metric("Rischio", data["risk_level"])
+                    st.markdown("#### Note tecniche")
+                    st.write(data["notes"])
 
-                        st.markdown("#### Struttura & Sciolina")
-                        st.write(f"**Struttura soletta:** {data['structure_pattern']}")
-                        st.write(f"**Wax consigliato:** {data['wax_group']}")
-
-                        st.markdown("#### Dettagli neve")
-                        st.write(
-                            f"Neve: **{data['snow_type']}**, "
-                            f"T neve ≈ **{data['snow_temp_c']}°C**, "
-                            f"T aria ≈ **{data['air_temp_c']}°C**, "
-                            f"Injected: **{data['injected']}**"
-                        )
-
-                        st.markdown("#### Note tecniche")
-                        st.write(data["notes"])
-
-                        if show_info:
-                            st.markdown("#### Debug evento")
-                            st.json(data)
+                    if show_info:
+                        st.markdown("#### Debug evento")
+                        st.json(data)
     else:
         st.info("Imposta i filtri e premi **“Carica gare”** per vedere il calendario.")
