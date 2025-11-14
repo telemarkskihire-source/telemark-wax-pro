@@ -160,50 +160,20 @@ with tab_race:
     # ---------- servizio calendari con cache ----------
     @st.cache_resource
     def get_calendar_service() -> RaceCalendarService:
-        # client HTTP per FIS
+        # client HTTP per FIS → passa dal proxy sul tuo dominio
         def http_client_fis(url: str, params: dict) -> str:
-            r = requests.get(url, params=params, timeout=10)
+            proxy_url = "https://telemarkskihire.com/api/fis_proxy.php"
+            r = requests.get(proxy_url, params=params, timeout=15)
             r.raise_for_status()
             return r.text
 
-        # client HTTP per FISI con User-Agent da browser + gestione 403
+        # client HTTP per FISI (per ora non usato: FISI blocca l’accesso diretto)
         def http_client_fisi(url: str, params_or_none) -> str:
-            headers = {
-                "User-Agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/120.0 Safari/537.36"
-                ),
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "Accept-Language": "it-IT,it;q=0.9,en-US;q=0.8,en;q=0.7",
-                "Referer": "https://www.fisi.org/",
-            }
+            # Non viene chiamato perché FISICalendarProvider al momento restituisce []
+            # Lo teniamo solo per interfaccia compatibile.
+            return ""
 
-            if params_or_none is None:
-                r = requests.get(url, headers=headers, timeout=10)
-            else:
-                r = requests.get(url, params=params_or_none, headers=headers, timeout=10)
-
-            if r.status_code == 403:
-                # Messaggio chiaro se FISI blocca l'accesso dal server
-                raise RuntimeError(
-                    "Accesso al calendario FISI negato (403). "
-                    "Probabilmente il sito blocca le richieste dal server: "
-                    "per ora è necessario caricare i calendari FISI in modo offline (file CSV/JSON)."
-                )
-
-            r.raise_for_status()
-            return r.text
-
-        # DA COMPLETARE: slug reali dei comitati FISI.
-        fisi_committee_slugs = {
-            # "VALLE_D_AOSTA": "valdostano",
-            # "PIEMONTE": "piemonte",
-            # "ALPI_CENTRALI": "alpi-centrali",
-            # "TRENTINO": "trentino",
-            # "VENETO": "veneto",
-            # ...
-        }
+        fisi_committee_slugs = {}
 
         return RaceCalendarService(
             fis_provider=FISCalendarProvider(http_client=http_client_fis),
@@ -279,8 +249,9 @@ with tab_race:
         if not events:
             st.info(
                 "Nessuna gara trovata con questi filtri.\n\n"
-                "Possibili cause: parser FISI/FIS da adattare alla struttura HTML reale "
-                "oppure comitati/slug non ancora configurati, oppure accesso FISI bloccato (403)."
+                "Per FIS usiamo il proxy su telemarkskihire.com; se non vedi gare verifica che il file "
+                "`api/fis_proxy.php` sia caricato e raggiungibile, e che FIS mostri la tabella per i parametri scelti. "
+                "Per FISI l’accesso diretto è ancora disattivato (403 dal sito)."
             )
         else:
             st.success(f"Trovate {len(events)} gare.")
