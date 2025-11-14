@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import datetime as dt
 from typing import Dict, Optional, Tuple
 
 from .race_events import RaceEvent
@@ -12,8 +11,8 @@ from .race_tuning import SkierLevel
 
 def _estimate_temps_for_event(ev: RaceEvent) -> tuple[float, float]:
     """
-    Stima molto semplice di temperatura aria/neve in base al mese.
-    È volutamente robusta (nessun accesso a servizi esterni) per non rompere l'app.
+    Stima semplice di temperatura aria/neve in base al mese.
+    Nessuna chiamata esterna: deve essere super-robusto.
     """
     month = ev.start_date.month
 
@@ -22,7 +21,7 @@ def _estimate_temps_for_event(ev: RaceEvent) -> tuple[float, float]:
         air = -3.0
     elif month in (12, 1, 2):
         air = -7.0
-    elif month in (3,):
+    elif month == 3:
         air = -2.0
     else:
         air = 0.0
@@ -47,11 +46,15 @@ def _wax_group_from_temp(snow_temp_c: float) -> str:
     return "VERY WARM (+2°C↑) · dirty snow / spring"
 
 
-def _wc_edge_setup(discipline: Optional[str], level: SkierLevel) -> tuple[float, float, str]:
+def _wc_edge_setup(
+    discipline: Optional[str],
+    level: SkierLevel,
+) -> tuple[float, float, str]:
     """
-    Impostazioni standard da WC, leggere differenze per disciplina.
+    Settaggi standard in stile World Cup per base/fianco,
+    con piccole variazioni per disciplina e livello.
     """
-    # defaults
+    # default
     base = 0.7
     side = 3.0
     risk = "MEDIUM"
@@ -73,7 +76,7 @@ def _wc_edge_setup(discipline: Optional[str], level: SkierLevel) -> tuple[float,
         side = 3.0
         risk = "MEDIUM-LOW"
 
-    # per livelli inferiori ammorbidiamo un filo i settaggi estremi
+    # livelli non WC: ammorbidiamo un filo
     if level != SkierLevel.WC:
         base += 0.1
         risk = risk.replace("HIGH", "MEDIUM").replace("MEDIUM-LOW", "LOW")
@@ -86,10 +89,12 @@ def get_wc_tuning_for_event(
     skier_level: SkierLevel,
 ) -> Optional[Tuple[Dict, Dict]]:
     """
-    Ritorna una tupla (params, data) dove:
-      - params: parametri grezzi usati dal calcolo (per debug)
-      - data:   struttura pronta per l'UI di Streamlit
-    Se la disciplina non è riconosciuta, ritorna None.
+    Ritorna (params, data) per il pannello WC:
+
+    - params: parametri grezzi usati dal calcolo (per debug)
+    - data:   struttura pronta per l'UI di Streamlit
+
+    Se la disciplina non è riconosciuta → None.
     """
 
     if not event.discipline:
@@ -97,11 +102,12 @@ def get_wc_tuning_for_event(
 
     air_temp_c, snow_temp_c = _estimate_temps_for_event(event)
     base_bevel_deg, side_bevel_deg, risk_level = _wc_edge_setup(
-        event.discipline, skier_level
+        event.discipline,
+        skier_level,
     )
     wax_group = _wax_group_from_temp(snow_temp_c)
 
-    # classificazione neve molto semplice in base a T neve
+    # classificazione neve in base alla T neve
     if snow_temp_c <= -8:
         snow_type = "WINTER · very cold / dry"
         structure_pattern = "Fine lineare / cross fine"
@@ -120,4 +126,30 @@ def get_wc_tuning_for_event(
         injected = False
 
     notes = (
-        f"Gara: {event.name} a {event.place} ({event
+        f"Gara: {event.name} a {event.place} ({event.start_date.isoformat()}). "
+        f"Settaggio di base in stile Coppa del Mondo per disciplina {event.discipline}. "
+        "Adatta leggermente il tuning in base allo stile personale e allo stato reale "
+        "della neve il giorno della gara."
+    )
+
+    params: Dict = {
+        "discipline": event.discipline,
+        "skier_level": skier_level.name,
+        "event_date": event.start_date.isoformat(),
+        "nation": event.nation,
+    }
+
+    data: Dict = {
+        "base_bevel_deg": float(base_bevel_deg),
+        "side_bevel_deg": float(side_bevel_deg),
+        "risk_level": risk_level,
+        "structure_pattern": structure_pattern,
+        "wax_group": wax_group,
+        "snow_type": snow_type,
+        "snow_temp_c": round(snow_temp_c, 1),
+        "air_temp_c": round(air_temp_c, 1),
+        "injected": injected,
+        "notes": notes,
+    }
+
+    return params, data
