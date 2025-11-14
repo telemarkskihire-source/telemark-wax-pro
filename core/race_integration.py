@@ -1,114 +1,82 @@
 # core/race_integration.py
 
 from __future__ import annotations
-
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Optional, Dict
 
-from core.race_events import RaceEvent
 from core.race_tuning import (
-    get_tuning_recommendation,
     TuningParamsInput,
+    get_tuning_recommendation,
+    SnowType,
     Discipline,
     SkierLevel,
-    SnowType,
 )
 
 
 @dataclass
 class SnowConditions:
     snow_temp_c: float
-    air_temp_c: Optional[float]
+    air_temp_c: float
     snow_type: SnowType
     injected: bool
 
 
-def _normalize_discipline_code(disc) -> Optional[str]:
-    if disc is None:
-        return None
-    if hasattr(disc, "value"):
-        return str(disc.value)
-    return str(disc).upper()
+def estimate_snow(event: dict) -> SnowConditions:
+    """
+    Placeholder reale: la tua app userà NOAA/ICON qui.
+    Ora metto un default valido.
+    """
+    disc = event["discipline"]
 
-
-def _discipline_enum_from_event(disc) -> Optional[Discipline]:
-    if disc is None:
-        return None
-    if isinstance(disc, Discipline):
-        return disc
-    code = _normalize_discipline_code(disc)
-    try:
-        return Discipline[code]
-    except Exception:
-        return None
-
-
-def estimate_snow_conditions_for_event(event: RaceEvent) -> SnowConditions:
-    snow_temp = -6.0
-    air_temp = -4.0
-    snow_type = SnowType.DRY
-    injected = False
-
-    level = (event.level or "").upper()
-    disc_code = _normalize_discipline_code(event.discipline)
-
-    if level in ("WC", "EC") and disc_code in ("SL", "GS"):
-        injected = True
-
+    injected = disc in ("SL", "GS")
     return SnowConditions(
-        snow_temp_c=snow_temp,
-        air_temp_c=air_temp,
-        snow_type=snow_type,
+        snow_temp_c=-6,
+        air_temp_c=-4,
+        snow_type=SnowType.DRY,
         injected=injected,
     )
 
 
-def get_wc_tuning_for_event(
-    event: RaceEvent,
-    skier_level: SkierLevel = SkierLevel.WC,
-) -> Optional[Tuple[TuningParamsInput, dict]]:
-    disc_enum = _discipline_enum_from_event(event.discipline)
-    if disc_enum is None:
+def convert_disc_to_enum(disc: str) -> Optional[Discipline]:
+    try:
+        return Discipline[disc]
+    except:
         return None
 
-    conditions = estimate_snow_conditions_for_event(event)
+
+def get_wc_tuning(event: dict) -> Dict:
+    """
+    Riceve un evento Neveitalia (dict) e restituisce il tuning WC.
+    """
+    disc_enum = convert_disc_to_enum(event["discipline"])
+    if disc_enum is None:
+        return {"error": "Disciplina non supportata"}
+
+    snow = estimate_snow(event)
 
     params = TuningParamsInput(
         discipline=disc_enum,
-        snow_temp_c=conditions.snow_temp_c,
-        air_temp_c=conditions.air_temp_c,
-        snow_type=conditions.snow_type,
-        injected=conditions.injected,
-        skier_level=skier_level,
+        snow_temp_c=snow.snow_temp_c,
+        air_temp_c=snow.air_temp_c,
+        snow_type=snow.snow_type,
+        injected=snow.injected,
+        skier_level=SkierLevel.WC,
     )
 
     rec = get_tuning_recommendation(params)
 
-    discipline_val = getattr(disc_enum, "value", str(disc_enum))
-    snow_type_val = getattr(conditions.snow_type, "value", str(conditions.snow_type))
-
-    result = {
-        "event_code": event.code,
-        "event_name": event.name,
-        "federation": event.federation,
-        "place": event.place,
-        "nation": event.nation,
-        "region": event.region,
-        "start_date": event.start_date.isoformat(),
-        "end_date": event.end_date.isoformat(),
-        "discipline": discipline_val,
-        "category": event.category,
-        "level": event.level,
-        "snow_temp_c": conditions.snow_temp_c,
-        "air_temp_c": conditions.air_temp_c,
-        "snow_type": snow_type_val,
-        "injected": conditions.injected,
-        "base_bevel_deg": rec.base_bevel_deg,
-        "side_bevel_deg": rec.side_bevel_deg,
-        "structure_pattern": rec.structure_pattern,
-        "wax_group": rec.wax_group,
-        "risk_level": rec.risk_level,
+    return {
+        "event": event,
+        "base_bevel": rec.base_bevel_deg,
+        "side_bevel": rec.side_bevel_deg,
+        "structure": rec.structure_pattern,
+        "wax": rec.wax_group,
+        "risk": rec.risk_level,
         "notes": rec.notes,
+        "snow": {
+            "snow_temp_c": snow.snow_temp_c,
+            "air_temp_c": snow.air_temp_c,
+            "snow_type": snow.snow_type.value,
+            "injected": snow.injected,
+        }
     }
-
-    return params, result
