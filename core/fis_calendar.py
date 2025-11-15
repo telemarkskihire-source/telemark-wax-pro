@@ -1,184 +1,206 @@
 # core/fis_calendar.py
 """
-Integrazione calendario Coppa del Mondo FIS (sito ufficiale fis-ski.com)
+Integrazione calendario FIS ufficiale (alpine skiing, World Cup).
 
-Legge la pagina:
-  https://www.fis-ski.com/DB/alpine-skiing/calendar-results.html
+- Scarica l'HTML da fis-ski.com con i parametri corretti (season, disciplina, gender, WC).
+- Effettua il parsing della tabella con BeautifulSoup.
+- Ritorna una lista di dizionari Python pronti per lo Streamlit UI.
 
-Usa i parametri:
-  sectorcode=AL           -> Sci alpino
-  seasoncode=YYYY         -> anno finale stagione (es. 2026 per stagione 2025/26)
-  categorycode=WC         -> Coppa del Mondo
-  gendercode=M/W (opz.)   -> uomini / donne
-
-Ritorna una lista di dict, uno per ogni gara (discipline “esplose” se 2xSL ecc).
+⚠️ Dipendenza: beautifulsoup4
+Assicurati di avere nel tuo requirements.txt:
+    beautifulsoup4
 """
 
 from __future__ import annotations
 
 import re
-from functools import lru_cache
-from typing import Literal, List, Dict, Any
+from typing import List, Optional, Dict, Any
 
 import requests
-from bs4 import BeautifulSoup
-from urllib.parse import urlencode
 
-FIS_BASE_URL = "https://www.fis-ski.com/DB/alpine-skiing/calendar-results.html"
-
-DISC_CODES = {"DH", "SL", "GS", "SG", "AC", "SC", "PAR", "PSL", "PGS"}
-
-
-def _extract_disciplines(text: str) -> List[str]:
-    """
-    Estrae le sigle di disciplina (DH, SL, GS, SG, …) da stringhe tipo:
-      'WC GS', 'TRA • WC 3xDH SG', 'WC 2xSL 2xGS'
-    """
-    return list(dict.fromkeys(re.findall(r"\b(DH|SL|GS|SG|AC|SC|PAR|PSL|PGS)\b", text)))
+try:
+    from bs4 import BeautifulSoup  # type: ignore
+except ImportError as exc:  # messaggio chiaro se manca il pacchetto
+    raise RuntimeError(
+        "Per usare core.fis_calendar serve il pacchetto 'beautifulsoup4' "
+        "nel requirements.txt della tua app Streamlit."
+    ) from exc
 
 
-def _extract_genders(text: str) -> List[str]:
-    """
-    Colonna finale FIS:
-      'W', 'M', 'W M' …
-    """
-    genders: List[str] = []
-    if "W" in text:
-        genders.append("W")
-    if "M" in text:
-        genders.append("M")
-    return genders or ["?"]
+BASE_URL = "https://www.fis-ski.com/DB/alpine-skiing/calendar-results.html"
 
 
-@lru_cache(maxsize=32)
-def fetch_fis_wc_races(
+# mappa “discipline” che userai nello UI -> codice FIS per la query
+DISCIPLINE_CODE_MAP: Dict[str, str] = {
+    "ALL": "",    # nessun filtro disciplina
+    "SL": "SL",
+    "GS": "GS",
+    "SG": "SG",
+    "DH": "DH",
+    "AC": "AC",   # Alpine Combined
+    "PAR": "PAR", # Parallel / Team, se servirà
+}
+
+GENDER_CODE_MAP: Dict[str, str] = {
+    "ALL": "",    # All
+    "M": "M",
+    "W": "W",
+}
+
+
+def _build_fis_params(
     season_start: int,
-    gender: Literal["M", "W", "both"] = "both",
-) -> List[Dict[str, Any]]:
+    discipline_code: str = "",
+    gender_code: str = "",
+) -> Dict[str, str]:
     """
-    Legge il calendario di Coppa del Mondo FIS per una stagione.
-
-    :param season_start: anno di inizio stagione (es. 2025 per 2025/26)
-    :param gender: 'M', 'W' oppure 'both'
-    :return: lista di dict con chiavi:
-             - date (str, come da sito FIS es. '28-29 Oct 2025')
-             - place (str)
-             - nation (str, es. 'ITA')
-             - discipline (str: SL/GS/DH/SG/…)
-             - genders (list[str]: ['M'], ['W'] o ['M','W'])
-             - description (str, es. 'WC 2xSL 2xGS')
-             - source (sempre 'fis')
+    Costruisce il dizionario di querystring per il calendario FIS WC alpino.
     """
-    # FIS usa l'anno FINALE della stagione come seasoncode
-    seasoncode = str(season_start + 1)
+    season_str = str(season_start)
 
     params = {
-        "sectorcode": "AL",
-        "seasoncode": seasoncode,
-        "categorycode": "WC",
+        "categorycode": "WC",              # Coppa del Mondo
+        "disciplinecode": discipline_code, # SL / GS / ...
+        "eventselection": "",              # tutti gli eventi
+        "gendercode": gender_code,         # "" / "M" / "W"
+        "nationcode": "",
+        "place": "",
+        "racecodex": "",
+        "racedate": "",
+        "saveselection": "-1",
+        "seasoncode": season_str,
+        "seasonmonth": f"X-{season_str}",  # come visto sulla pagina FIS
+        "seasonselection": "",
+        "sectorcode": "AL",                # Alpine
     }
+    return params
 
-    if gender == "M":
-        params["gendercode"] = "M"
-    elif gender == "W":
-        params["gendercode"] = "W"
-    # 'both' -> niente gendercode, prende tutti
 
-    url = f"{FIS_BASE_URL}?{urlencode(params)}"
-
-    resp = requests.get(url, timeout=20)
+def fetch_fis_wc_html(
+    season_start: int,
+    discipline_code: str = "",
+    gender_code: str = "",
+    timeout: int = 20,
+) -> str:
+    """
+    Scarica l'HTML del calendario FIS WC per la stagione richiesta.
+    """
+    params = _build_fis_params(season_start, discipline_code, gender_code)
+    resp = requests.get(BASE_URL, params=params, timeout=timeout)
     resp.raise_for_status()
+    return resp.text
 
-    soup = BeautifulSoup(resp.text, "html.parser")
 
-    # Troviamo la tabella che contiene la riga con "Status / Date / Place ..."
-    table = None
-    for a in soup.find_all("a"):
-        if a.get_text(strip=True) == "D P C C":
-            tr = a.find_parent("tr")
-            if tr is not None:
-                table = tr.parent
-            break
+def _extract_races_from_table(table_html: str) -> List[Dict[str, Any]]:
+    """
+    Parsing della tabella "Status / Date / Place / ... / Category & Event / Gender".
 
-    if table is None:
-        # fallback: nessuna tabella trovata
+    Ritorna una lista di dict:
+      {
+        "date": "10-11 Dec 2025",
+        "place": "Val Gardena",
+        "nation": "ITA",
+        "event": "WC DH",
+      }
+    """
+    soup = BeautifulSoup(table_html, "html.parser")
+
+    table = soup.find("table")
+    if not table:
         return []
 
-    rows_data = []
-    for tr in table.find_all("tr")[1:]:  # salta header
-        cols = [td.get_text(" ", strip=True) for td in tr.find_all("td")]
-        # ci aspettiamo ~10 colonne
-        if len(cols) < 10:
+    tbody = table.find("tbody") or table
+
+    races: List[Dict[str, Any]] = []
+
+    for tr in tbody.find_all("tr"):
+        tds = tr.find_all("td")
+        if len(tds) < 3:
             continue
 
-        # struttura tipica:
-        # 0: 'D P C C'
-        # 1: date           es. '28-29 Oct 2025'
-        # 2: 'Soelden WC GS'
-        # 3: place          es. 'Soelden'
-        # 4: place ripetuto
-        # 5: nation         es. 'AUT'
-        # 6: 'AL'
-        # 7: 'WC GS' / 'TRA • WC 3xDH SG' ecc
-        # 8: 'AL W' o 'AL W M'
-        # 9: 'W' / 'M' / 'W M'
-        date_str = cols[1]
-        place = cols[3]
-        nation = cols[5]
-        cat_event = cols[7]
-        gender_col = cols[9]
+        cell_texts = [td.get_text(" ", strip=True) for td in tds]
+        row_text = "  ".join(cell_texts)
 
-        rows_data.append((date_str, place, nation, cat_event, gender_col))
+        # 1) Data: di solito è la seconda colonna (index 1) es: "26-27 Nov 2025"
+        date_text = cell_texts[1] if len(cell_texts) > 1 else ""
 
-    events: List[Dict[str, Any]] = []
+        # 2) Nazione: tipicamente una stringa di 3 lettere maiuscole (ITA, SUI, AUT, ...)
+        nation = ""
+        for txt in cell_texts:
+            if re.fullmatch(r"[A-Z]{3}", txt):
+                nation = txt
+                break
 
-    for date_str, place, nation, cat_event, gender_col in rows_data:
-        disc_list = _extract_disciplines(cat_event)
-        genders = _extract_genders(gender_col)
+        # 3) Evento (Category & Event): il testo che contiene "WC"
+        event = ""
+        for txt in cell_texts:
+            if "WC" in txt:
+                event = txt
+                break
 
-        # Se nessuna disciplina riconosciuta, trattiamo come "ALL"
-        if not disc_list:
-            disc_list = ["ALL"]
+        # Se non c'è "WC" saltiamo (dovrebbe già essere filtrato ma meglio essere rigidi)
+        if not event:
+            continue
 
-        # Esplodiamo le discipline: se '2xSL 2xGS' -> un evento per SL, uno per GS
-        for disc in disc_list:
-            events.append(
-                {
-                    "date": date_str,
-                    "place": place,
-                    "nation": nation,
-                    "discipline": disc,
-                    "genders": genders,
-                    "description": cat_event,
-                    "source": "fis",
-                }
-            )
+        # 4) Place: prendiamo la prima cella “non tecnica” dopo la data
+        place = ""
+        for txt in cell_texts[2:]:
+            # escludiamo celle evidentemente tecniche (AL, WC, codici vari)
+            if "WC" in txt:
+                continue
+            if re.fullmatch(r"[A-Z]{3}", txt):
+                # è la nazione, non il posto
+                continue
+            place = txt
+            break
 
-    return events
+        if not place:
+            # fallback
+            place = cell_texts[2]
+
+        races.append(
+            {
+                "date": date_text,
+                "place": place,
+                "nation": nation,
+                "event": event,
+                "row_raw": row_text,
+            }
+        )
+
+    return races
 
 
 def filter_fis_wc_races(
     season_start: int,
-    discipline: str | None,
-    gender: Literal["M", "W", "both"] = "both",
+    discipline: Optional[str] = None,
+    gender: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """
-    Wrapper comodo per la pagina Cup.
+    API principale da usare nello Streamlit.
 
-    :param discipline: 'GS', 'SL', 'DH', 'SG', oppure None/'Tutte'
+    Parameters
+    ----------
+    season_start : int
+        Anno di inizio stagione (es. 2025 per 2025/26).
+    discipline : Optional[str]
+        "SL", "GS", "SG", "DH", "AC", "PAR" oppure None / "ALL".
+    gender : Optional[str]
+        "M", "W" oppure None / "ALL".
+
+    Returns
+    -------
+    List[Dict[str, Any]]
+        Lista di gare FIS WC già ripulite (date, place, nation, event).
     """
-    if not discipline or discipline.upper() in {"ALL", "TUTTE"}:
-        discipline_filter = None
-    else:
-        discipline_filter = discipline.upper()
+    discipline_code = DISCIPLINE_CODE_MAP.get((discipline or "ALL").upper(), "")
+    gender_code = GENDER_CODE_MAP.get((gender or "ALL").upper(), "")
 
-    races = fetch_fis_wc_races(season_start, gender=gender)
+    html = fetch_fis_wc_html(
+        season_start=season_start,
+        discipline_code=discipline_code,
+        gender_code=gender_code,
+    )
 
-    if discipline_filter is None:
-        return races
-
-    filtered = [
-        r for r in races if r["discipline"] == discipline_filter
-    ]
-
-    return filtered
+    races = _extract_races_from_table(html)
+    return races
