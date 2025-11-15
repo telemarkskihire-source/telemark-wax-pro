@@ -1,17 +1,18 @@
 # streamlit_app.py
 # Telemark · Pro Wax & Tune — modalità standard + modalità gara (FIS via Neveitalia)
 
+from __future__ import annotations
+
 import os
 import importlib
 
-import streamlit as st
 import requests
+import streamlit as st
 
-# --- import dal core (moduli esistenti) ---
+# --- import dal core ---
 from core.i18n import L
 from core.search import location_searchbox
 
-# --- import moduli gara/tuning ---
 from core.race_events import (
     RaceCalendarService,
     FISCalendarProvider,
@@ -21,9 +22,9 @@ from core.race_events import (
 from core.race_tuning import SkierLevel
 from core.race_integration import get_wc_tuning_for_event
 
-# ============================================================
-# CONFIG TEMA
-# ============================================================
+# ======================================================================
+# THEME
+# ======================================================================
 
 st.set_page_config(
     page_title="Telemark · Pro Wax & Tune",
@@ -53,9 +54,9 @@ hr { border:none; border-top:1px solid var(--line); margin:.75rem 0 }
 
 st.title("Telemark · Pro Wax & Tune")
 
-# ============================================================
+# ======================================================================
 # LINGUA
-# ============================================================
+# ======================================================================
 
 st.sidebar.markdown("### ⚙️")
 
@@ -65,22 +66,22 @@ lang = st.sidebar.selectbox(
     index=0,
 )
 T = L["it"] if lang == "IT" else L["en"]
+
 show_info = st.sidebar.toggle("Mostra info tecniche", value=False)
 
-# ============================================================
-# TABS: 1) Wax & Tune   2) Race / Gare
-# ============================================================
+# ======================================================================
+# TABS
+# ======================================================================
 
 tab_wax, tab_race = st.tabs(["🧊 Wax & Tune", "🏁 Race / Gare"])
 
-# ============================================================
+# ======================================================================
 # TAB 1 — WAX & TUNE
-# ============================================================
+# ======================================================================
 
 with tab_wax:
     st.markdown(f"### 1) {T['search_ph']}")
 
-    # ricerca / geocoding località
     lat, lon, place_label = location_searchbox(T)
 
     st.markdown(
@@ -89,7 +90,6 @@ with tab_wax:
         unsafe_allow_html=True,
     )
 
-    # contesto condiviso tra i moduli core.*
     ctx = {
         "lat": float(lat),
         "lon": float(lon),
@@ -102,7 +102,6 @@ with tab_wax:
 
     st.markdown("### 2) Moduli")
 
-    # loader generico per i vari pannelli core.*
     def _load(modname: str):
         try:
             importlib.invalidate_caches()
@@ -145,22 +144,19 @@ with tab_wax:
             unsafe_allow_html=True,
         )
 
-# ============================================================
+# ======================================================================
 # TAB 2 — RACE / GARE (FIS via Neveitalia → tuning WC)
-# ============================================================
+# ======================================================================
 
 with tab_race:
     st.markdown("### Modalità Gara · FIS (Neveitalia) → Tuning World Cup")
 
     @st.cache_resource
     def get_calendar_service() -> RaceCalendarService:
-        """
-        Service condiviso per caricare il calendario gare.
-        Usa Neveitalia come backend per la Coppa del Mondo FIS.
-        """
-
         def http_client_neve(url: str, params: dict | None) -> str:
-            r = requests.get(url, params=params or {}, timeout=15)
+            if params is None:
+                params = {}
+            r = requests.get(url, params=params, timeout=10)
             r.raise_for_status()
             return r.text
 
@@ -199,7 +195,7 @@ with tab_race:
     elif fed_label.startswith("FISI"):
         federation = Federation.FISI
     else:
-        federation = None  # entrambe
+        federation = None
 
     col3, col4 = st.columns(2)
     with col3:
@@ -211,7 +207,7 @@ with tab_race:
     if disc_label == "Tutte":
         discipline = None
     else:
-        discipline = disc_label  # es.: "SL", "GS", ...
+        discipline = disc_label
 
     with col4:
         region = st.text_input(
@@ -238,7 +234,7 @@ with tab_race:
         if not events:
             st.info(
                 "Nessuna gara trovata con questi filtri.\n\n"
-                "Per ora FIS è basato sul calendario di Neveitalia (WC maschile + femminile). "
+                "Per ora FIS è basato sul calendario di Neveitalia (CdM maschile+femminile). "
                 "FISI è ancora disattivato in attesa di una sorgente stabile."
             )
         else:
@@ -256,9 +252,7 @@ with tab_race:
                     skier_level=SkierLevel.WC,
                 )
                 if res is None:
-                    st.warning(
-                        "Questa gara non ha una disciplina riconosciuta (SL/GS/SG/DH)."
-                    )
+                    st.warning("Questa gara non ha una disciplina riconosciuta (SL/GS/SG/DH).")
                 else:
                     params, data = res
                     st.subheader("Tuning World Cup suggerito")
@@ -285,6 +279,7 @@ with tab_race:
 
                     if show_info:
                         st.markdown("#### Debug evento")
+                        st.json(params)
                         st.json(data)
     else:
         st.info("Imposta i filtri e premi **“Carica gare”** per vedere il calendario.")
