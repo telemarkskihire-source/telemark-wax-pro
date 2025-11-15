@@ -1,37 +1,38 @@
 # streamlit_app.py
 # Telemark · Pro Wax & Tune — modalità standard + modalità gara (FIS via Neveitalia)
 
-from __future__ import annotations
-
+import sys
 import os
 import importlib
 
-import requests
 import streamlit as st
+import requests
 
-# --- import dal core ---
+# --- hard-reload silenzioso del pacchetto core.* per evitare cache stale ---
+importlib.invalidate_caches()
+for name in list(sys.modules.keys()):
+    if name == "core" or name.startswith("core."):
+        del sys.modules[name]
+
+# --- import dal core (moduli esistenti) ---
 from core.i18n import L
 from core.search import location_searchbox
 
+# --- import moduli gara/tuning ---
 from core.race_events import (
     RaceCalendarService,
     FISCalendarProvider,
     FISICalendarProvider,
     Federation,
 )
-from core.race_tuning import SkierLevel
-from core.race_integration import get_wc_tuning_for_event
+from core.race_integration import SkierLevel, get_wc_tuning_for_event
 
-# ======================================================================
-# THEME
-# ======================================================================
-
+# ---------- THEME ----------
 st.set_page_config(
     page_title="Telemark · Pro Wax & Tune",
     page_icon="❄️",
     layout="wide",
 )
-
 st.markdown(
     """
 <style>
@@ -54,31 +55,25 @@ hr { border:none; border-top:1px solid var(--line); margin:.75rem 0 }
 
 st.title("Telemark · Pro Wax & Tune")
 
-# ======================================================================
-# LINGUA
-# ======================================================================
-
+# ---------- LINGUA ----------
 st.sidebar.markdown("### ⚙️")
-
 lang = st.sidebar.selectbox(
     L["it"]["lang"] + " / " + L["en"]["lang"],
     ["IT", "EN"],
     index=0,
 )
 T = L["it"] if lang == "IT" else L["en"]
-
 show_info = st.sidebar.toggle("Mostra info tecniche", value=False)
 
-# ======================================================================
-# TABS
-# ======================================================================
+# ============================================================
+# TABS: 1) Wax & Tune   2) Race / Gare
+# ============================================================
 
 tab_wax, tab_race = st.tabs(["🧊 Wax & Tune", "🏁 Race / Gare"])
 
-# ======================================================================
+# ============================================================
 # TAB 1 — WAX & TUNE
-# ======================================================================
-
+# ============================================================
 with tab_wax:
     st.markdown(f"### 1) {T['search_ph']}")
 
@@ -144,10 +139,9 @@ with tab_wax:
             unsafe_allow_html=True,
         )
 
-# ======================================================================
+# ============================================================
 # TAB 2 — RACE / GARE (FIS via Neveitalia → tuning WC)
-# ======================================================================
-
+# ============================================================
 with tab_race:
     st.markdown("### Modalità Gara · FIS (Neveitalia) → Tuning World Cup")
 
@@ -207,7 +201,7 @@ with tab_race:
     if disc_label == "Tutte":
         discipline = None
     else:
-        discipline = disc_label
+        discipline = disc_label  # stringa "SL"/"GS"/...
 
     with col4:
         region = st.text_input(
@@ -234,7 +228,7 @@ with tab_race:
         if not events:
             st.info(
                 "Nessuna gara trovata con questi filtri.\n\n"
-                "Per ora FIS è basato sul calendario di Neveitalia (CdM maschile+femminile). "
+                "Per ora FIS è basato sul calendario di Neveitalia (WC maschile + femminile). "
                 "FISI è ancora disattivato in attesa di una sorgente stabile."
             )
         else:
@@ -279,7 +273,6 @@ with tab_race:
 
                     if show_info:
                         st.markdown("#### Debug evento")
-                        st.json(params)
                         st.json(data)
     else:
         st.info("Imposta i filtri e premi **“Carica gare”** per vedere il calendario.")
