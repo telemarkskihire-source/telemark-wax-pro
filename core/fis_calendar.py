@@ -1,33 +1,16 @@
 # core/fis_calendar.py
-# Calendario FIS (World Cup) via proxy Telemark.
+# Calendario FIS tramite proxy Telemark (PHP)
 
 from __future__ import annotations
 
-import os
+import json
 from typing import List, Dict, Optional
 
 import requests
+import streamlit as st
 
 
-FIS_PROXY_URL = os.getenv(
-    "FIS_PROXY_URL",
-    "https://www.telemarkskihire.com/api/fis_proxy.php",
-)
-
-
-def _build_params(
-    season: int,
-    discipline: Optional[str],
-    gender: Optional[str],
-) -> dict:
-    params: dict = {}
-    if season:
-        params["season"] = int(season)
-    if discipline:
-        params["discipline"] = discipline
-    if gender:
-        params["gender"] = gender
-    return params
+PROXY_URL = "https://telemarkskihire.com/api/fis_proxy.php"
 
 
 def get_fis_calendar(
@@ -36,34 +19,78 @@ def get_fis_calendar(
     gender: Optional[str] = None,
 ) -> List[Dict]:
     """
-    Ritorna una lista di gare World Cup FIS.
+    Ritorna una lista di gare FIS (World Cup) usando il proxy PHP sul sito Telemark.
 
-    Ogni elemento:
-        {
-            "date":   "27-10-2024",
-            "place":  "Sölden",
-            "nation": "AUT",
-            "event":  "WC GS",
-            "gender": "M",
-        }
+    Ogni evento ha la forma:
+    {
+        "date": "2025-11-10",
+        "place": "Sölden",
+        "nation": "AUT",
+        "event": "GS",
+        "gender": "M" / "W" / None,
+    }
     """
-    params = _build_params(season, discipline, gender)
 
-    r = requests.get(FIS_PROXY_URL, params=params, timeout=20)
-    r.raise_for_status()
+    # Normalizziamo i parametri per il proxy
+    params = {
+        "season": str(season),
+        "discipline": discipline or "",
+        "gender": gender or "",
+    }
 
-    data = r.json()
-    if not data.get("ok"):
-        raise RuntimeError(f"Errore proxy FIS: {data}")
+    try:
+        r = requests.get(PROXY_URL, params=params, timeout=12)
+        r.raise_for_status()
+    except Exception as e:
+        st.error(f"Errore di rete verso il proxy FIS Telemark: {e}")
+        return []
 
-    events = data.get("events", [])
+    # --- PROTEZIONE contro risposte non-JSON (HTML, errori PHP, etc.) ---
+    raw = r.text.strip()
 
-    # Filtro di sicurezza lato client per stagione:
-    # se nel campo "date" compare l'anno richiesto lo teniamo,
-    # altrimenti teniamo tutto (fallback se formato data cambia).
-    season_str = str(season)
-    filtered = [ev for ev in events if season_str in str(ev.get("date", ""))]
-    if filtered:
-        events = filtered
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        # Qui sappiamo che il proxy non ha restituito JSON pulito
+        preview = raw[:400].replace("\n", " ")
+        st.error(
+            "Il proxy FIS su telemarkskihire.com non ha restituito JSON valido.\n\n"
+            f"Anteprima risposta:\n\n`{preview}`"
+        )
+        return []
 
-    return events
+    # Da qui in poi abbiamo JSON valido
+    if not isinstance(data, dict):
+        st.error("Risposta inattesa dal proxy FIS (non è un oggetto JSON).")
+        return []
+
+    if not data.get("ok", False):
+        # Il proxy stesso dice che qualcosa è andato storto (es. HTML rilevato)
+        msg = data.get("error") or "Errore sconosciuto dal proxy FIS."
+        api_url = data.get("api_url") or data.get("url_used")
+        debug = f"\n\n[Fonte: {api_url}]" if api_url else ""
+        st.warning(f"Proxy FIS: {msg}{debug}")
+        return []
+
+    events = data.get("events") or []
+    if not isinstance(events, list):
+        st.error("Formato 'events' inatteso dal proxy FIS.")
+        return []
+
+    # Normalizziamo i campi che usa l'app
+    norm_events: List[Dict] = []
+    for ev in events:
+        if not isinstance(ev, dict):
+            continue
+
+        norm_events.append(
+            {
+                "date": ev.get("date") or "",
+                "place": ev.get("place") or "",
+                "nation": ev.get("nation") or "",
+                "event": ev.get("event") or "",
+                "gender": ev.get("gender"),  # può essere None
+            }
+        )
+
+    return norm_events
