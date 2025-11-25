@@ -38,6 +38,7 @@ ALIASES = [
     },
 ]
 
+
 # ---------------- Utilità ----------------
 def flag(cc: str) -> str:
     try:
@@ -122,7 +123,7 @@ def _options_from_nominatim(js):
 
         cc = (addr.get("country_code") or "").upper()
         emoji = flag(cc)
-        label = f"{emoji}  {base}"   # SOLO testo, niente lat/lon
+        label = f"{emoji}  {base}"  # SOLO testo, nessuna lat/lon
 
         lat = float(it.get("lat", 0.0))
         lon = float(it.get("lon", 0.0))
@@ -222,7 +223,7 @@ def location_searchbox(T, iso2: str):
 
     selected_label = st_searchbox(
         provider,
-        key="place_v3",   # chiave nuova ⇒ no cache vecchia
+        key="place_v3",  # chiave nuova ⇒ no cache vecchia
         placeholder=T["search_ph"],
         clear_on_submit=False,
         default=default_label,
