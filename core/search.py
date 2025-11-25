@@ -1,12 +1,12 @@
 # core/search.py
-# Ricerca località: Nominatim + Open-Meteo, alias Telemark, nessuna lat/lon visibile
+# Modulo ricerca località: Nominatim + Open-Meteo (con filtro altitudine)
 
 import time
 import requests
 import streamlit as st
 from streamlit_searchbox import st_searchbox
 
-# ---------------- Paesi ----------------
+# ---------- Paesi (prefiltro) ----------
 COUNTRIES = {
     "Italia": "IT",
     "Svizzera": "CH",
@@ -20,7 +20,10 @@ COUNTRIES = {
 
 UA = {"User-Agent": "telemark-wax-pro/1.1"}
 
-# ---------------- Alias interni Telemark ----------------
+# qualunque cosa sotto questa quota viene scartata (solo per Open-Meteo)
+MIN_ELEVATION_M = 1000.0
+
+# ---------- Alias interni Telemark ----------
 ALIASES = [
     {
         "aliases": ["cham", "champo", "champol", "champolu", "champoluc"],
@@ -38,8 +41,7 @@ ALIASES = [
     },
 ]
 
-
-# ---------------- Utilità ----------------
+# ---------- Utilità ----------
 def flag(cc: str) -> str:
     try:
         c = cc.upper()
@@ -73,8 +75,8 @@ def _retry(func, attempts=3, sleep=0.5):
             time.sleep(sleep * (1.6 ** i))
 
 
-# ---------------- Data sources ----------------
-@st.cache_data(ttl=3600, show_spinner=False)
+# ---------- Data sources ----------
+@st.cache_data(ttl=60 * 60, show_spinner=False)
 def nominatim_search_api(q: str, iso2: str):
     r = _retry(
         lambda: requests.get(
@@ -82,7 +84,7 @@ def nominatim_search_api(q: str, iso2: str):
             params={
                 "q": q,
                 "format": "json",
-                "limit": 8,
+                "limit": 12,
                 "addressdetails": 1,
                 "countrycodes": iso2.lower() if iso2 else None,
             },
@@ -94,7 +96,7 @@ def nominatim_search_api(q: str, iso2: str):
     return r.json()
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@st.cache_data(ttl=60 * 60, show_spinner=False)
 def openmeteo_geocode_api(q: str, iso2: str):
     r = _retry(
         lambda: requests.get(
@@ -102,7 +104,7 @@ def openmeteo_geocode_api(q: str, iso2: str):
             params={
                 "name": q,
                 "language": "it",
-                "count": 8,
+                "count": 10,
                 "format": "json",
                 "filter": "country",
                 "country": iso2.upper() if iso2 else None,
@@ -123,18 +125,38 @@ def _options_from_nominatim(js):
 
         cc = (addr.get("country_code") or "").upper()
         emoji = flag(cc)
-        label = f"{emoji}  {base}"  # SOLO testo, nessuna lat/lon
+        label = f"{emoji}  {base}"
 
         lat = float(it.get("lat", 0.0))
         lon = float(it.get("lon", 0.0))
 
-        out.append({"label": label, "lat": lat, "lon": lon, "source": "osm"})
+        out.append(
+            {
+                "label": label,
+                "lat": lat,
+                "lon": lon,
+                "source": "osm",
+            }
+        )
     return out
 
 
 def _options_from_openmeteo(js):
+    """
+    Converte la risposta Open-Meteo in opzioni UI, scartando
+    i risultati con elevation < MIN_ELEVATION_M (se presente).
+    """
     out = []
     for it in (js or {}).get("results", []) or []:
+        elev = it.get("elevation")
+        if elev is not None:
+            try:
+                if float(elev) < MIN_ELEVATION_M:
+                    # sotto quota minima: ignora (niente pianura)
+                    continue
+            except Exception:
+                pass  # se elevation è strana, non filtriamo
+
         cc = (it.get("country_code") or "").upper()
         name = it.get("name") or ""
         admin1 = it.get("admin1") or it.get("admin2") or ""
@@ -145,8 +167,27 @@ def _options_from_openmeteo(js):
         lat = float(it.get("latitude", 0.0))
         lon = float(it.get("longitude", 0.0))
 
-        out.append({"label": label, "lat": lat, "lon": lon, "source": "om"})
+        out.append(
+            {
+                "label": label,
+                "lat": lat,
+                "lon": lon,
+                "source": "om",
+                "elevation": elev,
+            }
+        )
     return out
+
+
+# ---------- UI helpers ----------
+def country_selectbox(T):
+    sel = st.selectbox(
+        T["country"],
+        list(COUNTRIES.keys()),
+        index=0,
+        key="country_sel",
+    )
+    return COUNTRIES[sel]
 
 
 def _alias_match(query: str):
@@ -167,42 +208,36 @@ def _alias_match(query: str):
     return None
 
 
-# ---------------- UI helpers pubblici ----------------
-def country_selectbox(T):
-    sel = st.selectbox(T["country"], list(COUNTRIES.keys()), index=0, key="country_sel")
-    return COUNTRIES[sel]
-
-
-def location_searchbox(T, iso2: str):
+def location_searchbox(T, iso2=None):
     """
-    Mostra lo searchbox e aggiorna st.session_state:
-      - lat, lon
-      - place_label, place_source
-    Ritorna il dict selezionato o None.
+    Renderizza lo searchbox e salva la selezione in st.session_state:
+    keys: lat, lon, place_label, place_source
+    Ritorna il dict della selezione (o None).
     """
-    st.session_state.setdefault("_search_options_v3", {})
+    st.session_state.setdefault("_search_options", {})
 
     def provider(query: str):
         query = (query or "").strip()
         if len(query) < 2:
             return []
 
-        # 0) alias interni (Champoluc, Zermatt)
+        # 0) Alias Telemark (champo, champol, champoluc, zermatt, ecc.)
         alias_hit = _alias_match(query)
         if alias_hit is not None:
             label = alias_hit["label"]
-            st.session_state["_search_options_v3"] = {label: alias_hit}
+            st.session_state["_search_options"] = {label: alias_hit}
             return [label]
 
-        # 1) Nominatim + 2) OpenMeteo
+        # 1) Nominatim
         try:
-            js1 = nominatim_search_api(query, iso2)
+            js1 = nominatim_search_api(query, iso2 or "")
             opts1 = _options_from_nominatim(js1)
         except Exception:
             opts1 = []
 
+        # 2) Open-Meteo (con filtro altitudine)
         try:
-            js2 = openmeteo_geocode_api(query, iso2)
+            js2 = openmeteo_geocode_api(query, iso2 or "")
             opts2 = _options_from_openmeteo(js2)
         except Exception:
             opts2 = []
@@ -216,28 +251,28 @@ def location_searchbox(T, iso2: str):
             seen_labels.add(lbl)
             merged.append(src)
 
-        st.session_state["_search_options_v3"] = {it["label"]: it for it in merged}
+        st.session_state["_search_options"] = {it["label"]: it for it in merged}
         return [it["label"] for it in merged]
 
     default_label = st.session_state.get("place_label")
 
     selected_label = st_searchbox(
         provider,
-        key="place_v3",  # chiave nuova ⇒ no cache vecchia
+        key="place",
         placeholder=T["search_ph"],
         clear_on_submit=False,
         default=default_label,
     )
 
-    if selected_label and selected_label in st.session_state["_search_options_v3"]:
-        info = st.session_state["_search_options_v3"][selected_label]
+    if selected_label and selected_label in st.session_state["_search_options"]:
+        info = st.session_state["_search_options"][selected_label]
         st.session_state["lat"] = info["lat"]
         st.session_state["lon"] = info["lon"]
         st.session_state["place_label"] = selected_label
         st.session_state["place_source"] = info["source"]
         return info
 
-    # default Champoluc se è la primissima volta
+    # default (Champoluc) la prima volta
     if "lat" not in st.session_state:
         st.session_state["lat"] = 45.83333
         st.session_state["lon"] = 7.73333
