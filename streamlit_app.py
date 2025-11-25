@@ -5,6 +5,7 @@ import streamlit as st
 
 from core.i18n import L
 from core.search import country_selectbox, location_searchbox, get_current_selection
+from core.maps import render_map
 
 # ---------------- CONFIG & STILE ----------------
 PRIMARY = "#06b6d4"
@@ -66,6 +67,16 @@ if current:
         unsafe_allow_html=True,
     )
 
-# Qui sotto in futuro:
-# - core.maps  → mappa interattiva, pendenza, ombreggiatura
-# - core.tuning → sciolina, setup, grafici
+# ---------------- MAPPA & PISTE ----------------
+ctx = {
+    "lang": lang,
+    "lat": current["lat"] if current else 45.83333,
+    "lon": current["lon"] if current else 7.73333,
+    "place_label": current["label"] if current else "🇮🇹  Champoluc-Champlan, Valle d’Aosta — IT",
+}
+
+render_map(T, ctx)
+
+# In seguito qui aggiungeremo:
+# - modulo pendenza/ombreggiatura (separato, usando ctx e piste selezionata)
+# - modulo tuning / sciolina / grafici
