@@ -1,54 +1,54 @@
 # streamlit_app.py
-# Telemark · Pro Wax & Tune — versione stabile modulare
+# Telemark · Pro Wax & Tune — versione diagnostica (località + mappa piste)
 
 import streamlit as st
 
-from core.i18n import L
+# importa moduli core
+import core.search as search_mod
 from core.search import country_selectbox, location_searchbox, get_current_selection
+from core.i18n import L
 from core.maps import render_map
 
-# ---------------- CONFIG ----------------
+# ---------------------- PAGE CONFIG ----------------------
 st.set_page_config(
     page_title="Telemark · Pro Wax & Tune",
     page_icon="❄️",
     layout="wide",
 )
 
-# ---------------- STILE ----------------
+# CSS molto semplice (dark)
 st.markdown(
     """
-<style>
-html, body, .stApp {
-  background:#0b0f13;
-  color:#e5e7eb;
-}
-[data-testid="stHeader"] {
-  background:transparent;
-}
-section.main > div {
-  padding-top: 0.6rem;
-}
-
-.card {
-  background:#121821;
-  border-radius:12px;
-  border:1px solid #1f2937;
-  padding: .9rem .95rem;
-  margin-bottom: 1rem;
-}
-
-.small {
-  font-size:.85rem;
-  color:#9ca3af;
-}
-</style>
-""",
+    <style>
+    html, body, .stApp {
+      background-color: #05070b;
+      color: #e5e7eb;
+    }
+    [data-testid="stHeader"] {
+      background: transparent;
+    }
+    h1, h2, h3 {
+      color: #ffffff;
+    }
+    .card {
+      background: #111827;
+      border-radius: 12px;
+      padding: 0.75rem 0.9rem;
+      border: 1px solid #1f2933;
+    }
+    </style>
+    """,
     unsafe_allow_html=True,
 )
 
-# ---------------- LINGUA ----------------
-st.sidebar.markdown("### ⚙️")
+# ---------------------- DEBUG MODULO SEARCH ----------------------
+st.sidebar.markdown("### Debug")
+st.sidebar.write("Modulo search path:")
+st.sidebar.code(getattr(search_mod, "__file__", "??"), language="text")
+st.sidebar.write("Search.VERSION:")
+st.sidebar.code(getattr(search_mod, "VERSION", "NO VERSION"), language="text")
 
+# ---------------------- LINGUA ----------------------
 lang = st.sidebar.selectbox(
     L["it"]["lang"] + " / " + L["en"]["lang"],
     ["IT", "EN"],
@@ -57,36 +57,32 @@ lang = st.sidebar.selectbox(
 
 T = L["it"] if lang == "IT" else L["en"]
 
-# ---------------- TITOLO ----------------
 st.title("Telemark · Pro Wax & Tune")
 
-# ---------------- LOCALITÀ ----------------
-st.markdown("#### 🌍 Località")
+# ---------------------- 1) SELEZIONE PAESE ----------------------
+st.markdown("### 🌍 Località")
 
 iso2 = country_selectbox(T)
-location_searchbox(T, iso2=iso2)
 
-current = get_current_selection()
+# ---------------------- 2) SEARCH LOCALITÀ ----------------------
+selection = location_searchbox(T, iso2=iso2)
 
-if current:
+curr = get_current_selection() or selection
+
+if curr:
     st.markdown(
-        f"""
-        <div class="card">
-          <div class="small">{T.get("selected_place", "Località selezionata")}</div>
-          <strong>{current['label']}</strong>
-        </div>
-        """,
-        unsafe_allow_html=True,
+        f"**Località selezionata**: {curr['label']}  "
+        f"(lat={curr['lat']:.5f}, lon={curr['lon']:.5f})"
     )
+else:
+    st.info("Seleziona una località per continuare.")
 
-# ---------------- MAPPA & PISTE ----------------
-ctx = {
-    "lang": lang,
-    "lat": current["lat"] if current else 45.83333,
-    "lon": current["lon"] if current else 7.73333,
-    "place_label": current["label"]
-    if current
-    else "🇮🇹  Champoluc-Champlan, Valle d’Aosta — IT",
-}
-
-render_map(T, ctx)
+# ---------------------- 3) MAPPA & PISTE ----------------------
+if curr:
+    ctx = {
+        "lang": lang,
+        "lat": curr["lat"],
+        "lon": curr["lon"],
+        "place_label": curr["label"],
+    }
+    render_map(T, ctx)
