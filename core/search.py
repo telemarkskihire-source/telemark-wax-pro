@@ -1,3 +1,4 @@
+st.error("✅ NUOVO SEARCH.PY CARICATO")
 # core/search.py
 # Ricerca località: Open-Meteo (quota > 1000 m) + alias Telemark
 
