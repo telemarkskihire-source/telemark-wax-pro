@@ -1,5 +1,5 @@
 # core/search.py
-# Ricerca località: Open-Meteo (con filtro altitudine) + alias Telemark
+# Ricerca località: Open-Meteo (quota > 1000 m) + alias Telemark
 
 import time
 import requests
@@ -91,18 +91,25 @@ def openmeteo_geocode_api(q: str, iso2: str | None):
 def _options_from_openmeteo(js):
     """
     Converte la risposta Open-Meteo in opzioni UI, scartando
-    i risultati con elevation < MIN_ELEVATION_M (se presente).
+    i risultati con elevation < MIN_ELEVATION_M **o senza elevation**.
     """
     out = []
     for it in (js or {}).get("results", []) or []:
         elev = it.get("elevation")
-        if elev is not None:
+
+        # Se non c'è elevation ⇒ la trattiamo come "bassa quota" e la scartiamo.
+        drop = False
+        if elev is None:
+            drop = True
+        else:
             try:
                 if float(elev) < MIN_ELEVATION_M:
-                    # sotto quota minima: ignoriamo (niente pianura / città basse)
-                    continue
+                    drop = True
             except Exception:
-                pass  # se elevation è strana, non filtriamo
+                drop = True
+
+        if drop:
+            continue
 
         cc = (it.get("country_code") or "").upper()
         name = it.get("name") or ""
