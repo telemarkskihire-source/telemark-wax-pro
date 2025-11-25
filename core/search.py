@@ -20,19 +20,17 @@ COUNTRIES = {
 
 UA = {"User-Agent": "telemark-wax-pro/1.1"}
 
-
 # ---------- Alias interni Telemark ----------
-# Per nomi scritti a metà o abbreviati (champo, champol, ecc.)
 ALIASES = [
     {
-        "aliases": ["champo", "champol", "champolu", "champoluc"],
+        "aliases": ["cham", "champo", "champol", "champolu", "champoluc"],
         "label": "🇮🇹  Champoluc-Champlan, Valle d’Aosta — IT",
         "lat": 45.83333,
         "lon": 7.73333,
         "source": "alias",
     },
     {
-        "aliases": ["zermat", "zermatt"],
+        "aliases": ["zerm", "zermat", "zermatt"],
         "label": "🇨🇭  Zermatt, Vallese — CH",
         "lat": 46.02072,
         "lon": 7.74912,
@@ -40,10 +38,8 @@ ALIASES = [
     },
 ]
 
-
 # ---------- Utilità ----------
 def flag(cc: str) -> str:
-    """Trasforma codice paese ISO2 in emoji bandiera."""
     try:
         c = cc.upper()
         return chr(127397 + ord(c[0])) + chr(127397 + ord(c[1]))
@@ -52,10 +48,6 @@ def flag(cc: str) -> str:
 
 
 def concise_label(addr: dict, fallback: str) -> str:
-    """
-    Crea una label compatta:
-    es. 'Zermatt, Vallese — CH'
-    """
     name = (
         addr.get("neighbourhood")
         or addr.get("hamlet")
@@ -103,7 +95,6 @@ def nominatim_search_api(q: str, iso2: str):
 
 @st.cache_data(ttl=60 * 60, show_spinner=False)
 def openmeteo_geocode_api(q: str, iso2: str):
-    # Fallback molto veloce e con toponimi alpini
     r = _retry(
         lambda: requests.get(
             "https://geocoding-api.open-meteo.com/v1/search",
@@ -138,7 +129,7 @@ def _options_from_nominatim(js):
 
         out.append(
             {
-                "label": label,  # TESTO CHE L'UTENTE VEDE
+                "label": label,
                 "lat": lat,
                 "lon": lon,
                 "source": "osm",
@@ -162,7 +153,7 @@ def _options_from_openmeteo(js):
 
         out.append(
             {
-                "label": label,  # TESTO CHE L'UTENTE VEDE
+                "label": label,
                 "lat": lat,
                 "lon": lon,
                 "source": "om",
@@ -189,8 +180,9 @@ def _alias_match(query: str):
 
     for place in ALIASES:
         for alias in place["aliases"]:
-            if q.startswith(alias):
-                # ritorniamo una copia con label già pronta
+            a = alias.lower()
+            # match se: inizia con, contiene o è contenuto
+            if q.startswith(a) or a.startswith(q) or a in q:
                 return {
                     "label": place["label"],
                     "lat": place["lat"],
@@ -201,12 +193,6 @@ def _alias_match(query: str):
 
 
 def location_searchbox(T, iso2):
-    """
-    Renderizza lo searchbox e salva la selezione in st.session_state:
-    keys: lat, lon, place_label, place_source
-    Ritorna il dict della selezione (o None).
-    """
-    # Mappa: label (stringa mostrata) -> info completa
     st.session_state.setdefault("_search_options", {})
 
     def provider(query: str):
@@ -214,7 +200,7 @@ def location_searchbox(T, iso2):
         if len(query) < 2:
             return []
 
-        # 0) Alias Telemark (champo, champol, zermat, ecc.)
+        # 0) Alias Telemark (champo, champol, champoluc, zermatt, ecc.)
         alias_hit = _alias_match(query)
         if alias_hit is not None:
             label = alias_hit["label"]
@@ -235,7 +221,6 @@ def location_searchbox(T, iso2):
         except Exception:
             opts2 = []
 
-        # merge evitando duplicati per LABEL (così niente 5 volte Zermatt)
         merged = []
         seen_labels = set()
         for src in (opts1 + opts2):
@@ -245,13 +230,9 @@ def location_searchbox(T, iso2):
             seen_labels.add(lbl)
             merged.append(src)
 
-        # mappa label -> oggetto
         st.session_state["_search_options"] = {it["label"]: it for it in merged}
-
-        # valori mostrati nella tendina (SOLO label umana)
         return [it["label"] for it in merged]
 
-    # default = ultima località scelta (se esiste)
     default_label = st.session_state.get("place_label")
 
     selected_label = st_searchbox(
@@ -262,7 +243,6 @@ def location_searchbox(T, iso2):
         default=default_label,
     )
 
-    # Se l'utente ha scelto una voce valida
     if selected_label and selected_label in st.session_state["_search_options"]:
         info = st.session_state["_search_options"][selected_label]
         st.session_state["lat"] = info["lat"]
@@ -271,7 +251,6 @@ def location_searchbox(T, iso2):
         st.session_state["place_source"] = info["source"]
         return info
 
-    # Default (Champoluc) la prima volta
     if "lat" not in st.session_state:
         st.session_state["lat"] = 45.83333
         st.session_state["lon"] = 7.73333
@@ -286,7 +265,6 @@ def location_searchbox(T, iso2):
             "source": st.session_state["place_source"],
         }
 
-    # Nessuna selezione nuova, lasciamo quella esistente
     return None
 
 
