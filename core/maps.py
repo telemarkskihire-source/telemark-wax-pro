@@ -19,7 +19,7 @@ except Exception:
     HAS_FOLIUM = False
 
 UA = {
-    "User-Agent": "telemark-wax-pro/1.0 (+https://telemarkskihire.com)",
+    "User-Agent": "telemark-wax-pro/1.1 (+https://telemarkskihire.com)",
     "Accept": "application/json",
 }
 
@@ -29,7 +29,10 @@ OVERPASS_URLS = [
     "https://overpass.kumi.systems/api/interpreter",
 ]
 
-MAX_RADIUS_KM = 10  # raggio comprensorio
+# raggio base e raggio di fallback
+BASE_RADIUS_KM = 10
+FALLBACK_RADIUS_KM = 25
+
 
 # ---------- Helper geografici ----------
 
@@ -41,6 +44,7 @@ def _haversine(lat1, lon1, lat2, lon2) -> float:
     a = math.sin(dphi / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
     return 2 * R * math.asin(math.sqrt(a))
 
+
 def _line_length_km(coords: List[Dict[str, float]]) -> float:
     if not coords or len(coords) < 2:
         return 0.0
@@ -50,38 +54,51 @@ def _line_length_km(coords: List[Dict[str, float]]) -> float:
         total += _haversine(p0["lat"], p0["lon"], p1["lat"], p1["lon"])
     return total
 
+
 def _point_distance_km(lat1, lon1, lat2, lon2) -> float:
     return _haversine(lat1, lon1, lat2, lon2)
+
 
 # ---------- Fetch piste da Overpass ----------
 
 def _overpass_query(lat: float, lon: float, dist_km: int) -> List[Dict[str, Any]]:
+    """
+    Esegue una query Overpass e restituisce elements.
+    Se Overpass risponde con un 'remark' (rate limit, errore),
+    solleva RuntimeError.
+    """
     radius_m = int(dist_km * 1000)
+
+    # query semplice ma robusta: solo oggetti con 'piste:type'
     query = f"""
     [out:json][timeout:25];
     (
       way(around:{radius_m},{lat},{lon})["piste:type"];
       relation(around:{radius_m},{lat},{lon})["piste:type"];
-      way(around:{radius_m},{lat},{lon})["piste:difficulty"];
-      relation(around:{radius_m},{lat},{lon})["route"="piste"];
     );
     out tags geom center;
     """
+
     last_exc = None
     for url in OVERPASS_URLS:
         try:
             r = requests.post(url, data=query.encode("utf-8"), headers=UA, timeout=35)
             r.raise_for_status()
-            return (r.json() or {}).get("elements", []) or []
+            js = r.json() or {}
+            # se Overpass dà un "remark", è un errore logico (limite, sintassi, ecc.)
+            if "remark" in js:
+                raise RuntimeError(f"Overpass remark: {js.get('remark')}")
+            return js.get("elements", []) or []
         except Exception as e:
             last_exc = e
-    # se tutti gli endpoint falliscono, rilanciamo l'ultima eccezione
+
     if last_exc:
         raise last_exc
     return []
 
+
 @st.cache_data(ttl=3600, show_spinner=False)
-def fetch_pistes(lat: float, lon: float, dist_km: int = MAX_RADIUS_KM) -> List[Dict[str, Any]]:
+def fetch_pistes(lat: float, lon: float, dist_km: int) -> List[Dict[str, Any]]:
     """
     Restituisce una lista di piste nel raggio dist_km:
     [
@@ -103,6 +120,7 @@ def fetch_pistes(lat: float, lon: float, dist_km: int = MAX_RADIUS_KM) -> List[D
     pistes: List[Dict[str, Any]] = []
     for el in elements:
         tags = el.get("tags", {}) or {}
+
         # Filtra solo cose che sembrano piste
         if (
             "piste:type" not in tags
@@ -143,6 +161,7 @@ def fetch_pistes(lat: float, lon: float, dist_km: int = MAX_RADIUS_KM) -> List[D
     pistes.sort(key=lambda p: (p["name"] or "zzzz", p["length_km"]))
     return pistes
 
+
 # ---------- Label & difficulty ----------
 
 def _difficulty_label(diff: str, lang: str) -> str:
@@ -158,12 +177,14 @@ def _difficulty_label(diff: str, lang: str) -> str:
         return it.get(diff, diff)
     return diff
 
+
 def _piste_option_label(p: Dict[str, Any], lang: str) -> str:
     name = p["name"] or f"Pista {p['id']}"
     diff = _difficulty_label(p["difficulty"], lang)
     diff_part = f" · {diff}" if diff else ""
     len_part = f" · {p['length_km']:.1f} km" if p["length_km"] > 0 else ""
     return f"{name}{diff_part}{len_part}"
+
 
 # ---------- Render principale ----------
 
@@ -185,10 +206,23 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]):
     )
 
     pistes: List[Dict[str, Any]] = []
+    selected_piste = None
+    selected_id = st.session_state.get("selected_piste_id")
+
     if show_pistes:
         try:
-            with st.spinner("Carico le piste da OpenStreetMap / Overpass…"):
-                pistes = fetch_pistes(lat, lon, dist_km=MAX_RADIUS_KM)
+            with st.spinner(
+                f"Carico le piste (raggio {BASE_RADIUS_KM} km) da OpenStreetMap / Overpass…"
+            ):
+                pistes = fetch_pistes(lat, lon, dist_km=BASE_RADIUS_KM)
+
+            # se non trova nulla, riprova con raggio più ampio
+            if not pistes:
+                with st.spinner(
+                    f"Nessuna pista nel raggio {BASE_RADIUS_KM} km, riprovo con {FALLBACK_RADIUS_KM} km…"
+                ):
+                    pistes = fetch_pistes(lat, lon, dist_km=FALLBACK_RADIUS_KM)
+
         except requests.exceptions.Timeout:
             st.error("Errore caricando le piste (OSM/Overpass): timeout del servizio.")
         except requests.exceptions.HTTPError as e:
@@ -198,11 +232,10 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]):
 
     if show_pistes and not pistes:
         st.info("Nessuna pista trovata in questo comprensorio (OSM/Overpass).")
+    elif not show_pistes:
+        st.info("Attiva 'Mostra piste sulla mappa' per vedere il comprensorio.")
 
     # ----------- Ricerca / select pista -----------
-
-    selected_piste = None
-    selected_id = st.session_state.get("selected_piste_id")
 
     if pistes:
         search_txt = st.text_input(
@@ -225,7 +258,6 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]):
         options = [_piste_option_label(p, lang) for p in filtered]
         label_to_piste = { _piste_option_label(p, lang): p for p in filtered }
 
-        # default: se abbiamo una pista già selezionata, posizioniamo l'indice su quella
         default_index = 0
         if selected_id is not None:
             for i, p in enumerate(filtered):
@@ -233,12 +265,16 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]):
                     default_index = i
                     break
 
-        chosen_label = st.selectbox(
-            "Seleziona pista",
-            options=options,
-            index=default_index if options else 0,
-            key="piste_select",
-        ) if options else None
+        chosen_label = (
+            st.selectbox(
+                "Seleziona pista",
+                options=options,
+                index=default_index if options else 0,
+                key="piste_select",
+            )
+            if options
+            else None
+        )
 
         if chosen_label:
             selected_piste = label_to_piste.get(chosen_label)
@@ -248,7 +284,10 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]):
 
                 ctx_lat = float(selected_piste["center_lat"])
                 ctx_lon = float(selected_piste["center_lon"])
-                ctx_label = f"{place_label.split('—')[0].strip()} · {selected_piste['name'] or 'pista'}"
+                ctx_label = (
+                    f"{place_label.split('—')[0].strip()} · "
+                    f"{selected_piste['name'] or 'pista'}"
+                )
 
                 ctx["lat"] = ctx_lat
                 ctx["lon"] = ctx_lon
@@ -314,7 +353,6 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]):
                 tooltip=popup_txt,
             ).add_to(m)
 
-    # mostra mappa + click → selezione pista più vicina
     out = st_folium(
         m,
         height=420,
@@ -328,7 +366,6 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]):
         c_lat = float(click.get("lat"))
         c_lon = float(click.get("lng"))
 
-        # trova la pista col punto più vicino al click
         best_p = None
         best_d = 9999.0
         for p in pistes:
@@ -340,10 +377,12 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]):
 
         if best_p and best_p["id"] != st.session_state.get("selected_piste_id"):
             st.session_state["selected_piste_id"] = best_p["id"]
-            # aggiorna anche ctx e centri per meteo/DEM
             ctx_lat = float(best_p["center_lat"])
             ctx_lon = float(best_p["center_lon"])
-            ctx_label = f"{place_label.split('—')[0].strip()} · {best_p['name'] or 'pista'}"
+            ctx_label = (
+                f"{place_label.split('—')[0].strip()} · "
+                f"{best_p['name'] or 'pista'}"
+            )
             ctx["lat"] = ctx_lat
             ctx["lon"] = ctx_lon
             ctx["place_label"] = ctx_label
