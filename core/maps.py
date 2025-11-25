@@ -1,5 +1,6 @@
 # core/maps.py
 # Mappa & piste (OSM / Overpass) per Telemark · Pro Wax & Tune
+# Versione completa, nessuna patch
 
 from __future__ import annotations
 
@@ -9,6 +10,7 @@ from typing import List, Dict, Any
 import requests
 import streamlit as st
 
+# Folium opzionale (l'app gira anche senza)
 HAS_FOLIUM = False
 try:
     from streamlit_folium import st_folium
@@ -18,19 +20,22 @@ except Exception:
     HAS_FOLIUM = False
 
 UA = {
-    "User-Agent": "telemark-wax-pro/1.1 (+https://telemarkskihire.com)",
+    "User-Agent": "telemark-wax-pro/1.2 (+https://telemarkskihire.com)",
     "Accept": "application/json",
 }
 
+# Endpoints Overpass (primario + fallback)
 OVERPASS_URLS = [
     "https://overpass-api.de/api/interpreter",
     "https://overpass.kumi.systems/api/interpreter",
 ]
 
+# Raggio base e raggio di fallback
 BASE_RADIUS_KM = 10
 FALLBACK_RADIUS_KM = 25
 
 # ---------- Helper geografici ----------
+
 def _haversine(lat1, lon1, lat2, lon2) -> float:
     R = 6371.0
     p1, p2 = math.radians(lat1), math.radians(lat2)
@@ -54,10 +59,16 @@ def _point_distance_km(lat1, lon1, lat2, lon2) -> float:
     return _haversine(lat1, lon1, lat2, lon2)
 
 
-# ---------- Overpass ----------
+# ---------- Overpass: fetch piste ----------
+
 def _overpass_query(lat: float, lon: float, dist_km: int) -> List[Dict[str, Any]]:
     """
-    Query Overpass standard per piste da sci.
+    Query Overpass "larga" per le piste da sci.
+
+    Prende:
+      - way/rel con 'piste:type=*'
+      - way/rel con 'sport=skiing'
+      - way/rel con 'route=ski'
     """
     radius_m = int(dist_km * 1000)
 
@@ -65,7 +76,12 @@ def _overpass_query(lat: float, lon: float, dist_km: int) -> List[Dict[str, Any]
     [out:json][timeout:25];
     (
       way(around:{radius_m},{lat},{lon})["piste:type"];
+      way(around:{radius_m},{lat},{lon})["sport"="skiing"];
+      way(around:{radius_m},{lat},{lon})["route"="ski"];
+
       relation(around:{radius_m},{lat},{lon})["piste:type"];
+      relation(around:{radius_m},{lat},{lon})["sport"="skiing"];
+      relation(around:{radius_m},{lat},{lon})["route"="ski"];
     );
     out tags geom center;
     """
@@ -90,14 +106,33 @@ def _overpass_query(lat: float, lon: float, dist_km: int) -> List[Dict[str, Any]
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_pistes(lat: float, lon: float, dist_km: int) -> List[Dict[str, Any]]:
     """
-    Restituisce una lista di piste nel raggio dist_km.
+    Restituisce una lista di piste nel raggio dist_km:
+    [
+      {
+        "id": 123,
+        "osm_type": "way" | "relation",
+        "name": "Pista ...",
+        "difficulty": "red",
+        "length_km": 1.8,
+        "center_lat": ...,
+        "center_lon": ...,
+        "coords": [ {"lat":..,"lon":..}, ... ]
+      },
+      ...
+    ]
     """
     elements = _overpass_query(lat, lon, dist_km)
 
     pistes: List[Dict[str, Any]] = []
     for el in elements:
         tags = el.get("tags", {}) or {}
-        if "piste:type" not in tags:
+
+        # qualcosa che assomiglia a una pista
+        if not (
+            "piste:type" in tags
+            or tags.get("sport") == "skiing"
+            or tags.get("route") == "ski"
+        ):
             continue
 
         name = tags.get("name") or tags.get("piste:name") or tags.get("ref") or ""
@@ -133,7 +168,8 @@ def fetch_pistes(lat: float, lon: float, dist_km: int) -> List[Dict[str, Any]]:
     return pistes
 
 
-# ---------- UI helpers ----------
+# ---------- Label & difficulty ----------
+
 def _difficulty_label(diff: str, lang: str) -> str:
     if not diff:
         return ""
@@ -157,7 +193,12 @@ def _piste_option_label(p: Dict[str, Any], lang: str) -> str:
 
 
 # ---------- Render principale ----------
+
 def render_map(T: Dict[str, str], ctx: Dict[str, Any]):
+    """
+    Pannello 'Mappa & piste'.
+    Usa ctx["lat"], ctx["lon"], ctx["place_label"] come riferimento.
+    """
     lang = ctx.get("lang", "IT")
     lat = float(ctx.get("lat", 45.831))
     lon = float(ctx.get("lon", 7.730))
@@ -174,6 +215,7 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]):
     pistes: List[Dict[str, Any]] = []
     selected_id = st.session_state.get("selected_piste_id")
 
+    # --------- Fetch piste ---------
     if show_pistes:
         try:
             with st.spinner(
@@ -198,7 +240,7 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]):
     elif not show_pistes:
         st.info("Attiva 'Mostra piste sulla mappa' per vedere il comprensorio.")
 
-    # ----- Select pista -----
+    # --------- Ricerca / select pista ---------
     selected_piste = None
     if pistes:
         search_txt = st.text_input(
@@ -260,7 +302,7 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]):
                 st.session_state["lon"] = ctx_lon
                 st.session_state["place_label"] = ctx_label
 
-    # ----- Mappa -----
+    # --------- Mappa Leaflet / Folium ---------
     if not HAS_FOLIUM:
         st.info("Modulo mappa avanzata richiede 'folium' e 'streamlit-folium' installati.")
         return
@@ -284,12 +326,14 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]):
         control=True,
     ).add_to(m)
 
+    # marker località
     folium.Marker(
         [map_lat, map_lon],
         tooltip=ctx.get("place_label", place_label),
         icon=folium.Icon(color="lightgray", icon="info-sign"),
     ).add_to(m)
 
+    # disegna piste
     if pistes:
         for p in pistes:
             coords = [(c["lat"], c["lon"]) for c in p["coords"]]
@@ -313,6 +357,7 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]):
                 tooltip=popup_txt,
             ).add_to(m)
 
+    # click → seleziona la pista più vicina
     out = st_folium(
         m,
         height=420,
