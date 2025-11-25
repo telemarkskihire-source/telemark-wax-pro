@@ -70,10 +70,13 @@ selection = location_searchbox(T, iso2=iso2)
 curr = get_current_selection() or selection
 
 if curr:
+    # --- Riepilogo località selezionata (senza lat/lon) ---
+sel = get_current_selection()
+if sel:
     st.markdown(
-        f"**Località selezionata**: {curr['label']}  "
-        f"(lat={curr['lat']:.5f}, lon={curr['lon']:.5f})"
+        f"**Località selezionata:** {sel['label']}"
     )
+    st.write("")  # piccolo spazio
 else:
     st.info("Seleziona una località per continuare.")
 
