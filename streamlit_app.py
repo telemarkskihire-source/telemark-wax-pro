@@ -1,6 +1,15 @@
 # streamlit_app.py
 # Telemark · Pro Wax & Tune — main modulare
 
+import sys
+import importlib
+
+# --- forza refresh moduli core.* per evitare vecchia cache ---
+importlib.invalidate_caches()
+for name in list(sys.modules.keys()):
+    if name == "core" or name.startswith("core."):
+        del sys.modules[name]
+
 import streamlit as st
 
 from core.i18n import L
@@ -78,5 +87,5 @@ ctx = {
 render_map(T, ctx)
 
 # In seguito qui aggiungeremo:
-# - modulo pendenza/ombreggiatura (separato, usando ctx e piste selezionata)
+# - modulo pendenza/ombreggiatura (usando ctx e pista selezionata)
 # - modulo tuning / sciolina / grafici
