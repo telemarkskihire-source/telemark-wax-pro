@@ -1,33 +1,13 @@
 # core/i18n.py
-# Testi e traduzioni per Telemark · Pro Wax & Tune
 
 L = {
     "it": {
-        # --- meta / app ---
-        "app_title": "Telemark · Pro Wax & Tune",
-        "lang": "Lingua",
-        "unit": "Unità",
-        "unit_c": "°C / m/s",
-        "unit_f": "°F / km/h",
-
-        # --- ricerca località ---
-        "search_title": "1) Cerca località / stazione",
-        "search_ph": "Cerca… es. Champoluc, Plateau Rosa",
+        # --- blocco ricerca località ---
+        "search_title": "1) Cerca… es. Champoluc, Plateau Rosa",
         "country": "Nazione (prefiltro ricerca)",
+        "search_ph": "Cerca… es. Champoluc, Plateau Rosa",
 
-        # --- calibrazione / offset ---
-        "offset": "Calibrazione pista (offset termico °C)",
-
-        # --- mappa / DEM ---
-        "map": "Mappa (selezione)",
-        "dem_hdr": "Esposizione & pendenza (DEM locale)",
-        "slope_deg": "Pendenza (°)",
-        "slope_pct": "Pendenza (%)",
-        "aspect_deg": "Esposizione (° da N)",
-        "aspect_dir": "Esposizione (bussola)",
-        "dem_err": "DEM non disponibile ora. Riprova tra poco.",
-
-        # --- meteo & finestre ---
+        # --- parametri principali ---
         "ref_day": "Giorno di riferimento",
         "alt_lbl": "Altitudine pista/garà (m)",
         "blocks": "1) Finestre orarie A · B · C",
@@ -36,16 +16,23 @@ L = {
         "horizon": "2) Orizzonte previsionale",
         "tip": "Suggerimento: < 48h → stime più affidabili",
         "fetch": "Scarica/aggiorna previsioni",
-        "reset": "Reset",
-        "status_title": "Download & calcolo",
-        "last_upd": "Ultimo aggiornamento",
-        "low_alt": "Quota pista molto bassa (< 300 m): controlla che sia corretta.",
-        "invalid_win": "La finestra {lbl} ha orari invertiti (inizio ≥ fine). Correggi per continuare.",
 
         # --- grafici meteo ---
         "temp": "Temperature",
         "prec": "Precipitazione (mm/h)",
         "radhum": "Radiazione stimata & Umidità",
+
+        # --- sintesi blocchi ---
+        "cond": "Condizioni previste:",
+        "none": "—",
+        "rain": "pioggia",
+        "snow": "neve",
+        "mixed": "mista",
+        "struct": "Struttura consigliata:",
+        "waxes": "Scioline suggerite:",
+        "nodata": "Nessun dato nella finestra scelta.",
+
+        # --- colonne tabella meteo ---
         "t_air": "T aria (°C)",
         "td": "Td (°C)",
         "rh": "UR (%)",
@@ -61,52 +48,46 @@ L = {
         "speed": "Indice scorrevolezza",
         "hour": "Ora",
         "lead": "⟲ lead time (h)",
-        "download_csv": "Scarica CSV completo",
-        "speed_chart": "Indice scorrevolezza (mini)",
 
-        # --- sintesi blocchi ---
-        "cond": "Condizioni previste:",
-        "none": "—",
-        "rain": "pioggia",
-        "snow": "neve",
-        "mixed": "mista",
-        "nodata": "Nessun dato nella finestra scelta.",
-        "struct": "Struttura consigliata:",
-        "waxes": "Scioline suggerite:",
+        # --- download / stato ---
+        "download_csv": "Scarica CSV completo",
+        "reset": "Reset",
+        "last_upd": "Ultimo aggiornamento",
+        "status_title": "Download & calcolo",
+
+        # --- messaggi errore / warning ---
+        "invalid_win": "La finestra {lbl} ha orari invertiti (inizio ≥ fine). Correggi per continuare.",
+        "low_alt": "Quota pista molto bassa (< 300 m): controlla che sia corretta.",
         "alert": "Attenzione: condizioni molto umide/calde in finestra {lbl}. Preferire forma liquida/topcoat.",
+
+        # --- controlli laterali ---
+        "offset": "Calibrazione pista (offset termico °C)",
+        "speed_chart": "Indice scorrevolezza (mini)",
+        "lang": "Lingua",
+        "unit": "Unità",
+        "unit_c": "°C / m/s",
+        "unit_f": "°F / km/h",
+        "map": "Mappa (selezione)",
         "base_solid": "Base solida",
         "topcoat_lbl": "Topcoat",
-
-        # --- debug ---
         "debug": "Mostra debug",
+
+        # --- DEM ---
+        "dem_hdr": "Esposizione & pendenza (DEM locale)",
+        "slope_deg": "Pendenza (°)",
+        "slope_pct": "Pendenza (%)",
+        "aspect_deg": "Esposizione (° da N)",
+        "aspect_dir": "Esposizione (bussola)",
+        "dem_err": "DEM non disponibile ora. Riprova tra poco.",
     },
 
     "en": {
-        # --- meta / app ---
-        "app_title": "Telemark · Pro Wax & Tune",
-        "lang": "Language",
-        "unit": "Units",
-        "unit_c": "°C / m/s",
-        "unit_f": "°F / km/h",
-
-        # --- search ---
-        "search_title": "1) Search resort / location",
-        "search_ph": "Search… e.g. Champoluc, Plateau Rosa",
+        # --- search block ---
+        "search_title": "1) Search… e.g. Champoluc, Plateau Rosa",
         "country": "Country (search prefilter)",
+        "search_ph": "Search… e.g. Champoluc, Plateau Rosa",
 
-        # --- calibration / offset ---
-        "offset": "Track calibration (thermal offset °C)",
-
-        # --- map / DEM ---
-        "map": "Map (selection)",
-        "dem_hdr": "Aspect & slope (local DEM)",
-        "slope_deg": "Slope (°)",
-        "slope_pct": "Slope (%)",
-        "aspect_deg": "Aspect (° from N)",
-        "aspect_dir": "Aspect (compass)",
-        "dem_err": "DEM unavailable now. Try again shortly.",
-
-        # --- meteo & windows ---
+        # --- main params ---
         "ref_day": "Reference day",
         "alt_lbl": "Slope/race altitude (m)",
         "blocks": "1) Time windows A · B · C",
@@ -115,16 +96,23 @@ L = {
         "horizon": "2) Forecast horizon",
         "tip": "Tip: < 48h → more reliable",
         "fetch": "Fetch/update forecast",
-        "reset": "Reset",
-        "status_title": "Download & compute",
-        "last_upd": "Last update",
-        "low_alt": "Very low slope altitude (< 300 m): double-check.",
-        "invalid_win": "Window {lbl} has inverted times (start ≥ end). Fix to continue.",
 
         # --- charts ---
         "temp": "Temperatures",
         "prec": "Precipitation (mm/h)",
         "radhum": "Estimated radiation & Humidity",
+
+        # --- blocks summary ---
+        "cond": "Expected conditions:",
+        "none": "—",
+        "rain": "rain",
+        "snow": "snow",
+        "mixed": "mixed",
+        "struct": "Recommended structure:",
+        "waxes": "Suggested waxes:",
+        "nodata": "No data in selected window.",
+
+        # --- table columns ---
         "t_air": "Air T (°C)",
         "td": "Td (°C)",
         "rh": "RH (%)",
@@ -140,23 +128,36 @@ L = {
         "speed": "Speed index",
         "hour": "Hour",
         "lead": "⟲ lead time (h)",
-        "download_csv": "Download full CSV",
-        "speed_chart": "Speed index (mini)",
 
-        # --- block summaries ---
-        "cond": "Expected conditions:",
-        "none": "—",
-        "rain": "rain",
-        "snow": "snow",
-        "mixed": "mixed",
-        "nodata": "No data in selected window.",
-        "struct": "Recommended structure:",
-        "waxes": "Suggested waxes:",
+        # --- download / status ---
+        "download_csv": "Download full CSV",
+        "reset": "Reset",
+        "last_upd": "Last update",
+        "status_title": "Download & compute",
+
+        # --- errors / warnings ---
+        "invalid_win": "Window {lbl} has inverted times (start ≥ end). Fix to continue.",
+        "low_alt": "Very low slope altitude (< 300 m): double-check.",
         "alert": "Warning: very warm/humid conditions in {lbl}. Prefer liquid/topcoat.",
+
+        # --- sidebar controls ---
+        "offset": "Track calibration (thermal offset °C)",
+        "speed_chart": "Speed index (mini)",
+        "lang": "Language",
+        "unit": "Units",
+        "unit_c": "°C / m/s",
+        "unit_f": "°F / km/h",
+        "map": "Map (selection)",
         "base_solid": "Base solid",
         "topcoat_lbl": "Topcoat",
-
-        # --- debug ---
         "debug": "Show debug",
-    }
+
+        # --- DEM ---
+        "dem_hdr": "Aspect & slope (local DEM)",
+        "slope_deg": "Slope (°)",
+        "slope_pct": "Slope (%)",
+        "aspect_deg": "Aspect (° from N)",
+        "aspect_dir": "Aspect (compass)",
+        "dem_err": "DEM unavailable now. Try again shortly.",
+    },
 }
