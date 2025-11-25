@@ -1,4 +1,3 @@
-st.error("✅ NUOVO SEARCH.PY CARICATO")
 # core/search.py
 # Ricerca località: Open-Meteo (quota > 1000 m) + alias Telemark
 
@@ -6,6 +5,8 @@ import time
 import requests
 import streamlit as st
 from streamlit_searchbox import st_searchbox
+
+VERSION = "search-2025-11-26-v1"
 
 # ---------- Paesi (prefiltro) ----------
 COUNTRIES = {
@@ -92,13 +93,12 @@ def openmeteo_geocode_api(q: str, iso2: str | None):
 def _options_from_openmeteo(js):
     """
     Converte la risposta Open-Meteo in opzioni UI, scartando
-    i risultati con elevation < MIN_ELEVATION_M **o senza elevation**.
+    i risultati con elevation < MIN_ELEVATION_M o senza elevation.
     """
     out = []
     for it in (js or {}).get("results", []) or []:
         elev = it.get("elevation")
 
-        # Se non c'è elevation ⇒ la trattiamo come "bassa quota" e la scartiamo.
         drop = False
         if elev is None:
             drop = True
@@ -175,6 +175,11 @@ def location_searchbox(T, iso2: str | None = None):
     def provider(query: str):
         query = (query or "").strip()
         if len(query) < 2:
+            return []
+
+        # blocco assoluto di città inutili (anche se l'API le restituisce)
+        blacklist = ["roma", "milano", "napoli", "genova", "torino", "paris", "london"]
+        if query.lower() in blacklist:
             return []
 
         # 0) Alias Telemark (champo, champol, champoluc, zermatt, ecc.)
