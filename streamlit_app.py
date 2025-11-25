@@ -1,8 +1,8 @@
 # streamlit_app.py
-# Telemark · Pro Wax & Tune — versione con:
-# - ricerca località (quota > 1000 m + alias Telemark)
-# - mappa & piste sci alpino
-# - se disponibile: pannello pendenza / ombreggiatura (core.dem_tools)
+# Telemark · Pro Wax & Tune
+# - Ricerca località (quota > 1000 m + alias Telemark)
+# - Mappa & piste sci alpino
+# - Pendenza, esposizione, ombreggiatura + altitudine modificabile
 
 import sys
 import importlib
@@ -26,14 +26,12 @@ from core.search import (
 )
 from core.maps import render_map
 
-# modulo opzionale per pendenza / ombreggiatura
+# modulo DEM / pendenza & ombreggiatura
 try:
     from core.dem_tools import render_slope_shade_panel
-
     HAS_DEM_TOOLS = True
 except Exception:
     HAS_DEM_TOOLS = False
-
 
 # ---------------------- PAGE CONFIG & THEME ----------------------
 PRIMARY = "#06b6d4"
@@ -112,7 +110,6 @@ hr {{
 # ---------------------- SIDEBAR ----------------------
 st.sidebar.markdown("### ⚙️ Impostazioni")
 
-# lingua
 lang = st.sidebar.selectbox(
     "Lingua / Language",
     ["IT", "EN"],
@@ -133,10 +130,8 @@ st.sidebar.text(f"DEM tools:\n{'OK' if HAS_DEM_TOOLS else 'NOT INSTALLED'}")
 # ---------------------- HEADER ----------------------
 st.title("Telemark · Pro Wax & Tune")
 
-# context condiviso tra i moduli
-ctx = {
-    "lang": lang,
-}
+# context condiviso
+ctx = {"lang": lang}
 
 # ---------------------- 1) LOCALITÀ ----------------------
 st.markdown("## 🌍 Località")
@@ -156,9 +151,8 @@ with st.container():
         ctx["lon"] = float(sel["lon"])
         ctx["place_label"] = sel["label"]
 
-        st.markdown(
-            f"**Località selezionata:** {sel['label']}"
-        )
+        # Nessuna lat/lon in UI
+        st.markdown(f"**Località selezionata:** {sel['label']}")
     else:
         st.warning("Seleziona una località per continuare.")
         st.stop()
@@ -167,7 +161,7 @@ st.markdown("---")
 
 # ---------------------- 4) MAPPA & PISTE ----------------------
 st.markdown(
-    '<div class="section-title"><h2>4) Mappa & piste</h2>'
+    f'<div class="section-title"><h2>4) Mappa & piste</h2>'
     f'<span>{ctx["place_label"]}</span></div>',
     unsafe_allow_html=True,
 )
@@ -180,13 +174,12 @@ st.markdown("---")
 st.markdown("## 5) Pendenza & ombreggiatura")
 
 if HAS_DEM_TOOLS:
-    # delega il rendering al modulo dem_tools
     try:
         render_slope_shade_panel(T, ctx)
     except Exception as e:
         st.error(f"Errore modulo DEM/pendenza: {e}")
 else:
     st.info(
-        "Modulo pendenza / ombreggiatura non ancora installato in questo ambiente.\n"
-        "Il pannello verrà attivato quando core.dem_tools sarà disponibile."
+        "Modulo pendenza / ombreggiatura non attivo in questo ambiente.\n"
+        "Verrà abilitato quando core.dem_tools sarà disponibile."
     )
