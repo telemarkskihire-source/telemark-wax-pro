@@ -1,9 +1,7 @@
 # core/maps.py
 # Mappa & piste (OSM / Overpass) per Telemark · Pro Wax & Tune
-# Versione semplificata ma robusta:
-# - prende SOLO way con "piste:type"
-# - calcola lunghezza
-# - le disegna su Folium
+# - solo piste sci alpino: piste:type = downhill
+# - disegno su mappa Folium
 
 from __future__ import annotations
 
@@ -17,6 +15,7 @@ HAS_FOLIUM = False
 try:
     from streamlit_folium import st_folium
     import folium
+
     HAS_FOLIUM = True
 except Exception:
     HAS_FOLIUM = False
@@ -58,14 +57,14 @@ def _line_length_km(coords: List[Dict[str, float]]) -> float:
 # ---------- Overpass ----------
 def _overpass_query(lat: float, lon: float, dist_km: int) -> List[Dict[str, Any]]:
     """
-    Prende SOLO way con 'piste:type' (niente relation strane).
+    Recupera SOLO way con 'piste:type=downhill' (sci alpino).
     """
     radius_m = int(dist_km * 1000)
 
     query = f"""
     [out:json][timeout:25];
     (
-      way(around:{radius_m},{lat},{lon})["piste:type"];
+      way(around:{radius_m},{lat},{lon})["piste:type"="downhill"];
     );
     out tags geom;
     """
@@ -146,7 +145,7 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]):
     st.markdown("### 4) Mappa & piste")
 
     show_pistes = st.checkbox(
-        "Mostra piste sulla mappa",
+        "Mostra piste sci alpino sulla mappa",
         value=True,
         key="show_pistes",
     )
@@ -157,7 +156,7 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]):
     if show_pistes:
         try:
             with st.spinner(
-                f"Carico le piste (raggio {BASE_RADIUS_KM} km) da OpenStreetMap / Overpass…"
+                f"Carico le piste downhill (raggio {BASE_RADIUS_KM} km) da OSM/Overpass…"
             ):
                 pistes, raw_count = fetch_pistes(lat, lon, BASE_RADIUS_KM)
 
@@ -171,14 +170,16 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]):
             st.error(f"Errore caricando le piste (OSM/Overpass): {e}")
 
     st.caption(
-        f"Piste trovate: {len(pistes)} (elementi Overpass grezzi: {raw_count})"
+        f"Piste downhill trovate: {len(pistes)} (elementi Overpass grezzi: {raw_count})"
     )
 
     if show_pistes and not pistes:
-        st.info("Nessuna pista trovata in questo comprensorio (OSM/Overpass).")
+        st.info("Nessuna pista sci alpino trovata in questo comprensorio (OSM/Overpass).")
 
     if not HAS_FOLIUM:
-        st.info("Modulo mappa avanzata richiede 'folium' e 'streamlit-folium' installati.")
+        st.info(
+            "Modulo mappa avanzata richiede 'folium' e 'streamlit-folium' installati in questo ambiente."
+        )
         return
 
     # ---- Mappa Folium ----
