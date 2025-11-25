@@ -1,7 +1,8 @@
 # core/maps.py
 # Mappa & piste (OSM / Overpass) per Telemark · Pro Wax & Tune
-# - solo piste sci alpino: piste:type = downhill
-# - disegno su mappa Folium
+# - SOLO piste sci alpino (piste:type=downhill/alpine)
+# - click sulla mappa -> punto più vicino su una pista
+#   (aggiorna ctx.lat/lon e la località selezionata)
 
 from __future__ import annotations
 
@@ -44,20 +45,11 @@ def _haversine(lat1, lon1, lat2, lon2) -> float:
     return 2 * R * math.asin(math.sqrt(a))
 
 
-def _line_length_km(coords: List[Dict[str, float]]) -> float:
-    if not coords or len(coords) < 2:
-        return 0.0
-    total = 0.0
-    for i in range(1, len(coords)):
-        p0, p1 = coords[i - 1], coords[i]
-        total += _haversine(p0["lat"], p0["lon"], p1["lat"], p1["lon"])
-    return total
-
-
 # ---------- Overpass ----------
 def _overpass_query(lat: float, lon: float, dist_km: int) -> List[Dict[str, Any]]:
     """
     Recupera SOLO way con 'piste:type=downhill' (sci alpino).
+    Aggiungo anche eventuale 'alpine' per sicurezza.
     """
     radius_m = int(dist_km * 1000)
 
@@ -65,6 +57,7 @@ def _overpass_query(lat: float, lon: float, dist_km: int) -> List[Dict[str, Any]
     [out:json][timeout:25];
     (
       way(around:{radius_m},{lat},{lon})["piste:type"="downhill"];
+      way(around:{radius_m},{lat},{lon})["piste:type"="alpine"];
     );
     out tags geom;
     """
@@ -105,7 +98,13 @@ def fetch_pistes(lat: float, lon: float, dist_km: int):
         difficulty = tags.get("piste:difficulty", "")
 
         coords = [{"lat": g["lat"], "lon": g["lon"]} for g in geom]
-        length_km = _line_length_km(coords)
+
+        # lunghezza grezza (km)
+        length_km = 0.0
+        if len(coords) >= 2:
+            for i in range(1, len(coords)):
+                p0, p1 = coords[i - 1], coords[i]
+                length_km += _haversine(p0["lat"], p0["lon"], p1["lat"], p1["lon"])
 
         pistes.append(
             dict(
@@ -199,12 +198,14 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]):
         control=True,
     ).add_to(m)
 
+    # marker del punto selezionato
     folium.Marker(
         [lat, lon],
         tooltip=place_label,
         icon=folium.Icon(color="lightgray", icon="info-sign"),
     ).add_to(m)
 
+    # disegno piste
     for p in pistes:
         coords = [(c["lat"], c["lon"]) for c in p["coords"]]
         if not coords:
@@ -224,9 +225,43 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]):
             tooltip=popup,
         ).add_to(m)
 
-    st_folium(
+    # click -> attacca il posizionatore alla pista più vicina
+    out = st_folium(
         m,
         height=420,
         use_container_width=True,
         key=f"map_{round(lat,5)}_{round(lon,5)}",
+        returned_objects=["last_clicked"],
     )
+
+    click = (out or {}).get("last_clicked") or {}
+    if click and pistes:
+        c_lat = float(click.get("lat"))
+        c_lon = float(click.get("lng"))
+
+        best_p = None
+        best_point = None
+        best_d = 9999.0
+
+        for p in pistes:
+            for c in p["coords"]:
+                d = _haversine(c_lat, c_lon, c["lat"], c["lon"])
+                if d < best_d:
+                    best_d = d
+                    best_p = p
+                    best_point = (c["lat"], c["lon"])
+
+        if best_p and best_point:
+            # aggiorno ctx e session_state al punto più vicino sulla pista
+            new_lat, new_lon = best_point
+            base_label = place_label.split("—")[0].strip()
+            piste_name = best_p["name"] or "pista"
+            new_label = f"{base_label} · {piste_name}"
+
+            ctx["lat"] = float(new_lat)
+            ctx["lon"] = float(new_lon)
+            ctx["place_label"] = new_label
+
+            st.session_state["lat"] = float(new_lat)
+            st.session_state["lon"] = float(new_lon)
+            st.session_state["place_label"] = new_label
