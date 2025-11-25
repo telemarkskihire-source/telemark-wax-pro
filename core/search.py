@@ -1,5 +1,5 @@
 # core/search.py
-# Modulo ricerca località: Nominatim + Open-Meteo fallback, caching, retry
+# VERSIONE V3 — ricerca località pulita (no lat/lon visibili) + alias Telemark
 
 import time
 import requests
@@ -37,6 +37,7 @@ ALIASES = [
         "source": "alias",
     },
 ]
+
 
 # ---------- Utilità ----------
 def flag(cc: str) -> str:
@@ -129,7 +130,7 @@ def _options_from_nominatim(js):
 
         out.append(
             {
-                "label": label,
+                "label": label,   # SOLO testo utente
                 "lat": lat,
                 "lon": lon,
                 "source": "osm",
@@ -153,7 +154,7 @@ def _options_from_openmeteo(js):
 
         out.append(
             {
-                "label": label,
+                "label": label,   # SOLO testo utente
                 "lat": lat,
                 "lon": lon,
                 "source": "om",
@@ -181,7 +182,6 @@ def _alias_match(query: str):
     for place in ALIASES:
         for alias in place["aliases"]:
             a = alias.lower()
-            # match se: inizia con, contiene o è contenuto
             if q.startswith(a) or a.startswith(q) or a in q:
                 return {
                     "label": place["label"],
@@ -192,19 +192,28 @@ def _alias_match(query: str):
     return None
 
 
-def location_searchbox(T, iso2):
-    st.session_state.setdefault("_search_options", {})
+def location_searchbox(T, iso2="IT"):
+    """
+    Mostra la searchbox e aggiorna st.session_state con:
+      - lat, lon
+      - place_label, place_source
+    Ritorna il dict della selezione (o None).
+    """
+    # debug: mostra versione
+    st.caption("🔍 Search module: VERSIONE V3")
+
+    st.session_state.setdefault("_search_options_v3", {})
 
     def provider(query: str):
         query = (query or "").strip()
         if len(query) < 2:
             return []
 
-        # 0) Alias Telemark (champo, champol, champoluc, zermatt, ecc.)
+        # 0) Alias interni (Champoluc, Zermatt, ecc.)
         alias_hit = _alias_match(query)
         if alias_hit is not None:
             label = alias_hit["label"]
-            st.session_state["_search_options"] = {label: alias_hit}
+            st.session_state["_search_options_v3"] = {label: alias_hit}
             return [label]
 
         # 1) Nominatim
@@ -230,21 +239,22 @@ def location_searchbox(T, iso2):
             seen_labels.add(lbl)
             merged.append(src)
 
-        st.session_state["_search_options"] = {it["label"]: it for it in merged}
+        st.session_state["_search_options_v3"] = {it["label"]: it for it in merged}
         return [it["label"] for it in merged]
 
     default_label = st.session_state.get("place_label")
 
+    # NOTA: key diverso ("place_v3") per forzare nuovo widget
     selected_label = st_searchbox(
         provider,
-        key="place",
+        key="place_v3",
         placeholder=T["search_ph"],
         clear_on_submit=False,
         default=default_label,
     )
 
-    if selected_label and selected_label in st.session_state["_search_options"]:
-        info = st.session_state["_search_options"][selected_label]
+    if selected_label and selected_label in st.session_state["_search_options_v3"]:
+        info = st.session_state["_search_options_v3"][selected_label]
         st.session_state["lat"] = info["lat"]
         st.session_state["lon"] = info["lon"]
         st.session_state["place_label"] = selected_label
