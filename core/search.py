@@ -21,6 +21,26 @@ COUNTRIES = {
 UA = {"User-Agent": "telemark-wax-pro/1.1"}
 
 
+# ---------- Alias interni Telemark ----------
+# Per nomi scritti a metà o abbreviati (champo, champol, ecc.)
+ALIASES = [
+    {
+        "aliases": ["champo", "champol", "champolu", "champoluc"],
+        "label": "🇮🇹  Champoluc-Champlan, Valle d’Aosta — IT",
+        "lat": 45.83333,
+        "lon": 7.73333,
+        "source": "alias",
+    },
+    {
+        "aliases": ["zermat", "zermatt"],
+        "label": "🇨🇭  Zermatt, Vallese — CH",
+        "lat": 46.02072,
+        "lon": 7.74912,
+        "source": "alias",
+    },
+]
+
+
 # ---------- Utilità ----------
 def flag(cc: str) -> str:
     """Trasforma codice paese ISO2 in emoji bandiera."""
@@ -34,9 +54,7 @@ def flag(cc: str) -> str:
 def concise_label(addr: dict, fallback: str) -> str:
     """
     Crea una label compatta:
-    - riga 1: città/paese
-    - riga 2: regione / stato + codice paese
-    (ma come stringa unica, poi la mandiamo alla UI)
+    es. 'Zermatt, Vallese — CH'
     """
     name = (
         addr.get("neighbourhood")
@@ -85,7 +103,7 @@ def nominatim_search_api(q: str, iso2: str):
 
 @st.cache_data(ttl=60 * 60, show_spinner=False)
 def openmeteo_geocode_api(q: str, iso2: str):
-    # Fallback molto veloce e con toponimi alpini (Courmayeur incluso)
+    # Fallback molto veloce e con toponimi alpini
     r = _retry(
         lambda: requests.get(
             "https://geocoding-api.open-meteo.com/v1/search",
@@ -113,7 +131,6 @@ def _options_from_nominatim(js):
 
         cc = (addr.get("country_code") or "").upper()
         emoji = flag(cc)
-        # Etichetta SOLO testuale, niente coordinate
         label = f"{emoji}  {base}"
 
         lat = float(it.get("lat", 0.0))
@@ -121,7 +138,7 @@ def _options_from_nominatim(js):
 
         out.append(
             {
-                "label": label,  # quello che l'utente vede
+                "label": label,  # TESTO CHE L'UTENTE VEDE
                 "lat": lat,
                 "lon": lon,
                 "source": "osm",
@@ -145,7 +162,7 @@ def _options_from_openmeteo(js):
 
         out.append(
             {
-                "label": label,  # quello che l'utente vede
+                "label": label,  # TESTO CHE L'UTENTE VEDE
                 "lat": lat,
                 "lon": lon,
                 "source": "om",
@@ -165,6 +182,24 @@ def country_selectbox(T):
     return COUNTRIES[sel]
 
 
+def _alias_match(query: str):
+    q = (query or "").strip().lower()
+    if not q:
+        return None
+
+    for place in ALIASES:
+        for alias in place["aliases"]:
+            if q.startswith(alias):
+                # ritorniamo una copia con label già pronta
+                return {
+                    "label": place["label"],
+                    "lat": place["lat"],
+                    "lon": place["lon"],
+                    "source": place["source"],
+                }
+    return None
+
+
 def location_searchbox(T, iso2):
     """
     Renderizza lo searchbox e salva la selezione in st.session_state:
@@ -179,14 +214,21 @@ def location_searchbox(T, iso2):
         if len(query) < 2:
             return []
 
-        # 1) Nominatim (preciso)
+        # 0) Alias Telemark (champo, champol, zermat, ecc.)
+        alias_hit = _alias_match(query)
+        if alias_hit is not None:
+            label = alias_hit["label"]
+            st.session_state["_search_options"] = {label: alias_hit}
+            return [label]
+
+        # 1) Nominatim
         try:
             js1 = nominatim_search_api(query, iso2)
             opts1 = _options_from_nominatim(js1)
         except Exception:
             opts1 = []
 
-        # 2) Open-Meteo (più generoso su toponimi montani)
+        # 2) Open-Meteo
         try:
             js2 = openmeteo_geocode_api(query, iso2)
             opts2 = _options_from_openmeteo(js2)
@@ -203,7 +245,7 @@ def location_searchbox(T, iso2):
             seen_labels.add(lbl)
             merged.append(src)
 
-        # mappa label -> oggetto (per recupero dopo la scelta)
+        # mappa label -> oggetto
         st.session_state["_search_options"] = {it["label"]: it for it in merged}
 
         # valori mostrati nella tendina (SOLO label umana)
