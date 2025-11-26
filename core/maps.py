@@ -2,7 +2,7 @@
 # Mappa & piste (OSM / Overpass) per Telemark · Pro Wax & Tune
 # - SOLO piste sci alpino (piste:type=downhill/alpine)
 # - click sulla mappa -> punto più vicino su una pista
-#   (aggiorna ctx.lat/lon e la località selezionata)
+# - layer OSM + Satellite (Esri)
 
 from __future__ import annotations
 
@@ -141,8 +141,6 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]):
     lon = float(ctx.get("lon", 7.730))
     place_label = ctx.get("place_label", "Località")
 
-    st.markdown("### 4) Mappa & piste")
-
     show_pistes = st.checkbox(
         "Mostra piste sci alpino sulla mappa",
         value=True,
@@ -185,18 +183,36 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]):
     m = folium.Map(
         location=[lat, lon],
         zoom_start=13,
-        tiles=None,
+        tiles=None,          # usiamo solo tile layer custom
         control_scale=True,
         prefer_canvas=True,
     )
 
+    # Layer OSM standard
     folium.TileLayer(
         tiles="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",
         name="OSM",
         attr="© OpenStreetMap contributors",
         overlay=False,
         control=True,
+        show=False,          # NON predefinito
     ).add_to(m)
+
+    # Layer Satellite (Esri World Imagery) – predefinito
+    folium.TileLayer(
+        tiles=(
+            "https://server.arcgisonline.com/ArcGIS/rest/services/"
+            "World_Imagery/MapServer/tile/{z}/{y}/{x}"
+        ),
+        name="Satellite",
+        attr="Tiles © Esri — Source: Esri, i-cubed, USDA, USGS, AEX, GeoEye, "
+             "Getmapping, Aerogrid, IGN, IGP, UPR-EGP, and the GIS User Community",
+        overlay=False,
+        control=True,
+        show=True,          # è il layer attivo di default
+    ).add_to(m)
+
+    folium.LayerControl(position="topright", collapsed=True).add_to(m)
 
     # marker del punto selezionato
     folium.Marker(
