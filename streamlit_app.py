@@ -1,7 +1,7 @@
 # streamlit_app.py
 # Telemark · Pro Wax & Tune
 # Pagina 1: Località & Mappa
-# Pagina 2: Racing / Calendari + Mappa & DEM
+# Pagina 2: Racing / Calendari + Mappa & DEM con centratura sulla gara
 
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ import importlib
 from datetime import datetime, time as dtime
 from typing import Optional, Dict, Any
 
+import requests
 import streamlit as st
 
 # --- hard-reload moduli core.* per evitare cache vecchie ---
@@ -39,7 +40,7 @@ from core.race_events import (
 from core.race_tuning import Discipline
 from core.race_integration import get_wc_tuning_for_event, SkierLevel as WCSkierLevel
 
-import core.search as search_mod  # per debug + geocoding eventi
+import core.search as search_mod  # solo per debug path/version
 
 # ---------------------- PAGE CONFIG & THEME ----------------------
 PRIMARY = "#06b6d4"
@@ -111,6 +112,77 @@ _FIS_PROVIDER = FISCalendarProvider()
 _FISI_PROVIDER = FISICalendarProvider()
 _RACE_SERVICE = RaceCalendarService(_FIS_PROVIDER, _FISI_PROVIDER)
 
+# ---------------------- GEOCODER PER GARE (Open-Meteo) ---------
+MIN_ELEVATION_M = 1000.0
+UA = {"User-Agent": "telemark-wax-pro/2.0"}
+
+def _flag(cc: str) -> str:
+    try:
+        c = cc.upper()
+        return chr(127397 + ord(c[0])) + chr(127397 + ord(c[1]))
+    except Exception:
+        return "🏳️"
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def geocode_race_place(query: str) -> Optional[Dict[str, Any]]:
+    """
+    Geocoding molto semplice per le gare:
+    - usa Open-Meteo
+    - filtra località sotto 1000 m
+    - prende il primo risultato valido
+    """
+    q = (query or "").strip()
+    if not q:
+        return None
+
+    params = {
+        "name": q,
+        "language": "it",
+        "count": 10,
+        "format": "json",
+    }
+    try:
+        r = requests.get(
+            "https://geocoding-api.open-meteo.com/v1/search",
+            params=params,
+            headers=UA,
+            timeout=8,
+        )
+        r.raise_for_status()
+        js = r.json() or {}
+    except Exception:
+        return None
+
+    results = js.get("results") or []
+    best = None
+    for it in results:
+        elev = it.get("elevation")
+        if elev is None:
+            continue
+        try:
+            if float(elev) < MIN_ELEVATION_M:
+                continue
+        except Exception:
+            continue
+
+        best = it
+        break
+
+    if not best:
+        return None
+
+    cc = (best.get("country_code") or "").upper()
+    name = best.get("name") or ""
+    admin1 = best.get("admin1") or best.get("admin2") or ""
+    base = f"{name}, {admin1}".strip().replace(" ,", ",")
+    label = f"{_flag(cc)}  {base} — {cc}"
+
+    return {
+        "lat": float(best.get("latitude", 0.0)),
+        "lon": float(best.get("longitude", 0.0)),
+        "label": label,
+    }
+
 # ---------------------- FUNZIONI DI SUPPORTO --------------------
 def ensure_base_location() -> Dict[str, Any]:
     """
@@ -139,28 +211,21 @@ def race_event_label(ev: RaceEvent) -> str:
 def center_ctx_on_race_location(ctx: Dict[str, Any], event: RaceEvent) -> Dict[str, Any]:
     """
     Geocoda la località della gara e aggiorna ctx + session_state
-    in modo che la mappa della sezione Racing si centri sulla gara.
+    per centrare la mappa Racing sulla gara.
     """
-    # es. "Soelden (AUT)" -> "Soelden"
     raw_place = event.place or ""
     query_name = raw_place.split("(")[0].strip() or raw_place.strip()
+
     base = ensure_base_location()
     lat = base["lat"]
     lon = base["lon"]
     label = base["label"]
 
-    try:
-        # usa lo stesso geocoding Open-Meteo del modulo search
-        js = search_mod.openmeteo_geocode_api(query_name, None)
-        opts = search_mod._options_from_openmeteo(js)  # prende solo località >1000 m
-        if opts:
-            best = opts[0]
-            lat = float(best["lat"])
-            lon = float(best["lon"])
-            label = best["label"]
-    except Exception:
-        # se qualcosa va storto rimaniamo sulla località base
-        pass
+    geo = geocode_race_place(query_name)
+    if geo:
+        lat = geo["lat"]
+        lon = geo["lon"]
+        label = geo["label"]
 
     ctx["lat"] = lat
     ctx["lon"] = lon
@@ -235,7 +300,7 @@ if page == "Località & Mappa":
 else:
     st.markdown("## 🏁 Racing / Calendari gare")
 
-    # località base (ad es. scelta manualmente nella pagina 1)
+    # località base (es. scelta manualmente nella pagina 1)
     base_loc = ensure_base_location()
     ctx.update(base_loc)
     st.session_state["lat"] = base_loc["lat"]
@@ -358,7 +423,7 @@ else:
             c1m, c2m, c3m = st.columns(3)
             c1m.metric("Base bevel", f"{params_dict['base_bevel_deg']:.1f}°")
             c2m.metric("Side bevel", f"{params_dict['side_bevel_deg']:.1f}°")
-            c3m.metric("Rischio", str(params_dict["risk_level"]).title())
+            c3m.metric("Rischio", str(params_dict['risk_level']).title())
 
             st.markdown(
                 f"- **Struttura**: {data_dict['structure_pattern']}\n"
