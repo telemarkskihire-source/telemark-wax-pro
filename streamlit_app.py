@@ -41,8 +41,6 @@ from core.race_events import (
 from core.race_tuning import (
     Discipline,
     SkierLevel as TuneSkierLevel,
-    SnowType,
-    TuningParamsInput,
     get_tuning_recommendation,
 )
 from core.race_integration import get_wc_tuning_for_event, SkierLevel as WCSkierLevel
@@ -220,16 +218,14 @@ def center_ctx_on_race_location(ctx: Dict[str, Any], event: RaceEvent) -> Dict[s
     ctx["lat"] = lat
     ctx["lon"] = lon
     ctx["place_label"] = label
+    ctx["marker_lat"] = lat
+    ctx["marker_lon"] = lon
 
-    # aggiorno anche session_state e marker per il puntatore
     st.session_state["lat"] = lat
     st.session_state["lon"] = lon
     st.session_state["place_label"] = label
     st.session_state["marker_lat"] = lat
     st.session_state["marker_lon"] = lon
-
-    ctx["marker_lat"] = lat
-    ctx["marker_lon"] = lon
 
     return ctx
 
@@ -357,30 +353,19 @@ else:
         labels = [race_event_label(ev) for ev in events]
         label_to_event = {lbl: ev for lbl, ev in zip(labels, events)}
 
-        # ricorda selezione precedente
         prev_label = st.session_state.get("race_selected_label")
         if prev_label in label_to_event:
             default_idx = labels.index(prev_label)
         else:
             default_idx = 0
 
-        use_radio = len(labels) <= 25
-
-        if use_radio:
-            selected_label = st.radio(
-                "Seleziona gara",
-                labels,
-                index=default_idx,
-                key="race_radio",
-            )
-        else:
-            selected_label = st.selectbox(
-                "Seleziona gara",
-                labels,
-                index=default_idx,
-                key="race_select",
-            )
-
+        # SEMPRE radio → niente tastiera su mobile
+        selected_label = st.radio(
+            "Seleziona gara",
+            labels,
+            index=default_idx,
+            key="race_radio",
+        )
         selected_event = label_to_event[selected_label]
         st.session_state["race_selected_label"] = selected_label
 
@@ -399,7 +384,7 @@ else:
         # centra sempre sulla località gara + aggiorna puntatore
         ctx = center_ctx_on_race_location(ctx, selected_event)
 
-        # context mappa include label gara → cambia sempre
+        # context mappa cambia ad ogni gara → forza refresh
         ctx["map_context"] = f"race_{selected_label}"
 
         st.markdown(
@@ -416,7 +401,7 @@ else:
         st.markdown("### Mappa & piste per la gara")
         ctx = render_map(T, ctx) or ctx
 
-        # DEM con ombreggiatura (usa ctx['race_datetime'] internamente)
+        # DEM con ombreggiatura
         st.markdown("### Esposizione & pendenza sulla pista selezionata")
         render_dem(T, ctx)
 
@@ -468,6 +453,8 @@ else:
 
             df_reset = df.reset_index()
 
+            base_props = {"height": 120}
+
             # === FASCIA 1: temperatura aria vs neve ===
             temp_long = df_reset.melt(
                 id_vars="time",
@@ -477,15 +464,16 @@ else:
             )
             chart_temp = (
                 alt.Chart(temp_long)
-                .mark_line()
+                .mark_line(size=2)
                 .encode(
                     x=alt.X("time:T", title=None),
-                    y=alt.Y("valore:Q", title="°C"),
+                    y=alt.Y("valore:Q", title="Temperatura (°C)"),
                     color=alt.Color("serie:N", title=None),
                     tooltip=[],
                 )
-                .properties(height=140)
+                .properties(**base_props)
             )
+            st.altair_chart(chart_temp, use_container_width=True)
 
             # === FASCIA 2: precipitazioni (pioggia + neve) ===
             precip_long = df_reset.melt(
@@ -499,78 +487,55 @@ else:
                 .mark_bar()
                 .encode(
                     x=alt.X("time:T", title=None),
-                    y=alt.Y("mm:Q", title="mm/h"),
+                    y=alt.Y("mm:Q", title="Precipitazioni (mm/h)"),
                     color=alt.Color("tipo:N", title=None),
                     tooltip=[],
                 )
                 .properties(height=90)
             )
+            st.altair_chart(chart_precip, use_container_width=True)
 
             # === FASCIA 3: vento + ombreggiatura ===
-            wind_long = df_reset.melt(
+            wind_shade_long = df_reset.melt(
                 id_vars="time",
                 value_vars=["windspeed", "shade_index"],
                 var_name="serie",
                 value_name="valore",
             )
             chart_wind_shade = (
-                alt.Chart(wind_long)
-                .mark_line()
+                alt.Chart(wind_shade_long)
+                .mark_line(size=2)
                 .encode(
                     x=alt.X("time:T", title=None),
-                    y=alt.Y("valore:Q", title="vento / ombra"),
+                    y=alt.Y("valore:Q", title="Vento (km/h) / Ombra (0–1)"),
                     color=alt.Color("serie:N", title=None),
                     tooltip=[],
                 )
-                .properties(height=110)
+                .properties(**base_props)
             )
-
-            # Mostro le tre fasce tipo Meteoblue
-            st.altair_chart(chart_temp, use_container_width=True)
-            st.altair_chart(chart_precip, use_container_width=True)
             st.altair_chart(chart_wind_shade, use_container_width=True)
 
-            # === Grafici aggiuntivi (come versione precedente, ma statici) ===
-            # Umidità relativa
-            chart_rh = (
-                alt.Chart(df_reset)
-                .mark_line()
+            # === Umidità + scorrevolezza ===
+            hum_glide_long = df_reset.melt(
+                id_vars="time",
+                value_vars=["rh", "glide_index"],
+                var_name="serie",
+                value_name="valore",
+            )
+            chart_hum_glide = (
+                alt.Chart(hum_glide_long)
+                .mark_line(size=2)
                 .encode(
                     x=alt.X("time:T", title=None),
-                    y=alt.Y("rh:Q", title="Umidità relativa (%)"),
+                    y=alt.Y("valore:Q", title="Umidità (%) / Glide (0–1)"),
+                    color=alt.Color("serie:N", title=None),
                     tooltip=[],
                 )
-                .properties(height=80)
+                .properties(**base_props)
             )
-            st.altair_chart(chart_rh, use_container_width=True)
+            st.altair_chart(chart_hum_glide, use_container_width=True)
 
-            # Indice ombreggiatura
-            chart_shade = (
-                alt.Chart(df_reset)
-                .mark_line()
-                .encode(
-                    x=alt.X("time:T", title=None),
-                    y=alt.Y("shade_index:Q", title="Indice ombreggiatura (0 sole, 1 ombra)"),
-                    tooltip=[],
-                )
-                .properties(height=80)
-            )
-            st.altair_chart(chart_shade, use_container_width=True)
-
-            # Indice scorrevolezza
-            chart_glide = (
-                alt.Chart(df_reset)
-                .mark_line()
-                .encode(
-                    x=alt.X("time:T", title=None),
-                    y=alt.Y("glide_index:Q", title="Indice scorrevolezza (0–1)"),
-                    tooltip=[],
-                )
-                .properties(height=80)
-            )
-            st.altair_chart(chart_glide, use_container_width=True)
-
-            # Vento + copertura nuvolosa
+            # === Vento + nuvolosità ===
             wind_cloud_long = df_reset.melt(
                 id_vars="time",
                 value_vars=["windspeed", "cloudcover"],
@@ -579,14 +544,14 @@ else:
             )
             chart_wind_cloud = (
                 alt.Chart(wind_cloud_long)
-                .mark_line()
+                .mark_line(size=2)
                 .encode(
                     x=alt.X("time:T", title=None),
-                    y=alt.Y("valore:Q", title="Vento / nuvolosità"),
+                    y=alt.Y("valore:Q", title="Vento / Nuvolosità (%)"),
                     color=alt.Color("serie:N", title=None),
                     tooltip=[],
                 )
-                .properties(height=90)
+                .properties(**base_props)
             )
             st.altair_chart(chart_wind_cloud, use_container_width=True)
 
