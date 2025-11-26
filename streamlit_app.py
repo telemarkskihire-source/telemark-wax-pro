@@ -1,26 +1,35 @@
 # streamlit_app.py
-# Telemark · Pro Wax & Tune — pagina Wax + pagina Racing
+# Telemark · Pro Wax & Tune
+# Pagina 1: Località & Mappa
+# Pagina 2: Racing / Calendari + Mappa, DEM, Meteo & Tuning dinamico
 
+from __future__ import annotations
+
+import os
 import sys
 import importlib
 from datetime import datetime, time as dtime
+from typing import Optional, Dict, Any
 
 import requests
+import pandas as pd
 import streamlit as st
 
-# --- hard-reload moduli core.* per evitare cache vecchia ---
+# --- hard-reload moduli core.* ---
 importlib.invalidate_caches()
 for name in list(sys.modules.keys()):
     if name == "core" or name.startswith("core."):
         del sys.modules[name]
 
-# --- import dal core ---
 from core.i18n import L
-import core.search as search_mod
-from core.search import country_selectbox, location_searchbox, get_current_selection
+from core.search import (
+    country_selectbox,
+    location_searchbox,
+    get_current_selection,
+    VERSION as SEARCH_VERSION,
+)
 from core.maps import render_map
 from core.dem_tools import render_dem
-from core.meteo import build_meteo_profile_for_race_day, build_dynamic_tuning_for_race
 from core.race_events import (
     RaceCalendarService,
     FISCalendarProvider,
@@ -28,9 +37,21 @@ from core.race_events import (
     Federation,
     RaceEvent,
 )
-from core.race_tuning import Discipline, SkierLevel
+from core.race_tuning import (
+    Discipline,
+    SkierLevel as TuneSkierLevel,
+    SnowType,
+    TuningParamsInput,
+    get_tuning_recommendation,
+)
+from core.race_integration import get_wc_tuning_for_event, SkierLevel as WCSkierLevel
+from core import meteo as meteo_mod
+
+import core.search as search_mod  # debug
 
 # ---------------------- THEME ----------------------
+PRIMARY = "#06b6d4"
+ACCENT = "#f97316"
 
 st.set_page_config(
     page_title="Telemark · Pro Wax & Tune",
@@ -39,355 +60,454 @@ st.set_page_config(
 )
 
 st.markdown(
-    """
+    f"""
 <style>
-:root {
-  --bg:#050813;
-  --panel:#101624;
+:root {{
+  --bg:#0b0f13;
+  --panel:#121821;
   --muted:#9aa4af;
   --fg:#e5e7eb;
   --line:#1f2937;
-}
-html, body, .stApp {
+}}
+html, body, .stApp {{
   background:var(--bg);
   color:var(--fg);
-}
-[data-testid="stHeader"] {
+}}
+[data-testid="stHeader"] {{
   background:transparent;
-}
-section.main > div {
-  padding-top: 0.4rem;
-}
-h1,h2,h3,h4 {
-  color:#ffffff;
-  letter-spacing:.2px;
-}
-hr {
+}}
+section.main > div {{
+  padding-top: 0.6rem;
+}}
+h1,h2,h3,h4 {{
+  color:#fff;
+  letter-spacing: .2px;
+}}
+hr {{
   border:none;
   border-top:1px solid var(--line);
   margin:.75rem 0;
-}
-.card {
+}}
+.card {{
   background: var(--panel);
   border:1px solid var(--line);
-  border-radius:14px;
-  padding:.9rem 1.0rem;
-}
-.badge {
+  border-radius:12px;
+  padding:.9rem .95rem;
+}}
+.small {{
+  font-size:.85rem;
+  color:#cbd5e1;
+}}
+.badge {{
   display:inline-flex;
   align-items:center;
-  gap:.5rem;
+  gap:.35rem;
   background:#020617;
   border:1px solid #1e293b;
-  color:#cbd5f5;
   border-radius:999px;
-  padding:.28rem .7rem;
-  font-size:.80rem;
-}
-.small {
-  font-size:.85rem;
-  color:#9ca3af;
-}
+  padding:.15rem .55rem;
+  font-size:.8rem;
+  color:#e2e8f0;
+}}
 </style>
 """,
     unsafe_allow_html=True,
 )
 
-# ---------------------- GEO per località gara ----------------------
+# ---------------------- SERVIZI CALENDARIO ----------------------
+_FIS_PROVIDER = FISCalendarProvider()
+_FISI_PROVIDER = FISICalendarProvider()
+_RACE_SERVICE = RaceCalendarService(_FIS_PROVIDER, _FISI_PROVIDER)
 
-def geocode_event_place(place: str):
+# ---------------------- GEOCODER GARE --------------------------
+MIN_ELEVATION_M = 1000.0
+UA = {"User-Agent": "telemark-wax-pro/2.0"}
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def geocode_race_place(query: str) -> Optional[Dict[str, Any]]:
+    q = (query or "").strip()
+    if not q:
+        return None
+
+    params = {
+        "name": q,
+        "language": "it",
+        "count": 10,
+        "format": "json",
+    }
     try:
         r = requests.get(
             "https://geocoding-api.open-meteo.com/v1/search",
-            params={"name": place, "count": 1, "language": "it", "format": "json"},
+            params=params,
+            headers=UA,
             timeout=8,
         )
         r.raise_for_status()
         js = r.json() or {}
-        results = js.get("results") or []
-        if not results:
-            return None
-        it = results[0]
-        lat = float(it.get("latitude", 0.0))
-        lon = float(it.get("longitude", 0.0))
-        name = it.get("name") or place
-        admin1 = it.get("admin1") or ""
-        cc = (it.get("country_code") or "").upper()
-        label = f"{name}, {admin1} — {cc}" if admin1 else f"{name} — {cc}"
-        return {"lat": lat, "lon": lon, "label": label}
     except Exception:
         return None
 
+    results = js.get("results") or []
+    best = None
+    for it in results:
+        elev = it.get("elevation")
+        if elev is None:
+            continue
+        try:
+            if float(elev) < MIN_ELEVATION_M:
+                continue
+        except Exception:
+            continue
+        best = it
+        break
+
+    if not best:
+        return None
+
+    cc = (best.get("country_code") or "").upper()
+    name = best.get("name") or ""
+    admin1 = best.get("admin1") or best.get("admin2") or ""
+    base = f"{name}, {admin1}".strip().replace(" ,", ",")
+    flag = "".join(
+        chr(127397 + ord(c)) for c in cc
+    ) if len(cc) == 2 else "🏳️"
+    label = f"{flag}  {base} — {cc}"
+
+    return {
+        "lat": float(best.get("latitude", 0.0)),
+        "lon": float(best.get("longitude", 0.0)),
+        "label": label,
+    }
+
+# ---------------------- SUPPORTO -------------------------------
+def ensure_base_location() -> Dict[str, Any]:
+    sel = get_current_selection()
+    if sel:
+        return sel
+    return {
+        "lat": 45.83333,
+        "lon": 7.73333,
+        "label": "🇮🇹  Champoluc-Champlan, Valle d’Aosta — IT",
+        "source": "default",
+    }
+
+
+def race_event_label(ev: RaceEvent) -> str:
+    disc = ev.discipline or "?"
+    d_txt = ev.start_date.strftime("%Y-%m-%d")
+    nation = ev.nation or ""
+    nat_txt = f" ({nation})" if nation else ""
+    return f"{d_txt} · {disc} · {ev.place}{nat_txt} · {ev.name}"
+
+
+def center_ctx_on_race_location(ctx: Dict[str, Any], event: RaceEvent) -> Dict[str, Any]:
+    raw_place = event.place or ""
+    query_name = raw_place.split("(")[0].strip() or raw_place.strip()
+
+    base = ensure_base_location()
+    lat = base["lat"]
+    lon = base["lon"]
+    label = base["label"]
+
+    geo = geocode_race_place(query_name)
+    if geo:
+        lat = geo["lat"]
+        lon = geo["lon"]
+        label = geo["label"]
+
+    ctx["lat"] = lat
+    ctx["lon"] = lon
+    ctx["place_label"] = label
+
+    st.session_state["lat"] = lat
+    st.session_state["lon"] = lon
+    st.session_state["place_label"] = label
+
+    return ctx
+
 
 # ---------------------- SIDEBAR ----------------------
-
 st.sidebar.markdown("### ⚙️")
 
 lang = st.sidebar.selectbox(
-    L["it"]["lang"] + " / " + L["en"]["lang"],
+    "Lingua / Language",
     ["IT", "EN"],
     index=0,
 )
 T = L["it"] if lang == "IT" else L["en"]
 
-st.sidebar.markdown("---")
-st.sidebar.markdown("#### Debug search")
+page = st.sidebar.radio(
+    "Sezione",
+    ["Località & Mappa", "Racing / Calendari"],
+    index=0,
+)
 
-search_path = getattr(search_mod, "__file__", "??")
-st.sidebar.text("Modulo search path:")
-st.sidebar.code(search_path, language="text")
+search_path = os.path.abspath(search_mod.__file__)
+st.sidebar.markdown("**Debug search.py**")
+st.sidebar.code(search_path, language="bash")
+st.sidebar.text(f"Search.VERSION: {getattr(search_mod, 'VERSION', SEARCH_VERSION)}")
 
-search_version = getattr(search_mod, "VERSION", "NO VERSION")
-st.sidebar.text("Search.VERSION:")
-st.sidebar.code(str(search_version), language="text")
+# ---------------------- MAIN -------------------------
+st.title("Telemark · Pro Wax & Tune")
 
-st.sidebar.markdown("---")
-st.sidebar.markdown("Lingua / Language")
-st.sidebar.write(lang)
+ctx: Dict[str, Any] = {"lang": lang}
 
-# ---------------------- WAX PAGE ----------------------
-
-def render_wax_page():
-    st.title("Telemark · Pro Wax & Tune")
-
+# =============== PAGINA 1: LOCALITÀ & MAPPA ===============
+if page == "Località & Mappa":
     st.markdown("## 🌍 Località")
 
-    col_c, col_s = st.columns([1, 2])
-    with col_c:
-        iso2 = country_selectbox(T)
-    with col_s:
-        location_searchbox(T, iso2)
+    iso2 = country_selectbox(T)
+    location_searchbox(T, iso2)
 
-    sel = get_current_selection() or {
-        "lat": 45.83333,
-        "lon": 7.73333,
-        "label": "🇮🇹  Champoluc-Champlan, Valle d’Aosta — IT",
-        "source": "default",
-    }
-
-    ctx = {
-        "lat": float(sel["lat"]),
-        "lon": float(sel["lon"]),
-        "place_label": sel["label"],
-        "place_source": sel["source"],
-        "lang": lang,
-    }
+    sel = ensure_base_location()
+    ctx.update(sel)
+    st.session_state["lat"] = sel["lat"]
+    st.session_state["lon"] = sel["lon"]
+    st.session_state["place_label"] = sel["label"]
 
     st.markdown(
-        f"""
-<div class="card">
-  <div class="badge">{T.get('selected_place', 'Località selezionata')}:</div>
-  <div style="margin-top:.35rem;font-size:1.05rem;font-weight:600;">
-    {ctx['place_label']}
-  </div>
-</div>
-""",
+        f'<div class="card">'
+        f'<span class="small"><strong>Località selezionata:</strong> {sel["label"]}</span>'
+        f"</div>",
         unsafe_allow_html=True,
     )
 
-    render_map(T, ctx, map_key="wax_map")
+    # mappa
+    st.markdown("## 4) Mappa & piste")
+    ctx["map_context"] = "local"
+    ctx = render_map(T, ctx) or ctx
+
+    # DEM
+    st.markdown("## 5) Esposizione & pendenza")
     render_dem(T, ctx)
 
+# =============== PAGINA 2: RACING / CALENDARI ===============
+else:
+    st.markdown("## 🏁 Racing / Calendari gare")
 
-# ---------------------- RACING PAGE ----------------------
-
-def _format_event_label(ev: RaceEvent) -> str:
-    d = ev.start_date.strftime("%d/%m/%Y")
-    disc = ev.discipline or "?"
-    fed = ev.federation.value
-    return f"{d} · {disc} · {ev.place} ({fed})"
-
-
-def render_racing_page():
-    st.title("🏁 Racing · Calendari & tuning")
-
-    base_sel = get_current_selection() or {
-        "lat": 45.83333,
-        "lon": 7.73333,
-        "label": "🇮🇹  Champoluc-Champlan, Valle d’Aosta — IT",
-        "source": "default",
-    }
-
-    st.markdown("### Calendario gare")
-
-    col_f1, col_f2 = st.columns(2)
-    this_year = datetime.utcnow().year
-
-    season = col_f1.number_input(
-        T.get("race_season", "Stagione"),
-        min_value=this_year - 1,
-        max_value=this_year + 1,
-        value=this_year,
-        step=1,
-        key="race_season",
-    )
-
-    fed_choice = col_f2.selectbox(
-        T.get("race_federation", "Federazione"),
-        ["FIS", "FISI"],
-        index=0,
-        key="race_federation",
-    )
-    federation = Federation.FIS if fed_choice == "FIS" else Federation.FISI
-
-    disc_label = st.selectbox(
-        T.get("race_disc", "Disciplina"),
-        ["Tutte", "SL", "GS", "SG", "DH"],
-        index=1,
-        key="race_disc",
-    )
-    disc_filter = None if disc_label == "Tutte" else disc_label
-
-    fis_provider = FISCalendarProvider()
-    fisi_provider = FISICalendarProvider()
-    cal_service = RaceCalendarService(fis_provider=fis_provider, fisi_provider=fisi_provider)
-
-    try:
-        with st.spinner("Carico calendario gare…"):
-            events = cal_service.list_events(
-                season=season,
-                federation=federation if federation in (Federation.FIS, Federation.FISI) else None,
-                discipline=disc_filter,
-                nation=None,
-                region="VDA" if federation == Federation.FISI else None,
-            )
-    except Exception as e:
-        st.error(f"Errore caricando il calendario gare: {e}")
-        return
-
-    if federation == Federation.FISI and not events:
-        st.info("FISI Valle d’Aosta: integrazione calendario ancora da completare.")
-        return
-
-    if not events:
-        st.info("Nessuna gara trovata per i filtri attuali.")
-        return
-
-    idx_default = st.session_state.get("race_event_index", 0)
-    idx_default = min(idx_default, len(events) - 1)
-
-    selected_idx = st.selectbox(
-        T.get("race_select", "Seleziona gara"),
-        options=list(range(len(events))),
-        format_func=lambda i: _format_event_label(events[i]),
-        index=idx_default,
-        key="race_event_select",
-    )
-    selected_event = events[selected_idx]
-    st.session_state["race_event_index"] = selected_idx
-
-    col_t1, col_t2 = st.columns(2)
-    default_hour = st.session_state.get("race_hour", 10)
-    default_min = st.session_state.get("race_min", 0)
-
-    race_hour = col_t1.slider("Ora gara", 7, 16, default_hour, key="race_hour")
-    race_min = col_t2.slider("Minuti gara", 0, 59, default_min, step=5, key="race_min")
-    race_time = dtime(hour=race_hour, minute=race_min)
-    race_dt = datetime.combine(selected_event.start_date, race_time)
-
-    geo = geocode_event_place(selected_event.place)
-    if geo:
-        race_lat = geo["lat"]
-        race_lon = geo["lon"]
-        race_label = f"{geo['label']} · {selected_event.discipline or ''}".strip()
-    else:
-        race_lat = float(base_sel["lat"])
-        race_lon = float(base_sel["lon"])
-        race_label = f"{base_sel['label']} · {selected_event.place}"
-
-    st.session_state["race_lat"] = race_lat
-    st.session_state["race_lon"] = race_lon
-    st.session_state["race_place_label"] = race_label
-
-    ctx = {
-        "lat": race_lat,
-        "lon": race_lon,
-        "place_label": race_label,
-        "lang": lang,
-        "race_datetime": race_dt,
-    }
+    base_loc = ensure_base_location()
+    ctx.update(base_loc)
+    st.session_state["lat"] = base_loc["lat"]
+    st.session_state["lon"] = base_loc["lon"]
+    st.session_state["place_label"] = base_loc["label"]
 
     st.markdown(
-        f"""
-<div class="card">
-  <div class="badge">Gara selezionata</div>
-  <div style="margin-top:.3rem;font-size:.98rem;">
-    {_format_event_label(selected_event)}
-  </div>
-  <div class="small" style="margin-top:.35rem;">
-    Località gara: {ctx['place_label']} · {race_dt.strftime('%d/%m/%Y · %H:%M')}
-  </div>
-</div>
-""",
+        f'<div class="card">'
+        f'<span class="small"><strong>Località di partenza (attuale):</strong> '
+        f'{base_loc["label"]}</span>'
+        f"</div>",
         unsafe_allow_html=True,
     )
 
-    # Mappa collegata SEMPRE alla gara selezionata
-    st.markdown("### Mappa & piste (vista gara)")
-    map_ctx = {
-        "lat": ctx["lat"],
-        "lon": ctx["lon"],
-        "place_label": ctx["place_label"],
-        "lang": lang,
-    }
-    render_map(T, map_ctx, map_key="race_map")
+    today = datetime.utcnow().date()
+    default_season = today.year if today.month >= 7 else today.year - 1
 
-    # METEO + TUNING
-    st.markdown("### Meteo, visibilità & tuning dinamico")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        season = st.number_input(
+            "Stagione (anno iniziale)",
+            min_value=2020,
+            max_value=default_season + 1,
+            value=default_season,
+            step=1,
+        )
+    with c2:
+        fed_choice = st.selectbox(
+            "Federazione",
+            ["Tutte", "FIS", "FISI"],
+            index=1,
+        )
+        if fed_choice == "FIS":
+            federation: Optional[Federation] = Federation.FIS
+        elif fed_choice == "FISI":
+            federation = Federation.FISI
+        else:
+            federation = None
+    with c3:
+        disc_choice = st.selectbox(
+            "Disciplina",
+            ["Tutte"] + [d.value for d in Discipline],
+            index=0,
+        )
+        discipline_filter: Optional[str] = None if disc_choice == "Tutte" else disc_choice
 
-    profile = build_meteo_profile_for_race_day(ctx)
-    if profile is None:
-        st.warning("Meteo non disponibile per questa località/data.")
-        return
+    nation_filter: Optional[str] = None
+    region_filter: Optional[str] = None
 
-    if disc_filter and disc_filter in Discipline.__members__:
-        race_disc_enum = Discipline[disc_filter]
-    elif selected_event.discipline and selected_event.discipline in Discipline.__members__:
-        race_disc_enum = Discipline[selected_event.discipline]
+    with st.spinner("Scarico calendario gare (Neveitalia)…"):
+        events = _RACE_SERVICE.list_events(
+            season=season,
+            federation=federation,
+            discipline=discipline_filter,
+            nation=nation_filter,
+            region=region_filter,
+        )
+
+    if not events:
+        st.info("Nessuna gara trovata per i filtri selezionati.")
     else:
-        race_disc_enum = Discipline.GS
+        labels = [race_event_label(ev) for ev in events]
+        label_to_event = {lbl: ev for lbl, ev in zip(labels, events)}
 
-    skier_level_enum = SkierLevel.WC
+        default_idx = 0
+        prev_label = st.session_state.get("race_selected_label")
+        if prev_label in label_to_event:
+            default_idx = labels.index(prev_label)
 
-    dyn = build_dynamic_tuning_for_race(
-        profile=profile,
-        ctx=ctx,
-        discipline=race_disc_enum,
-        skier_level=skier_level_enum,
-        injected=False,
-    )
+        selected_label = st.selectbox(
+            "Seleziona gara",
+            labels,
+            index=default_idx,
+            key="race_select",
+        )
+        selected_event = label_to_event[selected_label]
+        st.session_state["race_selected_label"] = selected_label
 
-    if dyn is None:
-        st.info("Impossibile costruire raccomandazioni di tuning per questa gara.")
-        return
+        default_time = st.session_state.get("race_time", dtime(hour=10, minute=0))
+        race_time = st.time_input(
+            "Orario di partenza gara (ora locale comprensorio)",
+            value=default_time,
+            key="race_time_input",
+        )
+        st.session_state["race_time"] = race_time
 
-    col_m1, col_m2 = st.columns(2)
+        race_datetime = datetime.combine(selected_event.start_date, race_time)
+        ctx["race_event"] = selected_event
+        ctx["race_datetime"] = race_datetime
 
-    with col_m1:
-        st.markdown("#### Condizioni neve & visibilità")
-        st.metric("Temperatura neve (stimata)", f"{dyn.snow_temp_c:.1f} °C")
-        st.metric("Temperatura aria", f"{dyn.air_temp_c:.1f} °C")
-        st.metric("Pendenza media locale", f"{dyn.slope_deg:.1f} °")
-        st.metric("Esposizione (bussola)", f"{dyn.aspect_txt} ({dyn.aspect_deg:.0f}°)")
-        st.metric("Indice visibilità", f"{dyn.visibility_index:.0f}/100 · {dyn.visibility_txt}")
+        # centra sempre sulla località gara
+        ctx = center_ctx_on_race_location(ctx, selected_event)
 
-    with col_m2:
-        st.markdown("#### Tuning consigliato")
-        st.metric("Base bevel", f"{dyn.base_bevel_deg:.1f}°")
-        st.metric("Side bevel", f"{dyn.side_bevel_deg:.1f}°")
-        st.metric("Struttura soletta", dyn.structure_pattern)
-        st.metric("Gruppo sciolina", dyn.wax_group)
+        # mappa context specifico per forza-refresh
+        ctx["map_context"] = f"race_{selected_event.start_date.isoformat()}_{selected_event.place}"
 
-    st.markdown(f"**Profilo setup:** {dyn.risk_level.upper()}")
-    st.markdown(f"**Note:** {dyn.notes}")
+        st.markdown(
+            f'<div class="card">'
+            f'<div class="small"><strong>Gara selezionata:</strong> {race_event_label(selected_event)}</div>'
+            f'<div class="small">Partenza prevista: {race_datetime.strftime("%Y-%m-%d · %H:%M")}</div>'
+            f'<div class="small"><strong>Località mappa per questa gara:</strong> '
+            f'{ctx.get("place_label","")}</div>'
+            f"</div>",
+            unsafe_allow_html=True,
+        )
 
+        # mappa & piste
+        st.markdown("### Mappa & piste per la gara")
+        ctx = render_map(T, ctx) or ctx
 
-# ---------------------- LAYOUT Tabs ----------------------
+        # DEM con ombreggiatura (usa ctx['race_datetime'] internamente)
+        st.markdown("### Esposizione & pendenza sulla pista selezionata")
+        render_dem(T, ctx)
 
-tab1, tab2 = st.tabs(["🎿 Wax & Tune", "🏁 Racing"])
+        # ---------- Tuning WC di base (preset statico) ----------
+        wc = get_wc_tuning_for_event(selected_event, WCSkierLevel.WC)
+        if wc is not None:
+            params_dict, data_dict = wc
+            st.markdown("### Tuning WC di base (preset)")
 
-with tab1:
-    render_wax_page()
+            c1m, c2m, c3m = st.columns(3)
+            c1m.metric("Base bevel", f"{params_dict['base_bevel_deg']:.1f}°")
+            c2m.metric("Side bevel", f"{params_dict['side_bevel_deg']:.1f}°")
+            c3m.metric("Rischio", str(params_dict["risk_level"]).title())
 
-with tab2:
-    render_racing_page()
+            st.markdown(
+                f"- **Struttura**: {data_dict['structure_pattern']}\n"
+                f"- **Wax group**: {data_dict['wax_group']}\n"
+                f"- **Tipo neve**: {data_dict['snow_type']}\n"
+                f"- **Neve (preset)**: {data_dict['snow_temp_c']} °C · "
+                f"**Aria (preset)**: {data_dict['air_temp_c']} °C\n"
+                f"- **Injected / ghiaccio**: {data_dict['injected']}\n"
+                f"- **Note**: {data_dict['notes']}"
+            )
+
+        # ---------- METEO & GRAFICI GARA ----------
+        st.markdown("### 📈 Meteo & profilo giornata gara")
+
+        profile = meteo_mod.build_meteo_profile_for_race_day(ctx)
+        if profile is None:
+            st.warning("Impossibile costruire il profilo meteo per questa gara.")
+        else:
+            # DataFrame per grafici
+            df = pd.DataFrame(
+                {
+                    "time": profile.times,
+                    "temp_air": profile.temp_air,
+                    "snow_temp": profile.snow_temp,
+                    "rh": profile.rh,
+                    "cloudcover": profile.cloudcover,
+                    "windspeed": profile.windspeed,
+                    "shade_index": profile.shade_index,
+                    "snow_moisture_index": profile.snow_moisture_index,
+                    "glide_index": profile.glide_index,
+                }
+            ).set_index("time")
+
+            st.caption("Grafici riferiti all'intera giornata di gara (00–24).")
+
+            c_a, c_b = st.columns(2)
+            with c_a:
+                st.markdown("**Temperatura aria vs neve**")
+                st.line_chart(df[["temp_air", "snow_temp"]])
+
+                st.markdown("**Umidità relativa (%)**")
+                st.line_chart(df[["rh"]])
+            with c_b:
+                st.markdown("**Indice ombreggiatura** (0 sole, 1 ombra/luce piatta)")
+                st.line_chart(df[["shade_index"]])
+
+                st.markdown("**Indice scorrevolezza teorica** (0–1)")
+                st.line_chart(df[["glide_index"]])
+
+            st.markdown("**Vento (km/h) e copertura nuvolosa (%)**")
+            st.line_chart(df[["windspeed", "cloudcover"]])
+
+            # ---------- TUNING DINAMICO BASATO SU METEO ----------
+            st.markdown("### 🎯 Tuning dinamico basato su meteo reale")
+
+            # scegli livello atleta (per ora semplifichiamo)
+            level_choice = st.selectbox(
+                "Livello sciatore per questo tuning",
+                [
+                    ("WC / Coppa del Mondo", TuneSkierLevel.WC),
+                    ("FIS / Continental", TuneSkierLevel.FIS),
+                    ("Esperto", TuneSkierLevel.EXPERT),
+                    ("Turistico evoluto", TuneSkierLevel.TOURIST),
+                ],
+                format_func=lambda x: x[0],
+            )
+            chosen_level = level_choice[1]
+
+            # per ora lasciamo "iniettata" come toggle manuale
+            injected_flag = st.checkbox(
+                "Pista iniettata / ghiacciata",
+                value=True if wc is not None else False,
+            )
+
+            dyn = meteo_mod.build_dynamic_tuning_for_race(
+                profile=profile,
+                ctx=ctx,
+                discipline=selected_event.discipline or Discipline.GS,
+                skier_level=chosen_level,
+                injected=injected_flag,
+            )
+
+            if dyn is None:
+                st.info("Non è stato possibile calcolare il tuning dinamico per questa gara.")
+            else:
+                # usa core.race_tuning per la raccomandazione finale
+                rec = get_tuning_recommendation(dyn.input_params)
+
+                c1t, c2t, c3t = st.columns(3)
+                c1t.metric("Base bevel (dinamico)", f"{rec.base_bevel_deg:.1f}°")
+                c2t.metric("Side bevel (dinamico)", f"{rec.side_bevel_deg:.1f}°")
+                c3t.metric("Rischio", rec.risk_level.capitalize())
+
+                st.markdown(
+                    f"- **Neve stimata gara**: {dyn.input_params.snow_temp_c:.1f} °C "
+                    f"({dyn.snow_type.value})\n"
+                    f"- **Aria all'ora di gara**: {dyn.input_params.air_temp_c:.1f} °C\n"
+                    f"- **Struttura soletta suggerita**: {rec.structure_pattern}\n"
+                    f"- **Wax group suggerito**: {rec.wax_group}\n"
+                    f"- **Note edges**: {rec.notes}\n"
+                )
+                st.caption(dyn.summary)
