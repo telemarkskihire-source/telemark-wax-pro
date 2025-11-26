@@ -1,8 +1,10 @@
 # core/maps.py
 # Mappa & piste (OSM / Overpass) per Telemark · Pro Wax & Tune
-# - SOLO piste sci alpino (piste:type=downhill/alpine)
+# - SOLO piste sci alpino/downhill
 # - click sulla mappa -> punto più vicino su una pista
 # - layer OSM + Satellite (Esri)
+# - la chiave del widget mappa tiene conto di un "map_context" passato via ctx
+#   (es. "local" o "race_<gara>") così quando cambi gara il widget si rigenera.
 
 from __future__ import annotations
 
@@ -35,7 +37,6 @@ BASE_RADIUS_KM = 10
 FALLBACK_RADIUS_KM = 25
 
 
-# ---------- Helper geografici ----------
 def _haversine(lat1, lon1, lat2, lon2) -> float:
     R = 6371.0
     p1, p2 = math.radians(lat1), math.radians(lat2)
@@ -45,11 +46,9 @@ def _haversine(lat1, lon1, lat2, lon2) -> float:
     return 2 * R * math.asin(math.sqrt(a))
 
 
-# ---------- Overpass ----------
-def _overpass_query(lat: float, lon: float, dist_km: int) -> List[Dict[str, Any]]:
+def _overpass_query(lat: float, lon: float, dist_km: int):
     """
-    Recupera SOLO way con 'piste:type=downhill' (sci alpino).
-    Aggiungo anche eventuale 'alpine' per sicurezza.
+    SOLO piste:type downhill/alpine (sci alpino).
     """
     radius_m = int(dist_km * 1000)
 
@@ -99,7 +98,6 @@ def fetch_pistes(lat: float, lon: float, dist_km: int):
 
         coords = [{"lat": g["lat"], "lon": g["lon"]} for g in geom]
 
-        # lunghezza grezza (km)
         length_km = 0.0
         if len(coords) >= 2:
             for i in range(1, len(coords)):
@@ -134,17 +132,23 @@ def _difficulty_label(diff: str, lang: str) -> str:
     return diff
 
 
-# ---------- Render principale ----------
-def render_map(T: Dict[str, str], ctx: Dict[str, Any]):
+def render_map(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    ctx deve contenere:
+      - lat, lon, place_label
+      - opzionale: map_context (es. "local", "race_<id>")
+    Ritorna ctx (eventualmente aggiornato dopo click sulla pista).
+    """
     lang = ctx.get("lang", "IT")
     lat = float(ctx.get("lat", 45.831))
     lon = float(ctx.get("lon", 7.730))
     place_label = ctx.get("place_label", "Località")
+    map_context = str(ctx.get("map_context", "default"))
 
     show_pistes = st.checkbox(
         "Mostra piste sci alpino sulla mappa",
         value=True,
-        key="show_pistes",
+        key=f"show_pistes_{map_context}",
     )
 
     pistes: List[Dict[str, Any]] = []
@@ -177,51 +181,53 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]):
         st.info(
             "Modulo mappa avanzata richiede 'folium' e 'streamlit-folium' installati in questo ambiente."
         )
-        return
+        return ctx
 
     # ---- Mappa Folium ----
     m = folium.Map(
         location=[lat, lon],
         zoom_start=13,
-        tiles=None,          # usiamo solo tile layer custom
+        tiles=None,
         control_scale=True,
         prefer_canvas=True,
     )
 
-    # Layer OSM standard
+    # OSM standard
     folium.TileLayer(
         tiles="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",
         name="OSM",
         attr="© OpenStreetMap contributors",
         overlay=False,
         control=True,
-        show=False,          # NON predefinito
+        show=False,
     ).add_to(m)
 
-    # Layer Satellite (Esri World Imagery) – predefinito
+    # Satellite (Esri)
     folium.TileLayer(
         tiles=(
             "https://server.arcgisonline.com/ArcGIS/rest/services/"
             "World_Imagery/MapServer/tile/{z}/{y}/{x}"
         ),
         name="Satellite",
-        attr="Tiles © Esri — Source: Esri, i-cubed, USDA, USGS, AEX, GeoEye, "
-             "Getmapping, Aerogrid, IGN, IGP, UPR-EGP, and the GIS User Community",
+        attr=(
+            "Tiles © Esri — Source: Esri, i-cubed, USDA, USGS, AEX, GeoEye, "
+            "Getmapping, Aerogrid, IGN, IGP, UPR-EGP, and the GIS User Community"
+        ),
         overlay=False,
         control=True,
-        show=True,          # è il layer attivo di default
+        show=True,
     ).add_to(m)
 
     folium.LayerControl(position="topright", collapsed=True).add_to(m)
 
-    # marker del punto selezionato
+    # marker località
     folium.Marker(
         [lat, lon],
         tooltip=place_label,
         icon=folium.Icon(color="lightgray", icon="info-sign"),
     ).add_to(m)
 
-    # disegno piste
+    # disegna piste
     for p in pistes:
         coords = [(c["lat"], c["lon"]) for c in p["coords"]]
         if not coords:
@@ -241,12 +247,14 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]):
             tooltip=popup,
         ).add_to(m)
 
-    # click -> attacca il posizionatore alla pista più vicina
+    # chiave widget: dipende anche da map_context, così cambiando gara si rigenera
+    map_key = f"map_{round(lat,5)}_{round(lon,5)}_{abs(hash(map_context)) % 10**6}"
+
     out = st_folium(
         m,
         height=420,
         use_container_width=True,
-        key=f"map_{round(lat,5)}_{round(lon,5)}",
+        key=map_key,
         returned_objects=["last_clicked"],
     )
 
@@ -268,7 +276,6 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]):
                     best_point = (c["lat"], c["lon"])
 
         if best_p and best_point:
-            # aggiorno ctx e session_state al punto più vicino sulla pista
             new_lat, new_lon = best_point
             base_label = place_label.split("—")[0].strip()
             piste_name = best_p["name"] or "pista"
@@ -281,3 +288,5 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]):
             st.session_state["lat"] = float(new_lat)
             st.session_state["lon"] = float(new_lon)
             st.session_state["place_label"] = new_label
+
+    return ctx
