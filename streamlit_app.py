@@ -14,7 +14,7 @@ from typing import Optional, Dict, Any
 import requests
 import pandas as pd
 import streamlit as st
-import altair as alt  # <-- NUOVO: per grafici statici
+import altair as alt
 
 # --- hard-reload moduli core.* ---
 importlib.invalidate_caches()
@@ -117,7 +117,7 @@ hr {{
 
 # ---------------------- SERVIZI CALENDARIO ----------------------
 _FIS_PROVIDER = FISCalendarProvider()
-_FISI_PROVIDER = FISICalendarProvider()  # per ora ancora “vuoto” lato dati reali
+_FISI_PROVIDER = FISICalendarProvider()
 _RACE_SERVICE = RaceCalendarService(_FIS_PROVIDER, _FISI_PROVIDER)
 
 # ---------------------- GEOCODER GARE --------------------------
@@ -411,7 +411,6 @@ else:
             c1m, c2m, c3m = st.columns(3)
             c1m.metric("Base bevel", f"{params_dict['base_bevel_deg']:.1f}°")
             c2m.metric("Side bevel", f"{params_dict['side_bevel_deg']:.1f}°")
-            # QUI: Rischio → Profilo
             c3m.metric("Profilo", str(params_dict["risk_level"]).title())
 
             st.markdown(
@@ -448,7 +447,7 @@ else:
 
             st.caption("Grafici riferiti all'intera giornata di gara (00–24).")
 
-            # ---- grafici statici Altair, SENZA tooltip / zoom ----
+            # ---- grafici statici Altair, SENZA tooltip ----
             df_reset = df.reset_index()
 
             # aria vs neve
@@ -542,6 +541,45 @@ else:
             st.markdown("**Vento (km/h) e copertura nuvolosa (%)**")
             st.altair_chart(chart_wind_cloud, use_container_width=True)
 
+            # ---- Grafico icone meteo stile Meteoblue ----
+            icon_df = df_reset.copy()
+            icons = []
+            for _, row in icon_df.iterrows():
+                cc = float(row["cloudcover"])
+                pr = float(row["precipitation"]) if "precipitation" in row else 0.0
+                sf = float(row["snowfall"]) if "snowfall" in row else 0.0
+
+                if sf > 0.2:
+                    icon = "❄️"
+                elif pr > 0.2:
+                    icon = "🌧️"
+                else:
+                    if cc < 20:
+                        icon = "☀️"
+                    elif cc < 60:
+                        icon = "🌤️"
+                    else:
+                        icon = "☁️"
+                icons.append(icon)
+
+            icon_df["icon"] = icons
+            icon_df["y"] = 0
+
+            chart_icons = (
+                alt.Chart(icon_df)
+                .mark_text(size=18)
+                .encode(
+                    x=alt.X("time:T", title=None),
+                    y=alt.Y("y:Q", axis=None),
+                    text="icon:N",
+                    tooltip=[],
+                )
+                .properties(height=60)
+            )
+
+            st.markdown("**Sintesi meteo giornata (icone)**")
+            st.altair_chart(chart_icons, use_container_width=True)
+
             # ---------- TUNING DINAMICO BASATO SU METEO ----------
             st.markdown("### 🎯 Tuning dinamico basato su meteo reale")
 
@@ -578,7 +616,6 @@ else:
                 c1t, c2t, c3t = st.columns(3)
                 c1t.metric("Base bevel (dinamico)", f"{rec.base_bevel_deg:.1f}°")
                 c2t.metric("Side bevel (dinamico)", f"{rec.side_bevel_deg:.1f}°")
-                # QUI: Rischio → Profilo
                 c3t.metric("Profilo", rec.risk_level.capitalize())
 
                 st.markdown(
@@ -587,6 +624,8 @@ else:
                     f"- **Aria all'ora di gara**: {dyn.input_params.air_temp_c:.1f} °C\n"
                     f"- **Struttura soletta suggerita**: {rec.structure_pattern}\n"
                     f"- **Wax group suggerito**: {rec.wax_group}\n"
+                    f"- **VLT consigliata maschera/occhiale**: "
+                    f"{dyn.vlt_pct:.0f}% ({dyn.vlt_label})\n"
                     f"- **Note edges**: {rec.notes}\n"
                 )
                 st.caption(dyn.summary)
