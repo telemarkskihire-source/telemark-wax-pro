@@ -2,22 +2,24 @@
 # DEM locale tramite Open-Meteo:
 # - pendenza (° e %)
 # - esposizione (bussola + gradi)
-# - stima ombreggiatura
-#   · all'ora attuale
-#   · all'ora di gara (se ctx["race_datetime"] presente)
+# - stima ombreggiatura:
+#     · ora attuale
+#     · ora gara (se ctx["race_datetime"] presente)
+#   con correzione qualitativa in base alla nuvolosità
 # - altitudine con override manuale per ogni punto selezionato
+# - espone in ctx anche un mini pacchetto meteo per ora attuale / ora gara
 
 from __future__ import annotations
 
 import math
 from datetime import datetime
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 
 import requests
 import numpy as np
 import streamlit as st
 
-UA = {"User-Agent": "telemark-wax-pro/2.0"}
+UA = {"User-Agent": "telemark-wax-pro/2.1"}
 
 
 def dem_patch(lat: float, lon: float, spacing_m: int = 30, size: int = 3):
@@ -63,7 +65,7 @@ def slope_aspect_from_dem(Z, spacing_m):
     slope_deg = math.degrees(slope_rad)
     slope_pct = math.tan(slope_rad) * 100.0
 
-    aspect_rad = math.atan2(dzdx, dzdy)  # convenzione N=0
+    aspect_rad = math.atan2(dzdx, dzdy)  # N=0
     aspect_deg = (math.degrees(aspect_rad) + 360.0) % 360.0
     return float(slope_deg), float(slope_pct), float(aspect_deg)
 
@@ -92,10 +94,6 @@ def aspect_to_compass(deg: float):
 
 
 def _base_shade_from_aspect(aspect_deg: float) -> str:
-    """
-    Classificazione generica (senza orario), solo da esposizione:
-    stessa logica che avevamo prima.
-    """
     d = aspect_deg % 360
     if (315 <= d <= 360) or (0 <= d <= 45):
         return "molto ombreggiata"
@@ -105,33 +103,125 @@ def _base_shade_from_aspect(aspect_deg: float) -> str:
 
 
 def shade_with_time(aspect_deg: float, hour_local: float) -> str:
-    """
-    Stima qualitativa di ombreggiatura che tiene conto grossolanamente dell'orario.
-    Idea:
-      - mattina (<10): pendii EST/SE più soleggiati, OVEST/NO più in ombra
-      - mezzogiorno (10–14): usa classificazione base
-      - pomeriggio (>14): pendii OVEST/SO più soleggiati, EST/NE più in ombra
-    """
     d = aspect_deg % 360
     base = _base_shade_from_aspect(d)
 
-    # zona oraria approssimata in blocchi
     if hour_local < 10.0:  # mattina
-        if 45 <= d <= 150:  # NE–SE rivolti verso il sole del mattino
+        if 45 <= d <= 150:  # NE–SE
             return "molto soleggiata"
         if 210 <= d <= 330:  # SO–NO
             return "molto ombreggiata"
         return "parzialmente in ombra" if base != "molto soleggiata" else base
 
     if 10.0 <= hour_local <= 14.0:
-        return base  # metà giornata: esposizione quasi "pura"
+        return base
 
-    # pomeriggio / sera
+    # pomeriggio
     if 210 <= d <= 300:  # S–SO–O
         return "molto soleggiata"
     if 30 <= d <= 150:  # NE–E–SE
         return "molto ombreggiata"
     return "parzialmente in ombra" if base != "molto soleggiata" else base
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def _hourly_weather_for_date(lat: float, lon: float, date_str: str) -> Optional[Dict[str, Any]]:
+    """
+    Recupera meteo oraria da Open-Meteo per una singola data:
+    - temperatura 2m
+    - umidità relativa
+    - copertura nuvolosa
+    - vento
+    - precipitazione / neve
+    """
+    params = {
+        "latitude": lat,
+        "longitude": lon,
+        "hourly": "temperature_2m,relativehumidity_2m,cloudcover,windspeed_10m,precipitation,snowfall",
+        "start_date": date_str,
+        "end_date": date_str,
+        "timezone": "auto",
+    }
+    try:
+        r = requests.get(
+            "https://api.open-meteo.com/v1/forecast",
+            params=params,
+            headers=UA,
+            timeout=10,
+        )
+        r.raise_for_status()
+        js = r.json() or {}
+        return js.get("hourly") or None
+    except Exception:
+        return None
+
+
+def _interp_hourly(weather: Dict[str, Any], target_hour: int) -> Dict[str, float]:
+    """
+    Estrae il valore più vicino all'ora target (0-23).
+    """
+    times = weather.get("time") or []
+    if not times:
+        return {}
+
+    idx_best = None
+    best_diff = 999
+    for idx, t in enumerate(times):
+        # formato "YYYY-MM-DDTHH:MM"
+        try:
+            hh = int(t[11:13])
+        except Exception:
+            continue
+        diff = abs(hh - target_hour)
+        if diff < best_diff:
+            best_diff = diff
+            idx_best = idx
+
+    if idx_best is None:
+        return {}
+
+    def _get(name: str):
+        arr = weather.get(name) or []
+        if idx_best < len(arr):
+            try:
+                return float(arr[idx_best])
+            except Exception:
+                return None
+        return None
+
+    return {
+        "temp_air": _get("temperature_2m"),
+        "rh": _get("relativehumidity_2m"),
+        "cloudcover": _get("cloudcover"),
+        "windspeed": _get("windspeed_10m"),
+        "precip": _get("precipitation"),
+        "snowfall": _get("snowfall"),
+    }
+
+
+def _shade_with_meteo(aspect_deg: float, hour_local: float, cloudcover: Optional[float]) -> str:
+    """
+    Integra nuvolosità: se copertura molto alta, anche un pendio "molto soleggiata"
+    diventa luce diffusa / meno impattante sulla neve.
+    """
+    base = shade_with_time(aspect_deg, hour_local)
+    if cloudcover is None:
+        return base
+
+    if cloudcover >= 85:
+        # cielo coperto, luce piatta
+        if "soleggiata" in base:
+            return "luce diffusa (cielo coperto), ombreggiatura poco rilevante"
+        if "ombreggiata" in base:
+            return "ombreggiata ma con cielo coperto (contrasto ridotto)"
+        return "luce diffusa (cielo coperto)"
+    if 50 <= cloudcover < 85:
+        # parzialmente nuvoloso
+        if "molto soleggiata" in base:
+            return "parzialmente soleggiata (nuvolosità variabile)"
+        return base
+    # cielo abbastanza sereno
+    return base
 
 
 def render_dem(T: Dict[str, str], ctx: Dict[str, Any]):
@@ -157,10 +247,8 @@ def render_dem(T: Dict[str, str], ctx: Dict[str, Any]):
         sdeg, spct, adeg = slope_aspect_from_dem(Z, spacing_m)
         compass = aspect_to_compass(adeg)
 
-        # altitudine DEM al centro patch
         center_alt = float(Z[Z.shape[0] // 2, Z.shape[1] // 2])
 
-        # chiave per override legata a lat/lon -> cambia quando cambi pista/punto
         alt_key = f"altitude_override_m_{round(lat,5)}_{round(lon,5)}"
         default_alt = float(st.session_state.get(alt_key, center_alt))
 
@@ -182,32 +270,47 @@ def render_dem(T: Dict[str, str], ctx: Dict[str, Any]):
             f"{compass} ({adeg:.0f}°)",
         )
 
-        # ---- Ombreggiatura: adesso + ora gara (se presente) ----
+        # ---------- METEO + OMBREGGIATURA ----------
         now = datetime.now()
         now_hour = now.hour + now.minute / 60.0
-        shade_now = shade_with_time(adeg, now_hour)
-
         race_dt = ctx.get("race_datetime")
-        if isinstance(race_dt, datetime):
+        has_race = isinstance(race_dt, datetime)
+
+        # meteo ora attuale
+        weather_now = _hourly_weather_for_date(lat, lon, now.date().isoformat())
+        sample_now = _interp_hourly(weather_now, now.hour) if weather_now else {}
+
+        cloud_now = sample_now.get("cloudcover")
+        shade_now = _shade_with_meteo(adeg, now_hour, cloud_now)
+
+        ctx["meteo_now"] = sample_now
+
+        if has_race:
+            weather_race = _hourly_weather_for_date(lat, lon, race_dt.date().isoformat())
+            sample_race = _interp_hourly(weather_race, race_dt.hour) if weather_race else {}
+            cloud_race = sample_race.get("cloudcover")
             race_hour = race_dt.hour + race_dt.minute / 60.0
-            shade_race = shade_with_time(adeg, race_hour)
+            shade_race = _shade_with_meteo(adeg, race_hour, cloud_race)
+            ctx["meteo_race"] = sample_race
 
             st.caption(
-                f"Ora attuale ~{now_hour:.1f}h → stima ombreggiatura: {shade_now}."
+                f"Ora attuale ~{now_hour:.1f}h → ombreggiatura stimata: {shade_now} "
+                + (f"(nuvolosità ~{cloud_now:.0f}%)." if cloud_now is not None else ".")
             )
             st.caption(
-                f"Ora gara {race_dt.strftime('%Y-%m-%d · %H:%M')} → "
-                f"stima ombreggiatura: {shade_race}."
+                f"Ora gara {race_dt.strftime('%Y-%m-%d · %H:%M')} → ombreggiatura stimata: {shade_race} "
+                + (f"(nuvolosità ~{cloud_race:.0f}%)." if cloud_race is not None else ".")
             )
         else:
             st.caption(
-                f"Stima ombreggiatura ora (~{now_hour:.1f}h): {shade_now}."
+                f"Stima ombreggiatura ora (~{now_hour:.1f}h): {shade_now} "
+                + (f"(nuvolosità ~{cloud_now:.0f}%)." if cloud_now is not None else ".")
             )
 
         st.caption(f"Altitudine DEM di riferimento (centro patch): {center_alt:.0f} m")
 
 
-# alias per compatibilità
+# alias
 render_slope_shade_panel = render_dem
 dem_panel = render_dem
 show_dem = render_dem
