@@ -13,10 +13,9 @@
 #   · shade_index 0–1 (0 pieno sole, 1 piena ombra / luce piatta)
 #   · snow_moisture_index 0–1 (0 secca, 1 molto bagnata)
 #   · glide_index 0–1 (scorrevolezza)
-# - VLT consigliato (visible light transmission) per la maschera:
-#   · vlt_percent + categoria (S0–S4) in base a luce/ombra e nuvole
 # - Funzione per derivare parametri di tuning dinamico
 #   (snow_temp_c, snow_type) da passare a core.race_tuning.get_tuning_recommendation
+# - Calcolo Visible Light Transmission consigliato per lenti (VLT)
 
 from __future__ import annotations
 
@@ -35,12 +34,7 @@ UA = {"User-Agent": "telemark-wax-pro/3.0"}
 
 # ---------- chiamata Open-Meteo -------------------------------------------
 @st.cache_data(ttl=900, show_spinner=False)
-def fetch_hourly_meteo(
-    lat: float,
-    lon: float,
-    start: date,
-    end: date,
-) -> Optional[Dict[str, Any]]:
+def fetch_hourly_meteo(lat: float, lon: float, start: date, end: date) -> Optional[Dict[str, Any]]:
     """
     Meteo oraria per intervallo [start, end] (inclusi):
     - temperature_2m (°C)
@@ -85,11 +79,7 @@ def fetch_hourly_meteo(
 
 
 # ---------- utilità meteo / neve ------------------------------------------
-def _shade_factor(
-    aspect_deg: float,
-    hour_local: float,
-    cloudcover: Optional[float],
-) -> float:
+def _shade_factor(aspect_deg: float, hour_local: float, cloudcover: Optional[float]) -> float:
     """
     Restituisce un indice 0–1:
       0 = pieno sole
@@ -170,7 +160,10 @@ def _snow_temp_series(
         last_24_mask = np.array([True], dtype=bool)
     else:
         ref_time = times[-1] - timedelta(hours=24)
-        last_24_mask = np.array([t >= ref_time for t in times], dtype=bool)
+        last_24_mask = np.array(
+            [t >= ref_time for t in times],
+            dtype=bool,
+        )
 
     fresh_snow_mm = float(np.nansum(np.where(last_24_mask, snowfall, 0.0)))
     # più neve fresca → neve "segue" più l'aria
@@ -245,10 +238,7 @@ def _snow_moisture_index(
     return np.clip(m, 0.0, 1.0)
 
 
-def _glide_index(
-    snow_temp: np.ndarray,
-    moisture: np.ndarray,
-) -> np.ndarray:
+def _glide_index(snow_temp: np.ndarray, moisture: np.ndarray) -> np.ndarray:
     """
     Indice 0–1 di "scorrevolezza" teorica:
     - troppo fredda/secca o troppo bagnata → meno glide
@@ -390,9 +380,9 @@ def build_meteo_profile_for_race_day(ctx: Dict[str, Any]) -> Optional[MeteoProfi
 class DynamicTuningResult:
     input_params: TuningParamsInput
     snow_type: SnowType
-    summary: str          # testo descrittivo per UI
-    vlt_percent: float    # VLT consigliato (0–100 %)
-    vlt_category: str     # es. "S2 (20%) – sole moderato"
+    summary: str  # testo descrittivo per UI
+    vlt_pct: float  # VLT consigliata (0–100 %)
+    vlt_label: str  # descrizione (cat. lente)
 
 
 def _classify_snow_type_from_profile(
@@ -416,38 +406,6 @@ def _classify_snow_type_from_profile(
     return SnowType.PACKED
 
 
-def _suggest_vlt(
-    shade_idx: float,
-    cloudcover_pct: float,
-) -> tuple[float, str]:
-    """
-    Stima VLT consigliato in base a luminosità:
-    - combina ombreggiatura (shade_idx) e nuvolosità
-    - ritorna (percentuale, categoria S0–S4)
-    """
-    # 0 = buio, 1 = luce fortissima
-    brightness = (1.0 - shade_idx) * (1.0 - cloudcover_pct / 100.0)
-    brightness = float(np.clip(brightness, 0.0, 1.0))
-
-    if brightness >= 0.8:
-        vlt = 10.0
-        cat = "S3–S4 (~10% VLT, molto scuro)"
-    elif brightness >= 0.6:
-        vlt = 20.0
-        cat = "S2 (~20% VLT, sole pieno)"
-    elif brightness >= 0.4:
-        vlt = 30.0
-        cat = "S1–S2 (~30% VLT, luce media)"
-    elif brightness >= 0.25:
-        vlt = 40.0
-        cat = "S1 (~40% VLT, cielo velato)"
-    else:
-        vlt = 60.0
-        cat = "S0–S1 (50–70% VLT, luce piatta / notturna)"
-
-    return vlt, cat
-
-
 def build_dynamic_tuning_for_race(
     profile: MeteoProfile,
     ctx: Dict[str, Any],
@@ -460,7 +418,7 @@ def build_dynamic_tuning_for_race(
     parametri di tuning dinamico:
       - snow_temp_c = temperatura neve stimata all'ora di gara
       - snow_type   = tipologia neve da profilo
-      - vlt_percent = VLT consigliato per la maschera
+      - vlt_pct     = Visible Light Transmission consigliata per lenti
     """
     race_dt = ctx.get("race_datetime")
     if not isinstance(race_dt, datetime):
@@ -492,8 +450,6 @@ def build_dynamic_tuning_for_race(
         moisture_idx=moisture,
         injected=injected,
     )
-
-    vlt_percent, vlt_cat = _suggest_vlt(shade_idx, cloud)
 
     params = TuningParamsInput(
         discipline=discipline,
@@ -532,18 +488,36 @@ def build_dynamic_tuning_for_race(
         else "scorrevolezza limitata"
     )
 
+    # ---------------- VLT consigliata ----------------
+    # brightness sintetico: sole/ombra + nuvole + bagnato/secco neve
+    brightness = (
+        (1.0 - shade_idx) * 0.5
+        + (1.0 - cloud / 100.0) * 0.3
+        + (1.0 - moisture) * 0.2
+    )
+    brightness = float(np.clip(brightness, 0.0, 1.0))
+
+    # mappo brightness (0–1) in VLT 10–70 %
+    vlt_pct = float(np.clip(70.0 - brightness * 50.0, 10.0, 70.0))
+
+    if vlt_pct <= 20:
+        vlt_label = "lente molto scura (cat. 3–4)"
+    elif vlt_pct <= 35:
+        vlt_label = "lente media (cat. 2–3)"
+    else:
+        vlt_label = "lente chiara / flat light (cat. 1–2)"
+
     summary = (
         f"Alle {race_dt.strftime('%H:%M')} la neve stimata è ~{snow_temp_c:.1f} °C "
         f"(aria {temp_air_c:.1f} °C), pista {shade_txt}, neve {moisture_txt}, "
         f"vento ~{wind:.1f} km/h, scorrevolezza {glide_txt} "
-        f"(UR {rh:.0f}%, copertura nuvolosa {cloud:.0f}%, "
-        f"VLT consigliato ≈ {vlt_percent:.0f}% – {vlt_cat})."
+        f"(UR {rh:.0f}%, copertura nuvolosa {cloud:.0f}%)."
     )
 
     return DynamicTuningResult(
         input_params=params,
         snow_type=snow_type,
         summary=summary,
-        vlt_percent=vlt_percent,
-        vlt_category=vlt_cat,
+        vlt_pct=vlt_pct,
+        vlt_label=vlt_label,
     )
