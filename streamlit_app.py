@@ -8,7 +8,7 @@ from __future__ import annotations
 import os
 import sys
 import importlib
-from datetime import datetime, date, time as dtime
+from datetime import datetime, time as dtime
 from typing import Optional, Dict, Any
 
 import streamlit as st
@@ -39,7 +39,7 @@ from core.race_events import (
 from core.race_tuning import Discipline
 from core.race_integration import get_wc_tuning_for_event, SkierLevel as WCSkierLevel
 
-import core.search as search_mod  # per debug path/version
+import core.search as search_mod  # per debug + geocoding eventi
 
 # ---------------------- PAGE CONFIG & THEME ----------------------
 PRIMARY = "#06b6d4"
@@ -111,7 +111,6 @@ _FIS_PROVIDER = FISCalendarProvider()
 _FISI_PROVIDER = FISICalendarProvider()
 _RACE_SERVICE = RaceCalendarService(_FIS_PROVIDER, _FISI_PROVIDER)
 
-
 # ---------------------- FUNZIONI DI SUPPORTO --------------------
 def ensure_base_location() -> Dict[str, Any]:
     """
@@ -121,7 +120,6 @@ def ensure_base_location() -> Dict[str, Any]:
     if sel:
         return sel
 
-    # fallback Champoluc
     return {
         "lat": 45.83333,
         "lon": 7.73333,
@@ -136,6 +134,43 @@ def race_event_label(ev: RaceEvent) -> str:
     nation = ev.nation or ""
     nat_txt = f" ({nation})" if nation else ""
     return f"{d_txt} · {disc} · {ev.place}{nat_txt} · {ev.name}"
+
+
+def center_ctx_on_race_location(ctx: Dict[str, Any], event: RaceEvent) -> Dict[str, Any]:
+    """
+    Geocoda la località della gara e aggiorna ctx + session_state
+    in modo che la mappa della sezione Racing si centri sulla gara.
+    """
+    # es. "Soelden (AUT)" -> "Soelden"
+    raw_place = event.place or ""
+    query_name = raw_place.split("(")[0].strip() or raw_place.strip()
+    base = ensure_base_location()
+    lat = base["lat"]
+    lon = base["lon"]
+    label = base["label"]
+
+    try:
+        # usa lo stesso geocoding Open-Meteo del modulo search
+        js = search_mod.openmeteo_geocode_api(query_name, None)
+        opts = search_mod._options_from_openmeteo(js)  # prende solo località >1000 m
+        if opts:
+            best = opts[0]
+            lat = float(best["lat"])
+            lon = float(best["lon"])
+            label = best["label"]
+    except Exception:
+        # se qualcosa va storto rimaniamo sulla località base
+        pass
+
+    ctx["lat"] = lat
+    ctx["lon"] = lon
+    ctx["place_label"] = label
+
+    st.session_state["lat"] = lat
+    st.session_state["lon"] = lon
+    st.session_state["place_label"] = label
+
+    return ctx
 
 
 # ---------------------- SIDEBAR ----------------------
@@ -168,7 +203,6 @@ st.title("Telemark · Pro Wax & Tune")
 # ctx condiviso fra moduli
 ctx: Dict[str, Any] = {"lang": lang}
 
-
 # ====================== PAGINA 1: LOCALITÀ & MAPPA ======================
 if page == "Località & Mappa":
     st.markdown("## 🌍 Località")
@@ -197,12 +231,11 @@ if page == "Località & Mappa":
     st.markdown("## 5) Esposizione & pendenza")
     render_dem(T, ctx)
 
-
 # ====================== PAGINA 2: RACING / CALENDARI ====================
 else:
     st.markdown("## 🏁 Racing / Calendari gare")
 
-    # località di riferimento corrente (senza possibilità di cambiarla qui)
+    # località base (ad es. scelta manualmente nella pagina 1)
     base_loc = ensure_base_location()
     ctx.update(base_loc)
     st.session_state["lat"] = base_loc["lat"]
@@ -211,7 +244,7 @@ else:
 
     st.markdown(
         f'<div class="card">'
-        f'<span class="small"><strong>Località attuale per la mappa:</strong> '
+        f'<span class="small"><strong>Località di partenza (attuale):</strong> '
         f'{base_loc["label"]}</span>'
         f"</div>",
         unsafe_allow_html=True,
@@ -295,22 +328,24 @@ else:
         ctx["race_event"] = selected_event
         ctx["race_datetime"] = race_datetime
 
-        # riepilogo
+        # CENTRA LA MAPPA SULLA LOCALITÀ DELLA GARA
+        ctx = center_ctx_on_race_location(ctx, selected_event)
+
         st.markdown(
             f'<div class="card">'
             f'<div class="small"><strong>Gara selezionata:</strong> {race_event_label(selected_event)}</div>'
             f'<div class="small">Partenza prevista: {race_datetime.strftime("%Y-%m-%d · %H:%M")}</div>'
+            f'<div class="small"><strong>Località mappa per questa gara:</strong> '
+            f'{ctx.get("place_label","")}</div>'
             f"</div>",
             unsafe_allow_html=True,
         )
 
-        # ------ Mappa & piste anche in pagina Racing ------
+        # ------ Mappa & piste per la gara ------
         st.markdown("### Mappa & piste per la gara")
-
-        # usiamo la stessa mappa della pagina Località & Mappa
         ctx = render_map(T, ctx) or ctx
 
-        # DEM sulla posizione/pista scelta qui
+        # ------ DEM sulla posizione/pista scelta ------
         st.markdown("### Esposizione & pendenza sulla pista selezionata")
         render_dem(T, ctx)
 
@@ -320,10 +355,10 @@ else:
             params_dict, data_dict = wc
             st.markdown("### Tuning WC di base suggerito")
 
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Base bevel", f"{params_dict['base_bevel_deg']:.1f}°")
-            c2.metric("Side bevel", f"{params_dict['side_bevel_deg']:.1f}°")
-            c3.metric("Rischio", str(params_dict["risk_level"]).title())
+            c1m, c2m, c3m = st.columns(3)
+            c1m.metric("Base bevel", f"{params_dict['base_bevel_deg']:.1f}°")
+            c2m.metric("Side bevel", f"{params_dict['side_bevel_deg']:.1f}°")
+            c3m.metric("Rischio", str(params_dict["risk_level"]).title())
 
             st.markdown(
                 f"- **Struttura**: {data_dict['structure_pattern']}\n"
