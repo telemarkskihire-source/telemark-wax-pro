@@ -22,23 +22,7 @@ for name in list(sys.modules.keys()):
     if name == "core" or name.startswith("core."):
         del sys.modules[name]
 
-# --------- i18n: usa core.i18n se esiste, altrimenti fallback minimale -----
-try:
-    from core.i18n import L  # type: ignore
-except ModuleNotFoundError:
-    L = {
-        "it": {
-            "country": "Nazione (prefiltro ricerca)",
-            "search_ph": "Cerca… es. Champoluc, Plateau Rosa",
-            "show_pistes_label": "Mostra piste sci alpino sulla mappa",
-        },
-        "en": {
-            "country": "Country (search prefilter)",
-            "search_ph": "Search… e.g. Champoluc, Plateau Rosa",
-            "show_pistes_label": "Show alpine ski slopes on map",
-        },
-    }
-
+from core.i18n import L
 from core.search import (
     country_selectbox,
     location_searchbox,
@@ -57,6 +41,8 @@ from core.race_events import (
 from core.race_tuning import (
     Discipline,
     SkierLevel as TuneSkierLevel,
+    SnowType,
+    TuningParamsInput,
     get_tuning_recommendation,
 )
 from core.race_integration import get_wc_tuning_for_event, SkierLevel as WCSkierLevel
@@ -75,45 +61,45 @@ st.set_page_config(
 )
 
 st.markdown(
-    """
+    f"""
 <style>
-:root {
+:root {{
   --bg:#0b0f13;
   --panel:#121821;
   --muted:#9aa4af;
   --fg:#e5e7eb;
   --line:#1f2937;
-}
-html, body, .stApp {
+}}
+html, body, .stApp {{
   background:var(--bg);
   color:var(--fg);
-}
-[data-testid="stHeader"] {
+}}
+[data-testid="stHeader"] {{
   background:transparent;
-}
-section.main > div {
+}}
+section.main > div {{
   padding-top: 0.6rem;
-}
-h1,h2,h3,h4 {
+}}
+h1,h2,h3,h4 {{
   color:#fff;
   letter-spacing: .2px;
-}
-hr {
+}}
+hr {{
   border:none;
   border-top:1px solid var(--line);
   margin:.75rem 0;
-}
-.card {
+}}
+.card {{
   background: var(--panel);
   border:1px solid var(--line);
   border-radius:12px;
   padding:.9rem .95rem;
-}
-.small {
+}}
+.small {{
   font-size:.85rem;
   color:#cbd5e1;
-}
-.badge {
+}}
+.badge {{
   display:inline-flex;
   align-items:center;
   gap:.35rem;
@@ -123,7 +109,7 @@ hr {
   padding:.15rem .55rem;
   font-size:.8rem;
   color:#e2e8f0;
-}
+}}
 </style>
 """,
     unsafe_allow_html=True,
@@ -184,7 +170,9 @@ def geocode_race_place(query: str) -> Optional[Dict[str, Any]]:
     name = best.get("name") or ""
     admin1 = best.get("admin1") or best.get("admin2") or ""
     base = f"{name}, {admin1}".strip().replace(" ,", ",")
-    flag = "".join(chr(127397 + ord(c)) for c in cc) if len(cc) == 2 else "🏳️"
+    flag = "".join(
+        chr(127397 + ord(c)) for c in cc
+    ) if len(cc) == 2 else "🏳️"
     label = f"{flag}  {base} — {cc}"
 
     return {
@@ -216,7 +204,6 @@ def race_event_label(ev: RaceEvent) -> str:
 
 
 def center_ctx_on_race_location(ctx: Dict[str, Any], event: RaceEvent) -> Dict[str, Any]:
-    """Centratura mappa sulla località di gara + aggiornamento puntatore."""
     raw_place = event.place or ""
     query_name = raw_place.split("(")[0].strip() or raw_place.strip()
 
@@ -234,14 +221,10 @@ def center_ctx_on_race_location(ctx: Dict[str, Any], event: RaceEvent) -> Dict[s
     ctx["lat"] = lat
     ctx["lon"] = lon
     ctx["place_label"] = label
-    ctx["marker_lat"] = lat
-    ctx["marker_lon"] = lon
 
     st.session_state["lat"] = lat
     st.session_state["lon"] = lon
     st.session_state["place_label"] = label
-    st.session_state["marker_lat"] = lat
-    st.session_state["marker_lon"] = lon
 
     return ctx
 
@@ -369,13 +352,19 @@ else:
         labels = [race_event_label(ev) for ev in events]
         label_to_event = {lbl: ev for lbl, ev in zip(labels, events)}
 
-        # tendina classica: compatta e familiare
+        default_idx = 0
+        prev_label = st.session_state.get("race_selected_label")
+        if prev_label in label_to_event:
+            default_idx = labels.index(prev_label)
+
         selected_label = st.selectbox(
             "Seleziona gara",
             labels,
+            index=default_idx,
             key="race_select",
         )
         selected_event = label_to_event[selected_label]
+        st.session_state["race_selected_label"] = selected_label
 
         default_time = st.session_state.get("race_time", dtime(hour=10, minute=0))
         race_time = st.time_input(
@@ -389,11 +378,11 @@ else:
         ctx["race_event"] = selected_event
         ctx["race_datetime"] = race_datetime
 
-        # centra sempre sulla località gara + aggiorna puntatore
+        # centra sempre sulla località gara
         ctx = center_ctx_on_race_location(ctx, selected_event)
 
-        # context mappa cambia ad ogni gara → forza refresh
-        ctx["map_context"] = f"race_{selected_label}"
+        # mappa context specifico per forza-refresh
+        ctx["map_context"] = f"race_{selected_event.start_date.isoformat()}_{selected_event.place}"
 
         st.markdown(
             f'<div class="card">'
@@ -409,7 +398,7 @@ else:
         st.markdown("### Mappa & piste per la gara")
         ctx = render_map(T, ctx) or ctx
 
-        # DEM con ombreggiatura
+        # DEM con ombreggiatura (usa ctx['race_datetime'] internamente)
         st.markdown("### Esposizione & pendenza sulla pista selezionata")
         render_dem(T, ctx)
 
@@ -441,6 +430,7 @@ else:
         if profile is None:
             st.warning("Impossibile costruire il profilo meteo per questa gara.")
         else:
+            # DataFrame per grafici
             df = pd.DataFrame(
                 {
                     "time": profile.times,
@@ -459,88 +449,138 @@ else:
 
             st.caption("Grafici riferiti all'intera giornata di gara (00–24).")
 
+            # ---- grafici statici Altair, SENZA tooltip ----
             df_reset = df.reset_index()
-            base_props = {"height": 130}
 
-            # 1) Temperatura aria vs neve
+            # aria vs neve
             temp_long = df_reset.melt(
                 id_vars="time",
                 value_vars=["temp_air", "snow_temp"],
-                var_name="serie",
-                value_name="valore",
+                var_name="series",
+                value_name="value",
             )
             chart_temp = (
                 alt.Chart(temp_long)
-                .mark_line(size=2)
+                .mark_line()
                 .encode(
                     x=alt.X("time:T", title=None),
-                    y=alt.Y("valore:Q", title="Temperatura (°C)"),
-                    color=alt.Color("serie:N", title=None),
+                    y=alt.Y("value:Q", title=None),
+                    color=alt.Color("series:N", title=None),
                     tooltip=[],
                 )
-                .properties(**base_props)
+                .properties(height=180)
             )
-            st.altair_chart(chart_temp, use_container_width=True)
 
-            # 2) Precipitazioni (pioggia/neve)
-            precip_long = df_reset.melt(
-                id_vars="time",
-                value_vars=["precipitation", "snowfall"],
-                var_name="tipo",
-                value_name="mm",
-            )
-            chart_precip = (
-                alt.Chart(precip_long)
-                .mark_bar()
+            # umidità
+            chart_rh = (
+                alt.Chart(df_reset)
+                .mark_line()
                 .encode(
                     x=alt.X("time:T", title=None),
-                    y=alt.Y("mm:Q", title="Precipitazioni (mm/h)"),
-                    color=alt.Color("tipo:N", title=None),
+                    y=alt.Y("rh:Q", title=None),
                     tooltip=[],
                 )
-                .properties(height=100)
+                .properties(height=180)
             )
-            st.altair_chart(chart_precip, use_container_width=True)
 
-            # 3) Vento + Ombreggiatura
-            wind_shade_long = df_reset.melt(
-                id_vars="time",
-                value_vars=["windspeed", "shade_index"],
-                var_name="serie",
-                value_name="valore",
-            )
-            chart_wind_shade = (
-                alt.Chart(wind_shade_long)
-                .mark_line(size=2)
+            # ombreggiatura
+            chart_shade = (
+                alt.Chart(df_reset)
+                .mark_line()
                 .encode(
                     x=alt.X("time:T", title=None),
-                    y=alt.Y("valore:Q", title="Vento (km/h) / Ombra (0–1)"),
-                    color=alt.Color("serie:N", title=None),
+                    y=alt.Y("shade_index:Q", title=None),
                     tooltip=[],
                 )
-                .properties(**base_props)
+                .properties(height=180)
             )
-            st.altair_chart(chart_wind_shade, use_container_width=True)
 
-            # 4) Umidità + Glide + Nuvolosità (combinazione)
-            hum_glide_cloud_long = df_reset.melt(
-                id_vars="time",
-                value_vars=["rh", "glide_index", "cloudcover"],
-                var_name="serie",
-                value_name="valore",
-            )
-            chart_hgc = (
-                alt.Chart(hum_glide_cloud_long)
-                .mark_line(size=2)
+            # glide
+            chart_glide = (
+                alt.Chart(df_reset)
+                .mark_line()
                 .encode(
                     x=alt.X("time:T", title=None),
-                    y=alt.Y("valore:Q", title="UR (%) / Glide / Nuvolosità (%)"),
-                    color=alt.Color("serie:N", title=None),
+                    y=alt.Y("glide_index:Q", title=None),
                     tooltip=[],
                 )
-                .properties(**base_props)
+                .properties(height=180)
             )
-            st.altair_chart(chart_hgc, use_container_width=True)
+
+            # vento + nuvole
+            wind_long = df_reset.melt(
+                id_vars="time",
+                value_vars=["windspeed", "cloudcover"],
+                var_name="series",
+                value_name="value",
+            )
+            chart_wind_cloud = (
+                alt.Chart(wind_long)
+                .mark_line()
+                .encode(
+                    x=alt.X("time:T", title=None),
+                    y=alt.Y("value:Q", title=None),
+                    color=alt.Color("series:N", title=None),
+                    tooltip=[],
+                )
+                .properties(height=200)
+            )
+
+            c_a, c_b = st.columns(2)
+            with c_a:
+                st.markdown("**Temperatura aria vs neve**")
+                st.altair_chart(chart_temp, use_container_width=True)
+
+                st.markdown("**Umidità relativa (%)**")
+                st.altair_chart(chart_rh, use_container_width=True)
+            with c_b:
+                st.markdown("**Indice ombreggiatura** (0 sole, 1 ombra/luce piatta)")
+                st.altair_chart(chart_shade, use_container_width=True)
+
+                st.markdown("**Indice scorrevolezza teorica** (0–1)")
+                st.altair_chart(chart_glide, use_container_width=True)
+
+            st.markdown("**Vento (km/h) e copertura nuvolosa (%)**")
+            st.altair_chart(chart_wind_cloud, use_container_width=True)
+
+            # ---- Grafico icone meteo stile Meteoblue ----
+            icon_df = df_reset.copy()
+            icons = []
+            for _, row in icon_df.iterrows():
+                cc = float(row["cloudcover"])
+                pr = float(row.get("precipitation", 0.0))
+                sf = float(row.get("snowfall", 0.0))
+
+                if sf > 0.2:
+                    icon = "❄️"
+                elif pr > 0.2:
+                    icon = "🌧️"
+                else:
+                    if cc < 20:
+                        icon = "☀️"
+                    elif cc < 60:
+                        icon = "🌤️"
+                    else:
+                        icon = "☁️"
+                icons.append(icon)
+
+            icon_df["icon"] = icons
+            icon_df["y"] = 0
+
+            chart_icons = (
+                alt.Chart(icon_df)
+                .mark_text(size=18)
+                .encode(
+                    x=alt.X("time:T", title=None),
+                    y=alt.Y("y:Q", axis=None),
+                    text="icon:N",
+                    tooltip=[],
+                )
+                .properties(height=60)
+            )
+
+            st.markdown("**Sintesi meteo giornata (icone)**")
+            st.altair_chart(chart_icons, use_container_width=True)
 
             # ---------- TUNING DINAMICO BASATO SU METEO ----------
             st.markdown("### 🎯 Tuning dinamico basato su meteo reale")
@@ -575,19 +615,19 @@ else:
             else:
                 rec = get_tuning_recommendation(dyn.input_params)
 
-                c1t, c2t, c3t, c4t = st.columns(4)
+                c1t, c2t, c3t = st.columns(3)
                 c1t.metric("Base bevel (dinamico)", f"{rec.base_bevel_deg:.1f}°")
                 c2t.metric("Side bevel (dinamico)", f"{rec.side_bevel_deg:.1f}°")
                 c3t.metric("Profilo", rec.risk_level.capitalize())
-                c4t.metric("VLT consigliato", f"{dyn.vlt_percent:.0f}%")
 
                 st.markdown(
                     f"- **Neve stimata gara**: {dyn.input_params.snow_temp_c:.1f} °C "
                     f"({dyn.snow_type.value})\n"
                     f"- **Aria all'ora di gara**: {dyn.input_params.air_temp_c:.1f} °C\n"
-                    f"- **VLT suggerito**: {dyn.vlt_percent:.0f}% – {dyn.vlt_category}\n"
                     f"- **Struttura soletta suggerita**: {rec.structure_pattern}\n"
                     f"- **Wax group suggerito**: {rec.wax_group}\n"
+                    f"- **VLT consigliata maschera/occhiale**: "
+                    f"{dyn.vlt_pct:.0f}% ({dyn.vlt_label})\n"
                     f"- **Note edges**: {rec.notes}\n"
                 )
                 st.caption(dyn.summary)
