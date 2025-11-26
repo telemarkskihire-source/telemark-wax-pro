@@ -5,7 +5,7 @@
 # - Tile OSM + Satellite
 # - Piste da Overpass (solo sci alpino / downhill)
 # - Puntatore agganciato alla pista più vicina (se presente)
-# - Click sulla mappa → aggiorna lat/lon in ctx + session_state
+#   e SEMPRE sincronizzato con ctx['lat'], ctx['lon']
 
 from __future__ import annotations
 
@@ -44,7 +44,7 @@ def _nearest_vertex(
     lat: float,
     lon: float,
 ) -> Optional[Tuple[float, float]]:
-    """Trova il vertice di pista più vicino al punto dato (approssimazione sufficiente)."""
+    """Trova il vertice di pista più vicino al punto dato."""
     best = None
     best_d = 1e12
     for line in polylines:
@@ -167,7 +167,7 @@ def render_map(T, ctx: Dict[str, Any]) -> Dict[str, Any]:
     Usa:
       - ctx['lat'], ctx['lon']
       - ctx['map_context'] per key univoco su Streamlit
-    Aggiorna ctx e st.session_state con ultimi lat/lon (click o snap a pista).
+    Aggiorna ctx e st.session_state con ultimi lat/lon (snap a pista).
     """
     lat = float(ctx.get("lat", 45.83333))
     lon = float(ctx.get("lon", 7.73333))
@@ -255,20 +255,16 @@ def render_map(T, ctx: Dict[str, Any]) -> Dict[str, Any]:
     # chiave univoca in base al contesto
     map_key = f"map_{map_context}"
 
-    rv = st_folium(
+    # usiamo st_folium solo per renderizzare; ignoro i click così
+    # il puntatore segue SEMPRE il centro logico (località / gara)
+    st_folium(
         m,
         height=450,
         width=None,
         key=map_key,
     )
 
-    # click utente → aggiorna lat/lon
-    last_clicked = rv.get("last_clicked") if isinstance(rv, dict) else None
-    if last_clicked and "lat" in last_clicked and "lng" in last_clicked:
-        marker_lat = float(last_clicked["lat"])
-        marker_lon = float(last_clicked["lng"])
-
-    # sincronizza verso ctx + session_state
+    # sincronizza verso ctx + session_state (dopo eventuale snap a pista)
     ctx["lat"] = marker_lat
     ctx["lon"] = marker_lon
     st.session_state["lat"] = marker_lat
