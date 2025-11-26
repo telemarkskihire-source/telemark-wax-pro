@@ -439,6 +439,8 @@ else:
                     "rh": profile.rh,
                     "cloudcover": profile.cloudcover,
                     "windspeed": profile.windspeed,
+                    "precipitation": profile.precip,
+                    "snowfall": profile.snowfall,
                     "shade_index": profile.shade_index,
                     "snow_moisture_index": profile.snow_moisture_index,
                     "glide_index": profile.glide_index,
@@ -546,8 +548,8 @@ else:
             icons = []
             for _, row in icon_df.iterrows():
                 cc = float(row["cloudcover"])
-                pr = float(row["precipitation"]) if "precipitation" in row else 0.0
-                sf = float(row["snowfall"]) if "snowfall" in row else 0.0
+                pr = float(row.get("precipitation", 0.0))
+                sf = float(row.get("snowfall", 0.0))
 
                 if sf > 0.2:
                     icon = "❄️"
