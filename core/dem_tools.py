@@ -3,9 +3,16 @@
 # - pendenza (° e %)
 # - esposizione (bussola + gradi)
 # - stima ombreggiatura
-# - altitudine con possibilità di override manuale (per ogni punto selezionato)
+#   · all'ora attuale
+#   · all'ora di gara (se ctx["race_datetime"] presente)
+# - altitudine con override manuale per ogni punto selezionato
+
+from __future__ import annotations
 
 import math
+from datetime import datetime
+from typing import Dict, Any
+
 import requests
 import numpy as np
 import streamlit as st
@@ -84,12 +91,10 @@ def aspect_to_compass(deg: float):
     return dirs[idx]
 
 
-def classify_shade(aspect_deg: float) -> str:
+def _base_shade_from_aspect(aspect_deg: float) -> str:
     """
-    Stima molto qualitativa dell'ombreggiatura:
-    - Nord, NNE, NNW -> molto ombreggiata
-    - NW, NE, W, E  -> parzialmente
-    - Sud, SE, SW   -> molto soleggiata
+    Classificazione generica (senza orario), solo da esposizione:
+    stessa logica che avevamo prima.
     """
     d = aspect_deg % 360
     if (315 <= d <= 360) or (0 <= d <= 45):
@@ -99,7 +104,37 @@ def classify_shade(aspect_deg: float) -> str:
     return "molto soleggiata"
 
 
-def render_slope_shade_panel(T, ctx):
+def shade_with_time(aspect_deg: float, hour_local: float) -> str:
+    """
+    Stima qualitativa di ombreggiatura che tiene conto grossolanamente dell'orario.
+    Idea:
+      - mattina (<10): pendii EST/SE più soleggiati, OVEST/NO più in ombra
+      - mezzogiorno (10–14): usa classificazione base
+      - pomeriggio (>14): pendii OVEST/SO più soleggiati, EST/NE più in ombra
+    """
+    d = aspect_deg % 360
+    base = _base_shade_from_aspect(d)
+
+    # zona oraria approssimata in blocchi
+    if hour_local < 10.0:  # mattina
+        if 45 <= d <= 150:  # NE–SE rivolti verso il sole del mattino
+            return "molto soleggiata"
+        if 210 <= d <= 330:  # SO–NO
+            return "molto ombreggiata"
+        return "parzialmente in ombra" if base != "molto soleggiata" else base
+
+    if 10.0 <= hour_local <= 14.0:
+        return base  # metà giornata: esposizione quasi "pura"
+
+    # pomeriggio / sera
+    if 210 <= d <= 300:  # S–SO–O
+        return "molto soleggiata"
+    if 30 <= d <= 150:  # NE–E–SE
+        return "molto ombreggiata"
+    return "parzialmente in ombra" if base != "molto soleggiata" else base
+
+
+def render_dem(T: Dict[str, str], ctx: Dict[str, Any]):
     lat = float(ctx.get("lat", 45.83333))
     lon = float(ctx.get("lon", 7.73333))
 
@@ -121,7 +156,6 @@ def render_slope_shade_panel(T, ctx):
 
         sdeg, spct, adeg = slope_aspect_from_dem(Z, spacing_m)
         compass = aspect_to_compass(adeg)
-        shade_txt = classify_shade(adeg)
 
         # altitudine DEM al centro patch
         center_alt = float(Z[Z.shape[0] // 2, Z.shape[1] // 2])
@@ -148,14 +182,33 @@ def render_slope_shade_panel(T, ctx):
             f"{compass} ({adeg:.0f}°)",
         )
 
-        st.caption(
-            T.get("shade_txt", "Stima ombreggiatura: ") + shade_txt
-        )
+        # ---- Ombreggiatura: adesso + ora gara (se presente) ----
+        now = datetime.now()
+        now_hour = now.hour + now.minute / 60.0
+        shade_now = shade_with_time(adeg, now_hour)
+
+        race_dt = ctx.get("race_datetime")
+        if isinstance(race_dt, datetime):
+            race_hour = race_dt.hour + race_dt.minute / 60.0
+            shade_race = shade_with_time(adeg, race_hour)
+
+            st.caption(
+                f"Ora attuale ~{now_hour:.1f}h → stima ombreggiatura: {shade_now}."
+            )
+            st.caption(
+                f"Ora gara {race_dt.strftime('%Y-%m-%d · %H:%M')} → "
+                f"stima ombreggiatura: {shade_race}."
+            )
+        else:
+            st.caption(
+                f"Stima ombreggiatura ora (~{now_hour:.1f}h): {shade_now}."
+            )
+
         st.caption(f"Altitudine DEM di riferimento (centro patch): {center_alt:.0f} m")
 
 
 # alias per compatibilità
-render_dem = render_slope_shade_panel
-dem_panel = render_slope_shade_panel
-show_dem = render_slope_shade_panel
-app = render = render_slope_shade_panel
+render_slope_shade_panel = render_dem
+dem_panel = render_dem
+show_dem = render_dem
+app = render = render_dem
