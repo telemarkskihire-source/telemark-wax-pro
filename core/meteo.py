@@ -15,6 +15,7 @@
 #   · glide_index 0–1 (scorrevolezza)
 # - Funzione per derivare parametri di tuning dinamico
 #   (snow_temp_c, snow_type) da passare a core.race_tuning.get_tuning_recommendation
+# - Calcolo Visible Light Transmission consigliato per lenti (VLT)
 
 from __future__ import annotations
 
@@ -380,6 +381,8 @@ class DynamicTuningResult:
     input_params: TuningParamsInput
     snow_type: SnowType
     summary: str  # testo descrittivo per UI
+    vlt_pct: float  # VLT consigliata (0–100 %)
+    vlt_label: str  # descrizione (cat. lente)
 
 
 def _classify_snow_type_from_profile(
@@ -415,6 +418,7 @@ def build_dynamic_tuning_for_race(
     parametri di tuning dinamico:
       - snow_temp_c = temperatura neve stimata all'ora di gara
       - snow_type   = tipologia neve da profilo
+      - vlt_pct     = Visible Light Transmission consigliata per lenti
     """
     race_dt = ctx.get("race_datetime")
     if not isinstance(race_dt, datetime):
@@ -484,6 +488,25 @@ def build_dynamic_tuning_for_race(
         else "scorrevolezza limitata"
     )
 
+    # ---------------- VLT consigliata ----------------
+    # brightness sintetico: sole/ombra + nuvole + bagnato/secco neve
+    brightness = (
+        (1.0 - shade_idx) * 0.5
+        + (1.0 - cloud / 100.0) * 0.3
+        + (1.0 - moisture) * 0.2
+    )
+    brightness = float(np.clip(brightness, 0.0, 1.0))
+
+    # mappo brightness (0–1) in VLT 10–70 %
+    vlt_pct = float(np.clip(70.0 - brightness * 50.0, 10.0, 70.0))
+
+    if vlt_pct <= 20:
+        vlt_label = "lente molto scura (cat. 3–4)"
+    elif vlt_pct <= 35:
+        vlt_label = "lente media (cat. 2–3)"
+    else:
+        vlt_label = "lente chiara / flat light (cat. 1–2)"
+
     summary = (
         f"Alle {race_dt.strftime('%H:%M')} la neve stimata è ~{snow_temp_c:.1f} °C "
         f"(aria {temp_air_c:.1f} °C), pista {shade_txt}, neve {moisture_txt}, "
@@ -495,4 +518,6 @@ def build_dynamic_tuning_for_race(
         input_params=params,
         snow_type=snow_type,
         summary=summary,
+        vlt_pct=vlt_pct,
+        vlt_label=vlt_label,
     )
