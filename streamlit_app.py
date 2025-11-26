@@ -14,6 +14,7 @@ from typing import Optional, Dict, Any
 import requests
 import pandas as pd
 import streamlit as st
+import altair as alt  # <-- NUOVO: per grafici statici
 
 # --- hard-reload moduli core.* ---
 importlib.invalidate_caches()
@@ -116,12 +117,13 @@ hr {{
 
 # ---------------------- SERVIZI CALENDARIO ----------------------
 _FIS_PROVIDER = FISCalendarProvider()
-_FISI_PROVIDER = FISICalendarProvider()
+_FISI_PROVIDER = FISICalendarProvider()  # per ora ancora “vuoto” lato dati reali
 _RACE_SERVICE = RaceCalendarService(_FIS_PROVIDER, _FISI_PROVIDER)
 
 # ---------------------- GEOCODER GARE --------------------------
 MIN_ELEVATION_M = 1000.0
 UA = {"User-Agent": "telemark-wax-pro/2.0"}
+
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def geocode_race_place(query: str) -> Optional[Dict[str, Any]]:
@@ -178,6 +180,7 @@ def geocode_race_place(query: str) -> Optional[Dict[str, Any]]:
         "lon": float(best.get("longitude", 0.0)),
         "label": label,
     }
+
 
 # ---------------------- SUPPORTO -------------------------------
 def ensure_base_location() -> Dict[str, Any]:
@@ -408,7 +411,8 @@ else:
             c1m, c2m, c3m = st.columns(3)
             c1m.metric("Base bevel", f"{params_dict['base_bevel_deg']:.1f}°")
             c2m.metric("Side bevel", f"{params_dict['side_bevel_deg']:.1f}°")
-            c3m.metric("Rischio", str(params_dict["risk_level"]).title())
+            # QUI: Rischio → Profilo
+            c3m.metric("Profilo", str(params_dict["risk_level"]).title())
 
             st.markdown(
                 f"- **Struttura**: {data_dict['structure_pattern']}\n"
@@ -444,27 +448,103 @@ else:
 
             st.caption("Grafici riferiti all'intera giornata di gara (00–24).")
 
+            # ---- grafici statici Altair, SENZA tooltip / zoom ----
+            df_reset = df.reset_index()
+
+            # aria vs neve
+            temp_long = df_reset.melt(
+                id_vars="time",
+                value_vars=["temp_air", "snow_temp"],
+                var_name="series",
+                value_name="value",
+            )
+            chart_temp = (
+                alt.Chart(temp_long)
+                .mark_line()
+                .encode(
+                    x=alt.X("time:T", title=None),
+                    y=alt.Y("value:Q", title=None),
+                    color=alt.Color("series:N", title=None),
+                    tooltip=[],
+                )
+                .properties(height=180)
+            )
+
+            # umidità
+            chart_rh = (
+                alt.Chart(df_reset)
+                .mark_line()
+                .encode(
+                    x=alt.X("time:T", title=None),
+                    y=alt.Y("rh:Q", title=None),
+                    tooltip=[],
+                )
+                .properties(height=180)
+            )
+
+            # ombreggiatura
+            chart_shade = (
+                alt.Chart(df_reset)
+                .mark_line()
+                .encode(
+                    x=alt.X("time:T", title=None),
+                    y=alt.Y("shade_index:Q", title=None),
+                    tooltip=[],
+                )
+                .properties(height=180)
+            )
+
+            # glide
+            chart_glide = (
+                alt.Chart(df_reset)
+                .mark_line()
+                .encode(
+                    x=alt.X("time:T", title=None),
+                    y=alt.Y("glide_index:Q", title=None),
+                    tooltip=[],
+                )
+                .properties(height=180)
+            )
+
+            # vento + nuvole
+            wind_long = df_reset.melt(
+                id_vars="time",
+                value_vars=["windspeed", "cloudcover"],
+                var_name="series",
+                value_name="value",
+            )
+            chart_wind_cloud = (
+                alt.Chart(wind_long)
+                .mark_line()
+                .encode(
+                    x=alt.X("time:T", title=None),
+                    y=alt.Y("value:Q", title=None),
+                    color=alt.Color("series:N", title=None),
+                    tooltip=[],
+                )
+                .properties(height=200)
+            )
+
             c_a, c_b = st.columns(2)
             with c_a:
                 st.markdown("**Temperatura aria vs neve**")
-                st.line_chart(df[["temp_air", "snow_temp"]])
+                st.altair_chart(chart_temp, use_container_width=True)
 
                 st.markdown("**Umidità relativa (%)**")
-                st.line_chart(df[["rh"]])
+                st.altair_chart(chart_rh, use_container_width=True)
             with c_b:
                 st.markdown("**Indice ombreggiatura** (0 sole, 1 ombra/luce piatta)")
-                st.line_chart(df[["shade_index"]])
+                st.altair_chart(chart_shade, use_container_width=True)
 
                 st.markdown("**Indice scorrevolezza teorica** (0–1)")
-                st.line_chart(df[["glide_index"]])
+                st.altair_chart(chart_glide, use_container_width=True)
 
             st.markdown("**Vento (km/h) e copertura nuvolosa (%)**")
-            st.line_chart(df[["windspeed", "cloudcover"]])
+            st.altair_chart(chart_wind_cloud, use_container_width=True)
 
             # ---------- TUNING DINAMICO BASATO SU METEO ----------
             st.markdown("### 🎯 Tuning dinamico basato su meteo reale")
 
-            # scegli livello atleta (per ora semplifichiamo)
             level_choice = st.selectbox(
                 "Livello sciatore per questo tuning",
                 [
@@ -477,7 +557,6 @@ else:
             )
             chosen_level = level_choice[1]
 
-            # per ora lasciamo "iniettata" come toggle manuale
             injected_flag = st.checkbox(
                 "Pista iniettata / ghiacciata",
                 value=True if wc is not None else False,
@@ -494,13 +573,13 @@ else:
             if dyn is None:
                 st.info("Non è stato possibile calcolare il tuning dinamico per questa gara.")
             else:
-                # usa core.race_tuning per la raccomandazione finale
                 rec = get_tuning_recommendation(dyn.input_params)
 
                 c1t, c2t, c3t = st.columns(3)
                 c1t.metric("Base bevel (dinamico)", f"{rec.base_bevel_deg:.1f}°")
                 c2t.metric("Side bevel (dinamico)", f"{rec.side_bevel_deg:.1f}°")
-                c3t.metric("Rischio", rec.risk_level.capitalize())
+                # QUI: Rischio → Profilo
+                c3t.metric("Profilo", rec.risk_level.capitalize())
 
                 st.markdown(
                     f"- **Neve stimata gara**: {dyn.input_params.snow_temp_c:.1f} °C "
