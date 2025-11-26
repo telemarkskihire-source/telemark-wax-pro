@@ -124,22 +124,6 @@ hr {
   font-size:.8rem;
   color:#e2e8f0;
 }
-
-/* lista gare “a tenda” scrollabile */
-.race-scroll {
-  max-height: 260px;
-  overflow-y: auto;
-  padding: .25rem .1rem;
-  border-radius: 10px;
-  background: #020617;
-  border: 1px solid #1f2937;
-}
-.race-scroll [data-testid="stRadio"] > div {
-  flex-direction: column;
-}
-.race-scroll label {
-  font-size: .85rem;
-}
 </style>
 """,
     unsafe_allow_html=True,
@@ -385,24 +369,13 @@ else:
         labels = [race_event_label(ev) for ev in events]
         label_to_event = {lbl: ev for lbl, ev in zip(labels, events)}
 
-        prev_label = st.session_state.get("race_selected_label")
-        if prev_label in label_to_event:
-            default_idx = labels.index(prev_label)
-        else:
-            default_idx = 0
-
-        st.markdown("**Seleziona gara**")
-        st.markdown('<div class="race-scroll">', unsafe_allow_html=True)
-        selected_label = st.radio(
-            "",
+        # tendina classica: compatta e familiare
+        selected_label = st.selectbox(
+            "Seleziona gara",
             labels,
-            index=default_idx,
-            key="race_radio",
+            key="race_select",
         )
-        st.markdown("</div>", unsafe_allow_html=True)
-
         selected_event = label_to_event[selected_label]
-        st.session_state["race_selected_label"] = selected_label
 
         default_time = st.session_state.get("race_time", dtime(hour=10, minute=0))
         race_time = st.time_input(
@@ -487,9 +460,9 @@ else:
             st.caption("Grafici riferiti all'intera giornata di gara (00–24).")
 
             df_reset = df.reset_index()
-            base_props = {"height": 120}
+            base_props = {"height": 130}
 
-            # === FASCIA 1: temperatura aria vs neve ===
+            # 1) Temperatura aria vs neve
             temp_long = df_reset.melt(
                 id_vars="time",
                 value_vars=["temp_air", "snow_temp"],
@@ -509,7 +482,7 @@ else:
             )
             st.altair_chart(chart_temp, use_container_width=True)
 
-            # === FASCIA 2: precipitazioni (pioggia + neve) ===
+            # 2) Precipitazioni (pioggia/neve)
             precip_long = df_reset.melt(
                 id_vars="time",
                 value_vars=["precipitation", "snowfall"],
@@ -525,11 +498,11 @@ else:
                     color=alt.Color("tipo:N", title=None),
                     tooltip=[],
                 )
-                .properties(height=90)
+                .properties(height=100)
             )
             st.altair_chart(chart_precip, use_container_width=True)
 
-            # === FASCIA 3: vento + ombreggiatura ===
+            # 3) Vento + Ombreggiatura
             wind_shade_long = df_reset.melt(
                 id_vars="time",
                 value_vars=["windspeed", "shade_index"],
@@ -549,45 +522,25 @@ else:
             )
             st.altair_chart(chart_wind_shade, use_container_width=True)
 
-            # === Umidità + scorrevolezza ===
-            hum_glide_long = df_reset.melt(
+            # 4) Umidità + Glide + Nuvolosità (combinazione)
+            hum_glide_cloud_long = df_reset.melt(
                 id_vars="time",
-                value_vars=["rh", "glide_index"],
+                value_vars=["rh", "glide_index", "cloudcover"],
                 var_name="serie",
                 value_name="valore",
             )
-            chart_hum_glide = (
-                alt.Chart(hum_glide_long)
+            chart_hgc = (
+                alt.Chart(hum_glide_cloud_long)
                 .mark_line(size=2)
                 .encode(
                     x=alt.X("time:T", title=None),
-                    y=alt.Y("valore:Q", title="Umidità (%) / Glide (0–1)"),
+                    y=alt.Y("valore:Q", title="UR (%) / Glide / Nuvolosità (%)"),
                     color=alt.Color("serie:N", title=None),
                     tooltip=[],
                 )
                 .properties(**base_props)
             )
-            st.altair_chart(chart_hum_glide, use_container_width=True)
-
-            # === Vento + nuvolosità ===
-            wind_cloud_long = df_reset.melt(
-                id_vars="time",
-                value_vars=["windspeed", "cloudcover"],
-                var_name="serie",
-                value_name="valore",
-            )
-            chart_wind_cloud = (
-                alt.Chart(wind_cloud_long)
-                .mark_line(size=2)
-                .encode(
-                    x=alt.X("time:T", title=None),
-                    y=alt.Y("valore:Q", title="Vento / Nuvolosità (%)"),
-                    color=alt.Color("serie:N", title=None),
-                    tooltip=[],
-                )
-                .properties(**base_props)
-            )
-            st.altair_chart(chart_wind_cloud, use_container_width=True)
+            st.altair_chart(chart_hgc, use_container_width=True)
 
             # ---------- TUNING DINAMICO BASATO SU METEO ----------
             st.markdown("### 🎯 Tuning dinamico basato su meteo reale")
@@ -622,15 +575,17 @@ else:
             else:
                 rec = get_tuning_recommendation(dyn.input_params)
 
-                c1t, c2t, c3t = st.columns(3)
+                c1t, c2t, c3t, c4t = st.columns(4)
                 c1t.metric("Base bevel (dinamico)", f"{rec.base_bevel_deg:.1f}°")
                 c2t.metric("Side bevel (dinamico)", f"{rec.side_bevel_deg:.1f}°")
                 c3t.metric("Profilo", rec.risk_level.capitalize())
+                c4t.metric("VLT consigliato", f"{dyn.vlt_percent:.0f}%")
 
                 st.markdown(
                     f"- **Neve stimata gara**: {dyn.input_params.snow_temp_c:.1f} °C "
                     f"({dyn.snow_type.value})\n"
                     f"- **Aria all'ora di gara**: {dyn.input_params.air_temp_c:.1f} °C\n"
+                    f"- **VLT suggerito**: {dyn.vlt_percent:.0f}% – {dyn.vlt_category}\n"
                     f"- **Struttura soletta suggerita**: {rec.structure_pattern}\n"
                     f"- **Wax group suggerito**: {rec.wax_group}\n"
                     f"- **Note edges**: {rec.notes}\n"
