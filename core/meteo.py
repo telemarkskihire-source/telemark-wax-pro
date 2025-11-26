@@ -3,7 +3,7 @@
 #
 # - Meteo oraria Open-Meteo (3 giorni: ieri, oggi, giorno gara)
 # - Stima temperatura neve per ora (snow_temp)
-#   · filtro "memoria neve" sui 2 giorni precedenti
+#   · memoria neve sui 2 giorni precedenti
 #   · influenza di:
 #       - temperatura aria
 #       - ombreggiatura (esposizione + orario + nuvolosità)
@@ -90,37 +90,35 @@ def _shade_factor(aspect_deg: float, hour_local: float, cloudcover: Optional[flo
     """
     d = aspect_deg % 360
 
-    # base da esposizione + orario (simile a dem_tools, ma in forma numerica)
-    # pendii N / NE hanno più ombra, S / SW più sole
+    # base da esposizione + orario
     base = 0.5
 
     # mattina
     if hour_local < 10.0:
-        # pendii E / SE più al sole
         if 60 <= d <= 150:
-            base = 0.1
+            base = 0.1           # E/SE al sole
         elif 240 <= d <= 330:
-            base = 0.9
+            base = 0.9           # O/NO in ombra
         else:
             base = 0.6
     # metà giornata
     elif 10.0 <= hour_local <= 14.0:
         if (315 <= d <= 360) or (0 <= d <= 45):
-            base = 0.8  # versante nord
+            base = 0.8           # N
         elif 135 <= d <= 225:
-            base = 0.2  # sud
+            base = 0.2           # S
         else:
             base = 0.5
     # pomeriggio
     else:
         if 210 <= d <= 300:
-            base = 0.2  # SO / O al sole
+            base = 0.2           # SO/O al sole
         elif 30 <= d <= 150:
-            base = 0.8  # NE / E in ombra
+            base = 0.8           # NE/E in ombra
         else:
             base = 0.5
 
-    # nuvolosità: se cielo coperto avvicino a luce piatta (0.7–0.9)
+    # nuvolosità → avvicino verso luce piatta
     if cloudcover is None:
         return float(np.clip(base, 0.0, 1.0))
 
@@ -142,8 +140,8 @@ def _snow_temp_series(
     aspect_deg: float,
 ) -> np.ndarray:
     """
-    Modello semplice ma "fisico" di temperatura neve:
-    - memoria su più ore e giorni
+    Modello temperatura neve:
+    - memoria su più ore/giorni
     - dipendente da aria, sole/ombra, vento, neve fresca
     """
     n = len(times)
@@ -156,45 +154,51 @@ def _snow_temp_series(
     precip = np.array(precip, dtype=float)
     snowfall = np.array(snowfall, dtype=float)
 
-    # stima se ci sono state nevicate significative negli ultimi 24h
-    # (più neve fresca -> neve che segue più velocemente l'aria)
-    last_24_mask = (times >= (times[-1] - timedelta(hours=24)))
+    # maschera ultime 24h → serve per valutare neve fresca
+    if n == 1:
+        last_24_mask = np.array([True], dtype=bool)
+    else:
+        ref_time = times[-1] - timedelta(hours=24)
+        last_24_mask = np.array(
+            [t >= ref_time for t in times],
+            dtype=bool,
+        )
+
     fresh_snow_mm = float(np.nansum(np.where(last_24_mask, snowfall, 0.0)))
+    # più neve fresca → neve "segue" più l'aria
     fresh_factor = 1.0 + min(fresh_snow_mm / 10.0, 1.0) * 0.5  # fino a +50%
 
-    # inizializzo neve come media fra minima degli ultimi 2 giorni e 0°C (limitata a 0, non oltre)
-    min_recent = float(np.nanmin(temp_air)) if np.isfinite(temp_air).any() else -5.0
-    snow_t0 = min(0.0, (min_recent * 0.7))  # neve tende a stare sotto lo zero
+    # inizializzo neve: media fra minima aria ultimi giorni e 0°C (limitata a 0)
+    if np.isfinite(temp_air).any():
+        min_recent = float(np.nanmin(temp_air))
+    else:
+        min_recent = -5.0
+    snow_t0 = min(0.0, (min_recent * 0.7))
     snow = np.zeros(n, dtype=float)
     snow[0] = snow_t0
 
     for i in range(1, n):
         Ta = temp_air[i]
-        # orario locale (uso ora dal timestamp)
+        # orario locale
         hour_local = times[i].hour + times[i].minute / 60.0
         cc = cloudcover[i] if np.isfinite(cloudcover[i]) else None
         w = windspeed[i] if np.isfinite(windspeed[i]) else 0.0
 
         shade = _shade_factor(aspect_deg, hour_local, cc)
-        # 0 sole, 1 ombra → fattore di irraggiamento inverso
         sun_gain = 1.0 - shade  # 0 (buio) – 1 (sole pieno)
 
-        # coefficiente di rilassamento neve verso l'aria:
-        # · più alto con neve fresca
-        # · più alto con sole
+        # coefficiente di rilassamento neve → aria
         alpha = 0.08 * fresh_factor + 0.04 * sun_gain
 
-        # raffreddamento da vento (venti forti aumentano scambio)
-        wind_cool = min(w / 40.0, 1.0) * 0.5  # fino a -0.5°C/h equivalente
+        # raffreddamento vento
+        wind_cool = min(w / 40.0, 1.0) * 0.5  # fino a -0.5 °C/h
 
-        # update: low-pass su aria + contributo sole + effetto vento
         prev = snow[i - 1]
         target = Ta
         new = prev + alpha * (target - prev) - wind_cool
 
-        # neve non sale oltre 0°C (soprattutto in gara su pista preparata)
+        # neve non oltre 0 °C
         new = min(new, 0.0)
-
         snow[i] = new
 
     return snow
@@ -207,29 +211,28 @@ def _snow_moisture_index(
     snowfall: np.ndarray,
 ) -> np.ndarray:
     """
-    Indice 0–1 di "bagnato neve":
-    - vicino a 0 con neve molto fredda e aria secca
-    - vicino a 1 se neve è vicina a 0°C, alta umidità, o precipitazioni liquide
+    Indice 0–1 "bagnato neve":
+    - 0 neve molto fredda + aria secca
+    - 1 neve vicino a 0°C + UR alta + pioggia
     """
     n = len(snow_temp)
     if n == 0:
         return np.array([])
 
-    # 1) contributo da temperatura neve (0 se <= -12, 1 se >= 0)
+    # 1) contributo da T neve (0 se <= -12, 1 se >= 0)
     t = np.clip((snow_temp + 12.0) / 12.0, 0.0, 1.0)
 
-    # 2) contributo da umidità relativa (0 se <= 40%, 1 se >= 95)
+    # 2) umidità relativa
     rh = np.where(np.isfinite(rh), rh, 60.0)
     h = np.clip((rh - 40.0) / 55.0, 0.0, 1.0)
 
-    # 3) precipitazioni: pioggia aumenta molto, neve un po' meno
+    # 3) precipitazioni
     precip = np.where(np.isfinite(precip), precip, 0.0)
     snowfall = np.where(np.isfinite(snowfall), snowfall, 0.0)
 
-    rain_effect = np.clip(precip / 2.0, 0.0, 1.0)  # >2 mm/h = contributo pieno
-    snow_effect = np.clip(snowfall / 3.0, 0.0, 0.6)  # neve fresca inumidisce i primi cm
+    rain_effect = np.clip(precip / 2.0, 0.0, 1.0)      # >2 mm/h pieno effetto
+    snow_effect = np.clip(snowfall / 3.0, 0.0, 0.6)    # neve fresca inumidisce un po'
 
-    # combinazione pesata
     m = 0.5 * t + 0.3 * h + 0.4 * rain_effect + 0.2 * snow_effect
     return np.clip(m, 0.0, 1.0)
 
@@ -237,22 +240,19 @@ def _snow_moisture_index(
 def _glide_index(snow_temp: np.ndarray, moisture: np.ndarray) -> np.ndarray:
     """
     Indice 0–1 di "scorrevolezza" teorica:
-    - troppo fredda e secca → meno glide
-    - troppo bagnata → freno
-    - mezzo (intorno a -8/-2, umidità media) → massimo glide
+    - troppo fredda/secca o troppo bagnata → meno glide
+    - medio (circa -10/-2 e umidità media) → massimo glide
     """
     n = len(snow_temp)
     if n == 0:
         return np.array([])
 
-    # penalità per temperature troppo estreme
-    # optimum zone: -10 .. -2
+    # optimum T: -10 .. -2
     t = snow_temp
-    # scala a 0–1: 1 se in [-10, -2], degradando fuori
     t_score = np.clip(1.0 - np.abs((t + 6.0) / 6.0), 0.0, 1.0)
 
-    m = moisture  # 0 secca, 1 molto bagnata
     # optimum moisture ~0.4–0.6
+    m = moisture
     m_score = 1.0 - np.abs(m - 0.5) * 2.0
     m_score = np.clip(m_score, 0.0, 1.0)
 
@@ -277,11 +277,12 @@ class MeteoProfile:
 
 def build_meteo_profile_for_race_day(ctx: Dict[str, Any]) -> Optional[MeteoProfile]:
     """
-    Costruisce profilo meteo completo per la giornata di gara:
+    Profilo meteo completo per la giornata di gara:
     - se ctx["race_datetime"] esiste → usa quella data,
-      altrimenti usa oggi come fallback.
-    - prende meteo da 2 giorni prima fino al giorno gara (memoria neve).
-    - profilo restituito solo per il giorno gara (0–23h).
+      altrimenti usa oggi.
+    - prende meteo da 2 giorni prima fino al giorno gara
+      (memoria neve).
+    - ritorna solo ore del giorno gara (00–24).
     """
     lat = float(ctx.get("lat", 45.83333))
     lon = float(ctx.get("lon", 7.73333))
@@ -303,7 +304,6 @@ def build_meteo_profile_for_race_day(ctx: Dict[str, Any]) -> Optional[MeteoProfi
     if not times_str:
         return None
 
-    # trasformo in datetime
     times = [datetime.fromisoformat(t) for t in times_str]
 
     def arr(name: str, fill: float = np.nan) -> np.ndarray:
@@ -319,15 +319,15 @@ def build_meteo_profile_for_race_day(ctx: Dict[str, Any]) -> Optional[MeteoProfi
     precip = arr("precipitation")
     snowfall = arr("snowfall")
 
-    # filtro solo il giorno gara (ma TENENDO in considerazione full serie per memoria neve)
-    mask_race = np.array([t.date() == race_day for t in times])
+    # maschera solo giorno gara
+    mask_race = np.array([t.date() == race_day for t in times], dtype=bool)
     if not mask_race.any():
         return None
 
-    # aspetto versante: se ctx non lo ha, assumo Nord-Ovest (classico ombreggiato)
+    # esposizione versante: se non esiste → NNO tipico
     aspect_deg = float(ctx.get("aspect_deg", 330.0))
 
-    # serie completa neve (su 3 giorni)
+    # serie completa neve (3 giorni) per memoria
     snow_full = _snow_temp_series(
         times=times,
         temp_air=temp_air,
@@ -338,7 +338,7 @@ def build_meteo_profile_for_race_day(ctx: Dict[str, Any]) -> Optional[MeteoProfi
         aspect_deg=aspect_deg,
     )
 
-    # subset solo giorno gara
+    # subset giorno gara
     times_r = [t for t, m in zip(times, mask_race) if m]
     Ta_r = temp_air[mask_race]
     rh_r = rh[mask_race]
@@ -348,7 +348,7 @@ def build_meteo_profile_for_race_day(ctx: Dict[str, Any]) -> Optional[MeteoProfi
     snowfall_r = snowfall[mask_race]
     snow_r = snow_full[mask_race]
 
-    # shade index per giorno gara
+    # shade index per ogni ora gara
     shade_r = []
     for t, cc_val in zip(times_r, cc_r):
         h = t.hour + t.minute / 60.0
@@ -356,7 +356,6 @@ def build_meteo_profile_for_race_day(ctx: Dict[str, Any]) -> Optional[MeteoProfi
         shade_r.append(_shade_factor(aspect_deg, h, cc_val_f))
     shade_r = np.array(shade_r, dtype=float)
 
-    # indici umidità neve & scorrevolezza
     moisture_r = _snow_moisture_index(snow_r, rh_r, precip_r, snowfall_r)
     glide_r = _glide_index(snow_r, moisture_r)
 
@@ -380,7 +379,7 @@ def build_meteo_profile_for_race_day(ctx: Dict[str, Any]) -> Optional[MeteoProfi
 class DynamicTuningResult:
     input_params: TuningParamsInput
     snow_type: SnowType
-    summary: str  # testo descrittivo da mostrare in UI
+    summary: str  # testo descrittivo per UI
 
 
 def _classify_snow_type_from_profile(
@@ -401,7 +400,6 @@ def _classify_snow_type_from_profile(
     if snow_temp_c > -2.0 and moisture_idx >= 0.5:
         return SnowType.WET
 
-    # fallback generico
     return SnowType.PACKED
 
 
@@ -458,7 +456,6 @@ def build_dynamic_tuning_for_race(
         skier_level=skier_level,
     )
 
-    # breve sintesi
     shade_txt = (
         "molto in ombra"
         if shade_idx > 0.7
@@ -490,7 +487,8 @@ def build_dynamic_tuning_for_race(
     summary = (
         f"Alle {race_dt.strftime('%H:%M')} la neve stimata è ~{snow_temp_c:.1f} °C "
         f"(aria {temp_air_c:.1f} °C), pista {shade_txt}, neve {moisture_txt}, "
-        f"vento ~{wind:.1f} km/h, scorrevolezza {glide_txt}."
+        f"vento ~{wind:.1f} km/h, scorrevolezza {glide_txt} "
+        f"(UR {rh:.0f}%, copertura nuvolosa {cloud:.0f}%)."
     )
 
     return DynamicTuningResult(
