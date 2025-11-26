@@ -357,18 +357,30 @@ else:
         labels = [race_event_label(ev) for ev in events]
         label_to_event = {lbl: ev for lbl, ev in zip(labels, events)}
 
-        # ricorda selezione precedente se ancora valida
-        default_idx = 0
+        # ricorda selezione precedente
         prev_label = st.session_state.get("race_selected_label")
         if prev_label in label_to_event:
             default_idx = labels.index(prev_label)
+        else:
+            default_idx = 0
 
-        selected_label = st.selectbox(
-            "Seleziona gara",
-            labels,
-            index=default_idx,
-            key="race_select",
-        )
+        use_radio = len(labels) <= 25
+
+        if use_radio:
+            selected_label = st.radio(
+                "Seleziona gara",
+                labels,
+                index=default_idx,
+                key="race_radio",
+            )
+        else:
+            selected_label = st.selectbox(
+                "Seleziona gara",
+                labels,
+                index=default_idx,
+                key="race_select",
+            )
+
         selected_event = label_to_event[selected_label]
         st.session_state["race_selected_label"] = selected_label
 
@@ -387,11 +399,8 @@ else:
         # centra sempre sulla località gara + aggiorna puntatore
         ctx = center_ctx_on_race_location(ctx, selected_event)
 
-        # context mappa include anche il nome gara → cambia sempre
-        ctx["map_context"] = (
-            f"race_{selected_event.start_date.isoformat()}_"
-            f"{selected_event.place}_{selected_event.name}"
-        )
+        # context mappa include label gara → cambia sempre
+        ctx["map_context"] = f"race_{selected_label}"
 
         st.markdown(
             f'<div class="card">'
@@ -439,7 +448,6 @@ else:
         if profile is None:
             st.warning("Impossibile costruire il profilo meteo per questa gara.")
         else:
-            # DataFrame per grafici
             df = pd.DataFrame(
                 {
                     "time": profile.times,
@@ -460,7 +468,7 @@ else:
 
             df_reset = df.reset_index()
 
-            # ---- FASCIA 1: temperatura aria vs neve (tipo Meteoblue) ----
+            # === FASCIA 1: temperatura aria vs neve ===
             temp_long = df_reset.melt(
                 id_vars="time",
                 value_vars=["temp_air", "snow_temp"],
@@ -479,7 +487,7 @@ else:
                 .properties(height=140)
             )
 
-            # ---- FASCIA 2: precipitazioni (pioggia + neve) ----
+            # === FASCIA 2: precipitazioni (pioggia + neve) ===
             precip_long = df_reset.melt(
                 id_vars="time",
                 value_vars=["precipitation", "snowfall"],
@@ -498,7 +506,7 @@ else:
                 .properties(height=90)
             )
 
-            # ---- FASCIA 3: vento + ombreggiatura (sensazione pista) ----
+            # === FASCIA 3: vento + ombreggiatura ===
             wind_long = df_reset.melt(
                 id_vars="time",
                 value_vars=["windspeed", "shade_index"],
@@ -517,10 +525,70 @@ else:
                 .properties(height=110)
             )
 
-            # mostro le 3 fasce una sotto l'altra
+            # Mostro le tre fasce tipo Meteoblue
             st.altair_chart(chart_temp, use_container_width=True)
             st.altair_chart(chart_precip, use_container_width=True)
             st.altair_chart(chart_wind_shade, use_container_width=True)
+
+            # === Grafici aggiuntivi (come versione precedente, ma statici) ===
+            # Umidità relativa
+            chart_rh = (
+                alt.Chart(df_reset)
+                .mark_line()
+                .encode(
+                    x=alt.X("time:T", title=None),
+                    y=alt.Y("rh:Q", title="Umidità relativa (%)"),
+                    tooltip=[],
+                )
+                .properties(height=80)
+            )
+            st.altair_chart(chart_rh, use_container_width=True)
+
+            # Indice ombreggiatura
+            chart_shade = (
+                alt.Chart(df_reset)
+                .mark_line()
+                .encode(
+                    x=alt.X("time:T", title=None),
+                    y=alt.Y("shade_index:Q", title="Indice ombreggiatura (0 sole, 1 ombra)"),
+                    tooltip=[],
+                )
+                .properties(height=80)
+            )
+            st.altair_chart(chart_shade, use_container_width=True)
+
+            # Indice scorrevolezza
+            chart_glide = (
+                alt.Chart(df_reset)
+                .mark_line()
+                .encode(
+                    x=alt.X("time:T", title=None),
+                    y=alt.Y("glide_index:Q", title="Indice scorrevolezza (0–1)"),
+                    tooltip=[],
+                )
+                .properties(height=80)
+            )
+            st.altair_chart(chart_glide, use_container_width=True)
+
+            # Vento + copertura nuvolosa
+            wind_cloud_long = df_reset.melt(
+                id_vars="time",
+                value_vars=["windspeed", "cloudcover"],
+                var_name="serie",
+                value_name="valore",
+            )
+            chart_wind_cloud = (
+                alt.Chart(wind_cloud_long)
+                .mark_line()
+                .encode(
+                    x=alt.X("time:T", title=None),
+                    y=alt.Y("valore:Q", title="Vento / nuvolosità"),
+                    color=alt.Color("serie:N", title=None),
+                    tooltip=[],
+                )
+                .properties(height=90)
+            )
+            st.altair_chart(chart_wind_cloud, use_container_width=True)
 
             # ---------- TUNING DINAMICO BASATO SU METEO ----------
             st.markdown("### 🎯 Tuning dinamico basato su meteo reale")
