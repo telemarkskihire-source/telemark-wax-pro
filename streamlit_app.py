@@ -1,7 +1,7 @@
 # streamlit_app.py
 # Telemark · Pro Wax & Tune
 # Pagina 1: Località & Mappa
-# Pagina 2: Racing / Calendari + Mappa & DEM (centrata sulla gara)
+# Pagina 2: Racing / Calendari + Mappa, DEM, Meteo & Tuning dinamico
 
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ from datetime import datetime, time as dtime
 from typing import Optional, Dict, Any
 
 import requests
+import pandas as pd
 import streamlit as st
 
 # --- hard-reload moduli core.* ---
@@ -36,8 +37,15 @@ from core.race_events import (
     Federation,
     RaceEvent,
 )
-from core.race_tuning import Discipline
+from core.race_tuning import (
+    Discipline,
+    SkierLevel as TuneSkierLevel,
+    SnowType,
+    TuningParamsInput,
+    get_tuning_recommendation,
+)
 from core.race_integration import get_wc_tuning_for_event, SkierLevel as WCSkierLevel
+from core import meteo as meteo_mod
 
 import core.search as search_mod  # debug
 
@@ -387,15 +395,15 @@ else:
         st.markdown("### Mappa & piste per la gara")
         ctx = render_map(T, ctx) or ctx
 
-        # DEM con ombreggiatura (usa ctx["race_datetime"])
+        # DEM con ombreggiatura (usa ctx['race_datetime'] internamente)
         st.markdown("### Esposizione & pendenza sulla pista selezionata")
         render_dem(T, ctx)
 
-        # tuning WC di base
+        # ---------- Tuning WC di base (preset statico) ----------
         wc = get_wc_tuning_for_event(selected_event, WCSkierLevel.WC)
         if wc is not None:
             params_dict, data_dict = wc
-            st.markdown("### Tuning WC di base suggerito")
+            st.markdown("### Tuning WC di base (preset)")
 
             c1m, c2m, c3m = st.columns(3)
             c1m.metric("Base bevel", f"{params_dict['base_bevel_deg']:.1f}°")
@@ -406,8 +414,100 @@ else:
                 f"- **Struttura**: {data_dict['structure_pattern']}\n"
                 f"- **Wax group**: {data_dict['wax_group']}\n"
                 f"- **Tipo neve**: {data_dict['snow_type']}\n"
-                f"- **Neve**: {data_dict['snow_temp_c']} °C · "
-                f"**Aria**: {data_dict['air_temp_c']} °C\n"
+                f"- **Neve (preset)**: {data_dict['snow_temp_c']} °C · "
+                f"**Aria (preset)**: {data_dict['air_temp_c']} °C\n"
                 f"- **Injected / ghiaccio**: {data_dict['injected']}\n"
                 f"- **Note**: {data_dict['notes']}"
             )
+
+        # ---------- METEO & GRAFICI GARA ----------
+        st.markdown("### 📈 Meteo & profilo giornata gara")
+
+        profile = meteo_mod.build_meteo_profile_for_race_day(ctx)
+        if profile is None:
+            st.warning("Impossibile costruire il profilo meteo per questa gara.")
+        else:
+            # DataFrame per grafici
+            df = pd.DataFrame(
+                {
+                    "time": profile.times,
+                    "temp_air": profile.temp_air,
+                    "snow_temp": profile.snow_temp,
+                    "rh": profile.rh,
+                    "cloudcover": profile.cloudcover,
+                    "windspeed": profile.windspeed,
+                    "shade_index": profile.shade_index,
+                    "snow_moisture_index": profile.snow_moisture_index,
+                    "glide_index": profile.glide_index,
+                }
+            ).set_index("time")
+
+            st.caption("Grafici riferiti all'intera giornata di gara (00–24).")
+
+            c_a, c_b = st.columns(2)
+            with c_a:
+                st.markdown("**Temperatura aria vs neve**")
+                st.line_chart(df[["temp_air", "snow_temp"]])
+
+                st.markdown("**Umidità relativa (%)**")
+                st.line_chart(df[["rh"]])
+            with c_b:
+                st.markdown("**Indice ombreggiatura** (0 sole, 1 ombra/luce piatta)")
+                st.line_chart(df[["shade_index"]])
+
+                st.markdown("**Indice scorrevolezza teorica** (0–1)")
+                st.line_chart(df[["glide_index"]])
+
+            st.markdown("**Vento (km/h) e copertura nuvolosa (%)**")
+            st.line_chart(df[["windspeed", "cloudcover"]])
+
+            # ---------- TUNING DINAMICO BASATO SU METEO ----------
+            st.markdown("### 🎯 Tuning dinamico basato su meteo reale")
+
+            # scegli livello atleta (per ora semplifichiamo)
+            level_choice = st.selectbox(
+                "Livello sciatore per questo tuning",
+                [
+                    ("WC / Coppa del Mondo", TuneSkierLevel.WC),
+                    ("FIS / Continental", TuneSkierLevel.FIS),
+                    ("Esperto", TuneSkierLevel.EXPERT),
+                    ("Turistico evoluto", TuneSkierLevel.TOURIST),
+                ],
+                format_func=lambda x: x[0],
+            )
+            chosen_level = level_choice[1]
+
+            # per ora lasciamo "iniettata" come toggle manuale
+            injected_flag = st.checkbox(
+                "Pista iniettata / ghiacciata",
+                value=True if wc is not None else False,
+            )
+
+            dyn = meteo_mod.build_dynamic_tuning_for_race(
+                profile=profile,
+                ctx=ctx,
+                discipline=selected_event.discipline or Discipline.GS,
+                skier_level=chosen_level,
+                injected=injected_flag,
+            )
+
+            if dyn is None:
+                st.info("Non è stato possibile calcolare il tuning dinamico per questa gara.")
+            else:
+                # usa core.race_tuning per la raccomandazione finale
+                rec = get_tuning_recommendation(dyn.input_params)
+
+                c1t, c2t, c3t = st.columns(3)
+                c1t.metric("Base bevel (dinamico)", f"{rec.base_bevel_deg:.1f}°")
+                c2t.metric("Side bevel (dinamico)", f"{rec.side_bevel_deg:.1f}°")
+                c3t.metric("Rischio", rec.risk_level.capitalize())
+
+                st.markdown(
+                    f"- **Neve stimata gara**: {dyn.input_params.snow_temp_c:.1f} °C "
+                    f"({dyn.snow_type.value})\n"
+                    f"- **Aria all'ora di gara**: {dyn.input_params.air_temp_c:.1f} °C\n"
+                    f"- **Struttura soletta suggerita**: {rec.structure_pattern}\n"
+                    f"- **Wax group suggerito**: {rec.wax_group}\n"
+                    f"- **Note edges**: {rec.notes}\n"
+                )
+                st.caption(dyn.summary)
