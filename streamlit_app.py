@@ -1,7 +1,7 @@
 # streamlit_app.py
 # Telemark · Pro Wax & Tune
 # Pagina 1: Località & Mappa
-# Pagina 2: Racing / Calendari + Mappa & DEM con centratura sulla gara
+# Pagina 2: Racing / Calendari + Mappa & DEM (centrata sulla gara)
 
 from __future__ import annotations
 
@@ -14,13 +14,12 @@ from typing import Optional, Dict, Any
 import requests
 import streamlit as st
 
-# --- hard-reload moduli core.* per evitare cache vecchie ---
+# --- hard-reload moduli core.* ---
 importlib.invalidate_caches()
 for name in list(sys.modules.keys()):
     if name == "core" or name.startswith("core."):
         del sys.modules[name]
 
-# --- import core ---
 from core.i18n import L
 from core.search import (
     country_selectbox,
@@ -40,9 +39,9 @@ from core.race_events import (
 from core.race_tuning import Discipline
 from core.race_integration import get_wc_tuning_for_event, SkierLevel as WCSkierLevel
 
-import core.search as search_mod  # solo per debug path/version
+import core.search as search_mod  # debug
 
-# ---------------------- PAGE CONFIG & THEME ----------------------
+# ---------------------- THEME ----------------------
 PRIMARY = "#06b6d4"
 ACCENT = "#f97316"
 
@@ -112,25 +111,12 @@ _FIS_PROVIDER = FISCalendarProvider()
 _FISI_PROVIDER = FISICalendarProvider()
 _RACE_SERVICE = RaceCalendarService(_FIS_PROVIDER, _FISI_PROVIDER)
 
-# ---------------------- GEOCODER PER GARE (Open-Meteo) ---------
+# ---------------------- GEOCODER GARE --------------------------
 MIN_ELEVATION_M = 1000.0
 UA = {"User-Agent": "telemark-wax-pro/2.0"}
 
-def _flag(cc: str) -> str:
-    try:
-        c = cc.upper()
-        return chr(127397 + ord(c[0])) + chr(127397 + ord(c[1]))
-    except Exception:
-        return "🏳️"
-
 @st.cache_data(ttl=3600, show_spinner=False)
 def geocode_race_place(query: str) -> Optional[Dict[str, Any]]:
-    """
-    Geocoding molto semplice per le gare:
-    - usa Open-Meteo
-    - filtra località sotto 1000 m
-    - prende il primo risultato valido
-    """
     q = (query or "").strip()
     if not q:
         return None
@@ -164,7 +150,6 @@ def geocode_race_place(query: str) -> Optional[Dict[str, Any]]:
                 continue
         except Exception:
             continue
-
         best = it
         break
 
@@ -175,7 +160,10 @@ def geocode_race_place(query: str) -> Optional[Dict[str, Any]]:
     name = best.get("name") or ""
     admin1 = best.get("admin1") or best.get("admin2") or ""
     base = f"{name}, {admin1}".strip().replace(" ,", ",")
-    label = f"{_flag(cc)}  {base} — {cc}"
+    flag = "".join(
+        chr(127397 + ord(c)) for c in cc
+    ) if len(cc) == 2 else "🏳️"
+    label = f"{flag}  {base} — {cc}"
 
     return {
         "lat": float(best.get("latitude", 0.0)),
@@ -183,15 +171,11 @@ def geocode_race_place(query: str) -> Optional[Dict[str, Any]]:
         "label": label,
     }
 
-# ---------------------- FUNZIONI DI SUPPORTO --------------------
+# ---------------------- SUPPORTO -------------------------------
 def ensure_base_location() -> Dict[str, Any]:
-    """
-    Restituisce la selezione corrente (se esiste) oppure Champoluc di default.
-    """
     sel = get_current_selection()
     if sel:
         return sel
-
     return {
         "lat": 45.83333,
         "lon": 7.73333,
@@ -209,10 +193,6 @@ def race_event_label(ev: RaceEvent) -> str:
 
 
 def center_ctx_on_race_location(ctx: Dict[str, Any], event: RaceEvent) -> Dict[str, Any]:
-    """
-    Geocoda la località della gara e aggiorna ctx + session_state
-    per centrare la mappa Racing sulla gara.
-    """
     raw_place = event.place or ""
     query_name = raw_place.split("(")[0].strip() or raw_place.strip()
 
@@ -241,7 +221,6 @@ def center_ctx_on_race_location(ctx: Dict[str, Any], event: RaceEvent) -> Dict[s
 # ---------------------- SIDEBAR ----------------------
 st.sidebar.markdown("### ⚙️")
 
-# lingua
 lang = st.sidebar.selectbox(
     "Lingua / Language",
     ["IT", "EN"],
@@ -249,26 +228,23 @@ lang = st.sidebar.selectbox(
 )
 T = L["it"] if lang == "IT" else L["en"]
 
-# scelta pagina
 page = st.sidebar.radio(
     "Sezione",
     ["Località & Mappa", "Racing / Calendari"],
     index=0,
 )
 
-# debug search.py effettivo
 search_path = os.path.abspath(search_mod.__file__)
 st.sidebar.markdown("**Debug search.py**")
 st.sidebar.code(search_path, language="bash")
 st.sidebar.text(f"Search.VERSION: {getattr(search_mod, 'VERSION', SEARCH_VERSION)}")
 
-# ---------------------- TITOLO GLOBALE -------------------------
+# ---------------------- MAIN -------------------------
 st.title("Telemark · Pro Wax & Tune")
 
-# ctx condiviso fra moduli
 ctx: Dict[str, Any] = {"lang": lang}
 
-# ====================== PAGINA 1: LOCALITÀ & MAPPA ======================
+# =============== PAGINA 1: LOCALITÀ & MAPPA ===============
 if page == "Località & Mappa":
     st.markdown("## 🌍 Località")
 
@@ -288,19 +264,19 @@ if page == "Località & Mappa":
         unsafe_allow_html=True,
     )
 
-    # ---- Mappa & piste ----
+    # mappa
     st.markdown("## 4) Mappa & piste")
+    ctx["map_context"] = "local"
     ctx = render_map(T, ctx) or ctx
 
-    # ---- DEM (pendenza & esposizione) ----
+    # DEM
     st.markdown("## 5) Esposizione & pendenza")
     render_dem(T, ctx)
 
-# ====================== PAGINA 2: RACING / CALENDARI ====================
+# =============== PAGINA 2: RACING / CALENDARI ===============
 else:
     st.markdown("## 🏁 Racing / Calendari gare")
 
-    # località base (es. scelta manualmente nella pagina 1)
     base_loc = ensure_base_location()
     ctx.update(base_loc)
     st.session_state["lat"] = base_loc["lat"]
@@ -315,7 +291,6 @@ else:
         unsafe_allow_html=True,
     )
 
-    # ------ Filtri calendario ------
     today = datetime.utcnow().date()
     default_season = today.year if today.month >= 7 else today.year - 1
 
@@ -380,7 +355,6 @@ else:
         selected_event = label_to_event[selected_label]
         st.session_state["race_selected_label"] = selected_label
 
-        # orario gara
         default_time = st.session_state.get("race_time", dtime(hour=10, minute=0))
         race_time = st.time_input(
             "Orario di partenza gara (ora locale comprensorio)",
@@ -393,8 +367,11 @@ else:
         ctx["race_event"] = selected_event
         ctx["race_datetime"] = race_datetime
 
-        # CENTRA LA MAPPA SULLA LOCALITÀ DELLA GARA
+        # centra sempre sulla località gara
         ctx = center_ctx_on_race_location(ctx, selected_event)
+
+        # mappa context specifico per forza-refresh
+        ctx["map_context"] = f"race_{selected_event.start_date.isoformat()}_{selected_event.place}"
 
         st.markdown(
             f'<div class="card">'
@@ -406,15 +383,15 @@ else:
             unsafe_allow_html=True,
         )
 
-        # ------ Mappa & piste per la gara ------
+        # mappa & piste
         st.markdown("### Mappa & piste per la gara")
         ctx = render_map(T, ctx) or ctx
 
-        # ------ DEM sulla posizione/pista scelta ------
+        # DEM con ombreggiatura (usa ctx["race_datetime"])
         st.markdown("### Esposizione & pendenza sulla pista selezionata")
         render_dem(T, ctx)
 
-        # ------ Tuning WC di base ------
+        # tuning WC di base
         wc = get_wc_tuning_for_event(selected_event, WCSkierLevel.WC)
         if wc is not None:
             params_dict, data_dict = wc
@@ -423,7 +400,7 @@ else:
             c1m, c2m, c3m = st.columns(3)
             c1m.metric("Base bevel", f"{params_dict['base_bevel_deg']:.1f}°")
             c2m.metric("Side bevel", f"{params_dict['side_bevel_deg']:.1f}°")
-            c3m.metric("Rischio", str(params_dict['risk_level']).title())
+            c3m.metric("Rischio", str(params_dict["risk_level"]).title())
 
             st.markdown(
                 f"- **Struttura**: {data_dict['structure_pattern']}\n"
@@ -434,5 +411,3 @@ else:
                 f"- **Injected / ghiaccio**: {data_dict['injected']}\n"
                 f"- **Note**: {data_dict['notes']}"
             )
-
-# fine file
