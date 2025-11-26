@@ -35,7 +35,6 @@ MAX_RADIUS_KM = 10  # raggio comprensorio
 
 # ---------- Helper geografici ----------
 
-
 def _haversine(lat1, lon1, lat2, lon2) -> float:
     R = 6371.0
     p1, p2 = math.radians(lat1), math.radians(lat2)
@@ -60,7 +59,6 @@ def _point_distance_km(lat1, lon1, lat2, lon2) -> float:
 
 
 # ---------- Fetch piste da Overpass ----------
-
 
 def _overpass_query(lat: float, lon: float, dist_km: int) -> List[Dict[str, Any]]:
     radius_m = int(dist_km * 1000)
@@ -115,8 +113,9 @@ def fetch_pistes(lat: float, lon: float, dist_km: int = MAX_RADIUS_KM) -> List[D
 
         piste_type = tags.get("piste:type", "")
         route = tags.get("route", "")
+
+        # tieni solo downhill/alpine; via nordic, skitour, sled, ecc.
         if piste_type and piste_type not in ("downhill", "alpine", "ski"):
-            # esclude nordic, skitour, sled, ecc.
             continue
         if (not piste_type) and (route != "piste"):
             continue
@@ -156,7 +155,6 @@ def fetch_pistes(lat: float, lon: float, dist_km: int = MAX_RADIUS_KM) -> List[D
 
 # ---------- Label & difficulty ----------
 
-
 def _difficulty_label(diff: str, lang: str) -> str:
     if not diff:
         return ""
@@ -181,19 +179,16 @@ def _piste_option_label(p: Dict[str, Any], lang: str) -> str:
 
 # ---------- Render principale ----------
 
-
 def render_map(
     T: Dict[str, str],
     ctx: Dict[str, Any],
-    map_key: str = "main_map",
-    auto_select_nearest: bool = False,
+    map_key: str = "map_default",
 ):
     """
     Pannello 'Mappa & piste'.
 
-    - map_key: permette di avere istanze indipendenti (Wax vs Racing).
-    - auto_select_nearest: se True, seleziona automaticamente la pista più vicina
-      al centro ctx["lat"], ctx["lon"] (utile per la pagina Racing).
+    Nessuna selezione automatica: la pista viene scelta solo
+    da selectbox o da click sulla mappa.
     """
     lang = ctx.get("lang", "IT")
     lat = float(ctx.get("lat", 45.831))
@@ -221,10 +216,7 @@ def render_map(
         except Exception as e:
             st.error(f"Errore imprevisto caricando le piste (OSM/Overpass): {e}")
 
-    st.caption(
-        f"Piste downhill trovate: {len(pistes)} (elementi Overpass grezzi: "
-        f"{len(pistes)})"
-    )
+    st.caption(f"Piste downhill trovate: {len(pistes)}")
 
     if show_pistes and not pistes:
         st.info("Nessuna pista trovata in questo comprensorio (OSM/Overpass).")
@@ -237,26 +229,6 @@ def render_map(
 
     selected_piste = None
     selected_id = st.session_state.get(sel_id_key)
-
-    # auto-select nearest piste (es. pagina Racing)
-    if auto_select_nearest and pistes:
-        # se non abbiamo ancora una selezione, scegliamo la pista più vicina al centro
-        if selected_id is None:
-            best_p = None
-            best_d = 9999.0
-            for p in pistes:
-                d = _point_distance_km(
-                    lat,
-                    lon,
-                    float(p["center_lat"]),
-                    float(p["center_lon"]),
-                )
-                if d < best_d:
-                    best_d = d
-                    best_p = p
-            if best_p:
-                selected_id = best_p["id"]
-                st.session_state[sel_id_key] = selected_id
 
     if pistes:
         search_txt = st.text_input(
@@ -279,7 +251,6 @@ def render_map(
         options = [_piste_option_label(p, lang) for p in filtered]
         label_to_piste = {_piste_option_label(p, lang): p for p in filtered}
 
-        # default: se abbiamo una pista già selezionata, posizioniamo l'indice su quella
         default_index = 0
         if selected_id is not None:
             for i, p in enumerate(filtered):
@@ -304,10 +275,12 @@ def render_map(
                 selected_id = selected_piste["id"]
                 st.session_state[sel_id_key] = selected_id
 
-                # aggiorna centro mappa / ctx alla pista selezionata
                 ctx_lat = float(selected_piste["center_lat"])
                 ctx_lon = float(selected_piste["center_lon"])
-                ctx_label = f"{place_label.split('—')[0].strip()} · {selected_piste['name'] or 'pista'}"
+                ctx_label = (
+                    f"{place_label.split('—')[0].strip()} · "
+                    f"{selected_piste['name'] or 'pista'}"
+                )
 
                 ctx["lat"] = ctx_lat
                 ctx["lon"] = ctx_lon
@@ -357,7 +330,7 @@ def render_map(
 
     folium.LayerControl().add_to(m)
 
-    # puntatore visibile sulla località
+    # puntatore ben visibile sulla località
     folium.Marker(
         [map_lat, map_lon],
         tooltip=ctx.get("place_label", place_label),
@@ -388,7 +361,7 @@ def render_map(
                 tooltip=popup_txt,
             ).add_to(m)
 
-    # mostra mappa + click → selezione pista più vicina
+    # click → seleziona pista più vicina al click (sempre consapevolmente)
     out = st_folium(
         m,
         height=420,
@@ -402,7 +375,6 @@ def render_map(
         c_lat = float(click.get("lat"))
         c_lon = float(click.get("lng"))
 
-        # trova la pista col punto più vicino al click
         best_p = None
         best_d = 9999.0
         for p in pistes:
@@ -417,7 +389,10 @@ def render_map(
 
             ctx_lat = float(best_p["center_lat"])
             ctx_lon = float(best_p["center_lon"])
-            ctx_label = f"{place_label.split('—')[0].strip()} · {best_p['name'] or 'pista'}"
+            ctx_label = (
+                f"{place_label.split('—')[0].strip()} · "
+                f"{best_p['name'] or 'pista'}"
+            )
 
             ctx["lat"] = ctx_lat
             ctx["lon"] = ctx_lon
