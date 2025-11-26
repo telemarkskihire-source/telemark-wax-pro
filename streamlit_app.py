@@ -22,7 +22,23 @@ for name in list(sys.modules.keys()):
     if name == "core" or name.startswith("core."):
         del sys.modules[name]
 
-from core.i18n import L
+# --------- i18n: usa core.i18n se esiste, altrimenti fallback minimale -----
+try:
+    from core.i18n import L  # type: ignore
+except ModuleNotFoundError:
+    L = {
+        "it": {
+            "country": "Nazione (prefiltro ricerca)",
+            "search_ph": "Cerca… es. Champoluc, Plateau Rosa",
+            "show_pistes_label": "Mostra piste sci alpino sulla mappa",
+        },
+        "en": {
+            "country": "Country (search prefilter)",
+            "search_ph": "Search… e.g. Champoluc, Plateau Rosa",
+            "show_pistes_label": "Show alpine ski slopes on map",
+        },
+    }
+
 from core.search import (
     country_selectbox,
     location_searchbox,
@@ -107,6 +123,22 @@ hr {
   padding:.15rem .55rem;
   font-size:.8rem;
   color:#e2e8f0;
+}
+
+/* lista gare “a tenda” scrollabile */
+.race-scroll {
+  max-height: 260px;
+  overflow-y: auto;
+  padding: .25rem .1rem;
+  border-radius: 10px;
+  background: #020617;
+  border: 1px solid #1f2937;
+}
+.race-scroll [data-testid="stRadio"] > div {
+  flex-direction: column;
+}
+.race-scroll label {
+  font-size: .85rem;
 }
 </style>
 """,
@@ -359,13 +391,16 @@ else:
         else:
             default_idx = 0
 
-        # SEMPRE radio → niente tastiera su mobile
+        st.markdown("**Seleziona gara**")
+        st.markdown('<div class="race-scroll">', unsafe_allow_html=True)
         selected_label = st.radio(
-            "Seleziona gara",
+            "",
             labels,
             index=default_idx,
             key="race_radio",
         )
+        st.markdown("</div>", unsafe_allow_html=True)
+
         selected_event = label_to_event[selected_label]
         st.session_state["race_selected_label"] = selected_label
 
@@ -452,7 +487,6 @@ else:
             st.caption("Grafici riferiti all'intera giornata di gara (00–24).")
 
             df_reset = df.reset_index()
-
             base_props = {"height": 120}
 
             # === FASCIA 1: temperatura aria vs neve ===
