@@ -3,7 +3,7 @@
 # - pendenza (° e %)
 # - esposizione (bussola + gradi)
 # - stima ombreggiatura
-# - altitudine con possibilità di override manuale
+# - altitudine con possibilità di override manuale (per ogni punto selezionato)
 
 import math
 import requests
@@ -125,8 +125,10 @@ def render_slope_shade_panel(T, ctx):
 
         # altitudine DEM al centro patch
         center_alt = float(Z[Z.shape[0] // 2, Z.shape[1] // 2])
-        override_key = "altitude_override_m"
-        default_alt = float(st.session_state.get(override_key, center_alt))
+
+        # chiave per override legata a lat/lon -> cambia quando cambi pista/punto
+        alt_key = f"altitude_override_m_{round(lat,5)}_{round(lon,5)}"
+        default_alt = float(st.session_state.get(alt_key, center_alt))
 
         alt = st.number_input(
             T.get("altitude_m", "Altitudine punto selezionato (m)"),
@@ -135,7 +137,7 @@ def render_slope_shade_panel(T, ctx):
             value=float(round(default_alt, 1)),
             step=10.0,
         )
-        st.session_state[override_key] = alt
+        st.session_state[alt_key] = alt
         ctx["altitude_m"] = alt
 
         c1, c2, c3 = st.columns(3)
@@ -149,6 +151,7 @@ def render_slope_shade_panel(T, ctx):
         st.caption(
             T.get("shade_txt", "Stima ombreggiatura: ") + shade_txt
         )
+        st.caption(f"Altitudine DEM di riferimento (centro patch): {center_alt:.0f} m")
 
 
 # alias per compatibilità
