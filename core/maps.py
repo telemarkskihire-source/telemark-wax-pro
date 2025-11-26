@@ -1,15 +1,16 @@
 # core/maps.py
-# Mappa + piste sci alpino per Telemark · Pro Wax & Tune
+# Mappa & piste per Telemark · Pro Wax & Tune
 #
-# - Folium + streamlit_folium
-# - Tile OSM + Satellite
-# - Piste da Overpass (solo sci alpino / downhill)
-# - Puntatore agganciato alla pista più vicina (se presente)
-#   e SEMPRE sincronizzato con ctx['lat'], ctx['lon']
+# - Base OSM + satellite (Esri World Imagery)
+# - Checkbox "Mostra piste sci alpino sulla mappa"
+# - Piste da Overpass: piste:type=downhill
+# - Puntatore visibile che segue:
+#     · selezione gara (via ctx["lat"]/["lon"])
+#     · click sulla mappa
+# - Ritorna ctx aggiornato (lat/lon + marker_lat/lon)
 
 from __future__ import annotations
 
-import math
 from typing import Dict, Any, List, Tuple, Optional
 
 import requests
@@ -17,196 +18,115 @@ import streamlit as st
 from streamlit_folium import st_folium
 import folium
 
-UA = {"User-Agent": "telemark-wax-pro/2.0"}
-OVERPASS_URL = "https://overpass-api.de/api/interpreter"
+UA = {"User-Agent": "telemark-wax-pro/3.0"}
 
 
-# -------------------------------------------------------------------
-# Utilità Geo
-# -------------------------------------------------------------------
-def _haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    """Distanza approssimata in metri tra due punti."""
-    R = 6371000.0
-    phi1 = math.radians(lat1)
-    phi2 = math.radians(lat2)
-    dphi = math.radians(lat2 - lat1)
-    dlambda = math.radians(lon2 - lon1)
-    a = (
-        math.sin(dphi / 2) ** 2
-        + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
-    )
-    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
-    return R * c
-
-
-def _nearest_vertex(
-    polylines: List[List[Tuple[float, float]]],
-    lat: float,
-    lon: float,
-) -> Optional[Tuple[float, float]]:
-    """Trova il vertice di pista più vicino al punto dato."""
-    best = None
-    best_d = 1e12
-    for line in polylines:
-        for la, lo in line:
-            d = _haversine_m(lat, lon, la, lo)
-            if d < best_d:
-                best_d = d
-                best = (la, lo)
-    return best
-
-
-# -------------------------------------------------------------------
-# Overpass: scarica piste alpine
-# -------------------------------------------------------------------
-def _is_downhill(tags: Dict[str, str]) -> bool:
+@st.cache_data(ttl=1800, show_spinner=False)
+def _fetch_downhill_pistes(lat: float, lon: float, radius_km: float = 10.0) -> Tuple[int, List[List[Tuple[float, float]]]]:
     """
-    Filtra SOLO piste di sci alpino / discesa.
-    - piste:type = downhill / alpine
-    - oppure route=piste con piste:difficulty presente
-    """
-    t = (tags.get("piste:type") or "").lower()
-    route = (tags.get("route") or "").lower()
-
-    if t in {"downhill", "alpine"}:
-        return True
-
-    if route == "piste" and tags.get("piste:difficulty"):
-        return True
-
-    return False
-
-
-def _fetch_pistes_alpine(
-    lat: float,
-    lon: float,
-    radius_km: float = 12.0,
-) -> Tuple[List[List[Tuple[float, float]]], int]:
-    """
+    Scarica le piste di discesa (piste:type=downhill) via Overpass attorno
+    a (lat, lon) con raggio in km.
     Ritorna:
-      - lista di polilinee [ [(lat,lon), ...], ... ] per piste alpine
-      - numero di elementi grezzi Overpass
+      - numero di piste
+      - lista di polilinee, ciascuna come lista di (lat, lon)
     """
-    r_m = int(radius_km * 1000)
+    radius_m = int(radius_km * 1000)
 
     query = f"""
-[out:json][timeout:30];
-(
-  way["piste:type"](around:{r_m},{lat},{lon});
-  relation["piste:type"](around:{r_m},{lat},{lon});
-  way["route"="piste"](around:{r_m},{lat},{lon});
-);
-out body;
->;
-out skel qt;
-"""
+    [out:json][timeout:25];
+    (
+      way["piste:type"="downhill"](around:{radius_m},{lat},{lon});
+      relation["piste:type"="downhill"](around:{radius_m},{lat},{lon});
+    );
+    (._;>;);
+    out body;
+    """
 
     try:
-        resp = requests.get(
-            OVERPASS_URL,
-            params={"data": query},
+        r = requests.post(
+            "https://overpass-api.de/api/interpreter",
+            data=query.encode("utf-8"),
             headers=UA,
-            timeout=30,
+            timeout=25,
         )
-        resp.raise_for_status()
-        js = resp.json() or {}
+        r.raise_for_status()
+        js = r.json()
     except Exception:
-        return [], 0
+        return 0, []
 
-    elems = js.get("elements") or []
-    nodes: Dict[int, Tuple[float, float]] = {}
-    ways: Dict[int, Dict[str, Any]] = {}
-
-    for el in elems:
-        if el.get("type") == "node":
-            nodes[el["id"]] = (float(el["lat"]), float(el["lon"]))
-        elif el.get("type") == "way":
-            ways[el["id"]] = el
+    elements = js.get("elements", [])
+    nodes = {el["id"]: el for el in elements if el.get("type") == "node"}
 
     polylines: List[List[Tuple[float, float]]] = []
+    piste_count = 0
 
-    # ways diretti
-    for w in ways.values():
-        tags = w.get("tags", {})
-        if not _is_downhill(tags):
+    for el in elements:
+        if el.get("type") not in ("way", "relation"):
             continue
-        coords = [
-            nodes[nid] for nid in w.get("nodes", []) if nid in nodes
-        ]
-        if len(coords) >= 2:
-            polylines.append(coords)
+        tags = el.get("tags") or {}
+        if tags.get("piste:type") != "downhill":
+            continue
 
-    # relations che raggruppano più ways
-    for el in elems:
-        if el.get("type") != "relation":
-            continue
-        tags = el.get("tags", {})
-        if not _is_downhill(tags):
-            continue
         coords: List[Tuple[float, float]] = []
-        for m in el.get("members", []):
-            if m.get("type") == "way":
-                w = ways.get(m.get("ref"))
-                if not w:
+
+        if el["type"] == "way":
+            for nid in el.get("nodes", []):
+                nd = nodes.get(nid)
+                if not nd:
                     continue
-                coords.extend(
-                    [nodes[nid] for nid in w.get("nodes", []) if nid in nodes]
-                )
+                coords.append((nd["lat"], nd["lon"]))
+
+        elif el["type"] == "relation":
+            for mem in el.get("members", []):
+                if mem.get("type") != "way":
+                    continue
+                wid = mem.get("ref")
+                way = next((e for e in elements if e.get("type") == "way" and e.get("id") == wid), None)
+                if not way:
+                    continue
+                for nid in way.get("nodes", []):
+                    nd = nodes.get(nid)
+                    if not nd:
+                        continue
+                    coords.append((nd["lat"], nd["lon"]))
+
         if len(coords) >= 2:
             polylines.append(coords)
+            piste_count += 1
 
-    return polylines, len(elems)
+    return piste_count, polylines
 
 
-# -------------------------------------------------------------------
-# RENDER MAP
-# -------------------------------------------------------------------
-def render_map(T, ctx: Dict[str, Any]) -> Dict[str, Any]:
+def render_map(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Disegna la mappa principale.
-    Usa:
-      - ctx['lat'], ctx['lon']
-      - ctx['map_context'] per key univoco su Streamlit
-    Aggiorna ctx e st.session_state con ultimi lat/lon (snap a pista).
+    Disegna la mappa basata su ctx:
+      - ctx["lat"], ctx["lon"]  → centro
+      - ctx["marker_lat"], ["marker_lon"] → puntatore (fallback = lat/lon)
+      - ctx["map_context"] → usato solo per key widget, per forzare refresh
+    Ritorna ctx aggiornato con eventuale click sulla mappa.
     """
     lat = float(ctx.get("lat", 45.83333))
     lon = float(ctx.get("lon", 7.73333))
-    map_context = ctx.get("map_context", "default")
 
-    # checkbox per piste
+    marker_lat = float(ctx.get("marker_lat", lat))
+    marker_lon = float(ctx.get("marker_lon", lon))
+
+    # salva in sessione così DEM & altri moduli usano gli stessi valori
+    st.session_state["lat"] = marker_lat
+    st.session_state["lon"] = marker_lon
+
+    ctx["lat"] = marker_lat
+    ctx["lon"] = marker_lon
+
+    map_context = str(ctx.get("map_context", "default"))
+
     show_pistes = st.checkbox(
-        "Mostra piste sci alpino sulla mappa",
+        T.get("show_pistes_label", "Mostra piste sci alpino sulla mappa"),
         value=True,
-        key=f"chk_pistes_alpine_{map_context}",
+        key=f"show_pistes_{map_context}",
     )
 
-    pistes: List[List[Tuple[float, float]]] = []
-    raw_count = 0
-
-    if show_pistes:
-        with st.spinner("Cerco piste sci alpino da OpenStreetMap…"):
-            pistes, raw_count = _fetch_pistes_alpine(lat, lon)
-
-        st.caption(
-            f"Piste alpine trovate: {len(pistes)} "
-            f"(elementi Overpass grezzi: {raw_count})"
-        )
-
-        if not pistes:
-            st.warning(
-                "Nessuna pista sci alpino trovata in questo comprensorio "
-                "(OSM/Overpass)."
-            )
-
-    # Se ci sono piste, agganciamo il puntatore al vertice più vicino
-    marker_lat = lat
-    marker_lon = lon
-    if pistes:
-        snap = _nearest_vertex(pistes, lat, lon)
-        if snap is not None:
-            marker_lat, marker_lon = snap
-
-    # costruiamo la mappa Folium
+    # Crea mappa Folium
     m = folium.Map(
         location=[marker_lat, marker_lon],
         zoom_start=13,
@@ -214,60 +134,53 @@ def render_map(T, ctx: Dict[str, Any]) -> Dict[str, Any]:
         control_scale=True,
     )
 
-    # base OSM
+    # Base OSM
     folium.TileLayer(
         "OpenStreetMap",
-        name="Mappa stradale",
+        name="Strade",
         control=True,
     ).add_to(m)
 
-    # satellite (Esri World Imagery)
+    # Satellite (Esri World Imagery)
     folium.TileLayer(
-        tiles=(
-            "https://server.arcgisonline.com/ArcGIS/rest/services/"
-            "World_Imagery/MapServer/tile/{z}/{y}/{x}"
-        ),
-        attr="Tiles © Esri — Sources: Esri, DeLorme, NAVTEQ, USGS, Intermap, and others",
+        tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+        attr="Esri World Imagery",
         name="Satellite",
         control=True,
     ).add_to(m)
 
-    # layer piste
-    if pistes:
-        fg = folium.FeatureGroup(name="Piste sci alpino", show=True)
-        for line in pistes:
-            folium.PolyLine(
-                locations=line,
-                weight=3,
-                opacity=0.9,
-            ).add_to(fg)
-        fg.add_to(m)
-
-    # marker posizione attuale
+    # Puntatore gara/località
     folium.Marker(
         location=[marker_lat, marker_lon],
         icon=folium.Icon(color="red", icon="flag"),
-        tooltip="Posizione selezionata",
     ).add_to(m)
 
-    folium.LayerControl().add_to(m)
+    piste_count = 0
 
-    # chiave univoca in base al contesto
+    if show_pistes:
+        piste_count, polylines = _fetch_downhill_pistes(marker_lat, marker_lon, radius_km=10.0)
+        for coords in polylines:
+            folium.PolyLine(
+                locations=coords,
+                weight=3,
+                opacity=0.9,
+            ).add_to(m)
+
+    st.caption(f"Piste downhill trovate: {piste_count}")
+
+    # Render mappa in Streamlit
     map_key = f"map_{map_context}"
+    map_data = st_folium(m, height=450, width=None, key=map_key)
 
-    # usiamo st_folium solo per renderizzare; ignoro i click così
-    # il puntatore segue SEMPRE il centro logico (località / gara)
-    st_folium(
-        m,
-        height=450,
-        width=None,
-        key=map_key,
-    )
-
-    # sincronizza verso ctx + session_state (dopo eventuale snap a pista)
-    ctx["lat"] = marker_lat
-    ctx["lon"] = marker_lon
-    st.session_state["lat"] = marker_lat
-    st.session_state["lon"] = marker_lon
+    # Gestione click: aggiorna puntatore e lat/lon
+    if map_data and map_data.get("last_clicked") is not None:
+        click_lat = float(map_data["last_clicked"]["lat"])
+        click_lon = float(map_data["last_clicked"]["lng"])
+        st.session_state["marker_lat"] = click_lat
+        st.session_state["marker_lon"] = click_lon
+        ctx["marker_lat"] = click_lat
+        ctx["marker_lon"] = click_lon
+        ctx["lat"] = click_lat
+        ctx["lon"] = click_lon
 
     return ctx
