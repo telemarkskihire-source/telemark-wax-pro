@@ -11,7 +11,7 @@
 
 from __future__ import annotations
 
-from typing import Dict, Any, List, Tuple, Optional
+from typing import Dict, Any, List, Tuple
 
 import requests
 import streamlit as st
@@ -111,10 +111,6 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
     marker_lat = float(ctx.get("marker_lat", lat))
     marker_lon = float(ctx.get("marker_lon", lon))
 
-    # salva in sessione così DEM & altri moduli usano gli stessi valori
-    st.session_state["lat"] = marker_lat
-    st.session_state["lon"] = marker_lon
-
     ctx["lat"] = marker_lat
     ctx["lon"] = marker_lon
 
@@ -172,15 +168,17 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
     map_key = f"map_{map_context}"
     map_data = st_folium(m, height=450, width=None, key=map_key)
 
-    # Gestione click: aggiorna puntatore e lat/lon
+    # Gestione click: aggiorna puntatore, ctx e sessione
     if map_data and map_data.get("last_clicked") is not None:
         click_lat = float(map_data["last_clicked"]["lat"])
         click_lon = float(map_data["last_clicked"]["lng"])
-        st.session_state["marker_lat"] = click_lat
-        st.session_state["marker_lon"] = click_lon
         ctx["marker_lat"] = click_lat
         ctx["marker_lon"] = click_lon
         ctx["lat"] = click_lat
         ctx["lon"] = click_lon
+        st.session_state["marker_lat"] = click_lat
+        st.session_state["marker_lon"] = click_lon
+        st.session_state["lat"] = click_lat
+        st.session_state["lon"] = click_lon
 
     return ctx
