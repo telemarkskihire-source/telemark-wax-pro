@@ -1,291 +1,302 @@
 # core/race_events.py
-# Calendari gare FIS/FISI – integrazione Neveitalia per Telemark · Pro Wax & Tune
+# Calendari gare per Telemark · Pro Wax & Tune
+#
+# - RaceEvent: modello unico per una gara
+# - Federation: FIS / FISI (label logico)
+# - FISICalendarProvider: scraping da https://www.fisi.org/calendario-gare/
+#   (estraiamo solo "Sci alpino")
+# - FISCalendarProvider: wrapper sullo stesso calendario (per ora)
+# - RaceCalendarService: unifica provider e applica filtri
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, date
+from datetime import date, datetime
 from enum import Enum
 from html.parser import HTMLParser
-from typing import Callable, List, Optional
-import re
+from typing import List, Optional, Dict, Any
 
+import re
 import requests
 
+UA = {"User-Agent": "telemark-wax-pro/3.0"}
 
-# ---------------------------------------------------------------------------
-# Modelli di base
-# ---------------------------------------------------------------------------
 
-class Federation(Enum):
+# ---------------------- MODEL ----------------------
+
+
+class Federation(str, Enum):
     FIS = "FIS"
     FISI = "FISI"
 
 
-@dataclass
+@dataclass(frozen=True)
 class RaceEvent:
     start_date: date
+    discipline: Optional[str]  # es. "SL", "GS", ...
     place: str
     nation: Optional[str]
-    name: str
-    discipline: Optional[str]  # "SL", "GS", "SG", "DH", ecc.
-    federation: Federation
+    name: str                  # nome breve gara (es. "Gara internazionale")
+    code: Optional[str] = None # codice gara (es. GER0741, ITA5797...)
+    gender: Optional[str] = None
+    federation: Federation = Federation.FISI
+    raw: Dict[str, Any] = None
 
 
-# ---------------------------------------------------------------------------
-# Parser HTML specifico Neveitalia
-#   lavora sui blocchi:
-#   <div class="ac">
-#     <div class="ac-q">
-#       <span class="date">2025-10-26 10:00 </span>
-#       <span class="place">Soelden (AUT)</span>
-#       <span class="event">Slalom Gigante Maschile </span>
-# ---------------------------------------------------------------------------
+# ---------------------- HTML UTILS ----------------------
 
-class _NeveitaliaCalendarParser(HTMLParser):
-    """Estrae (date, place, event) dai blocchi .ac-q del calendario."""
+
+class _AnchorTextExtractor(HTMLParser):
+    """Estrae il testo di tutti i tag <a>...</a> in una pagina HTML."""
 
     def __init__(self) -> None:
         super().__init__()
-        self.in_ac_q = False
-        self.current_span_class: Optional[str] = None
-        self.buf_date: str = ""
-        self.buf_place: str = ""
-        self.buf_event: str = ""
-        self.events_raw: List[tuple[str, str, str]] = []
+        self._in_a = False
+        self._current: List[str] = []
+        self.texts: List[str] = []
 
-    # --------- tag handling ---------
+    def handle_starttag(self, tag: str, attrs):
+        if tag.lower() == "a":
+            self._in_a = True
+            self._current = []
 
-    def handle_starttag(self, tag: str, attrs) -> None:
-        attrs_dict = dict(attrs)
-        if tag == "div":
-            cls = attrs_dict.get("class", "")
-            if "ac-q" in cls.split():
-                # inizio nuovo evento
-                self.in_ac_q = True
-                self.current_span_class = None
-                self.buf_date = ""
-                self.buf_place = ""
-                self.buf_event = ""
-        elif self.in_ac_q and tag == "span":
-            cls = attrs_dict.get("class", "")
-            if "date" in cls:
-                self.current_span_class = "date"
-            elif "place" in cls:
-                self.current_span_class = "place"
-            elif "event" in cls:
-                self.current_span_class = "event"
-        # <a> dentro place: manteniamo current_span_class così com'è
+    def handle_data(self, data: str):
+        if self._in_a:
+            self._current.append(data)
 
-    def handle_endtag(self, tag: str) -> None:
-        if tag == "div" and self.in_ac_q:
-            # chiusura del blocco .ac-q → salviamo l’evento
-            date_txt = self.buf_date.strip()
-            event_txt = self.buf_event.strip()
-            place_txt = self.buf_place.strip()
-            if date_txt and event_txt:
-                self.events_raw.append((date_txt, place_txt, event_txt))
-            self.in_ac_q = False
-            self.current_span_class = None
-
-    def handle_data(self, data: str) -> None:
-        if not (self.in_ac_q and self.current_span_class):
-            return
-        if self.current_span_class == "date":
-            self.buf_date += data
-        elif self.current_span_class == "place":
-            self.buf_place += data
-        elif self.current_span_class == "event":
-            self.buf_event += data
+    def handle_endtag(self, tag: str):
+        if tag.lower() == "a" and self._in_a:
+            txt = "".join(self._current).strip()
+            if txt:
+                # normalizziamo spazi
+                txt = re.sub(r"\s+", " ", txt)
+                self.texts.append(txt)
+            self._in_a = False
+            self._current = []
 
 
-# ---------------------------------------------------------------------------
-# Provider FIS via Neveitalia (maschile + femminile)
-# ---------------------------------------------------------------------------
+def _extract_anchor_texts(html: str) -> List[str]:
+    parser = _AnchorTextExtractor()
+    parser.feed(html)
+    return parser.texts
 
-HttpClient = Callable[[str, Optional[dict]], str]
+
+# ---------------------- FISI CALENDAR (fisi.org) ----------------------
 
 
-class FISCalendarProvider:
-    """Scarica il calendario di Coppa del Mondo da Neveitalia (M + F)."""
+class FISICalendarProvider:
+    """
+    Provider che legge il calendario da https://www.fisi.org/calendario-gare/
+    e costruisce RaceEvent solo per "Sci alpino".
+    """
 
-    MEN_URL = "https://www.neveitalia.it/sport/scialpino/calendario"
-    WOMEN_URL = (
-        "https://www.neveitalia.it/sport/scialpino/calendario/coppa-del-mondo-femminile"
-    )
+    BASE_URL = "https://www.fisi.org/calendario-gare/"
 
-    def __init__(self, http_client: Optional[HttpClient] = None) -> None:
-        self.http_client: HttpClient = http_client or self._default_http_client
+    def __init__(self) -> None:
+        self._session = requests.Session()
+        self._session.headers.update(UA)
 
-    # ---------- HTTP di default ----------
+    def _fetch_html(self) -> str:
+        try:
+            r = self._session.get(self.BASE_URL, timeout=15)
+            r.raise_for_status()
+            return r.text
+        except Exception:
+            return ""
 
     @staticmethod
-    def _default_http_client(url: str, params: Optional[dict] = None) -> str:
-        resp = requests.get(url, params=params, timeout=15)
-        resp.raise_for_status()
-        return resp.text
+    def _parse_event_from_text(txt: str) -> Optional[RaceEvent]:
+        """
+        Parsing di una riga tipo:
 
-    # ---------- API esterna ----------
+        "Sci alpino 01/11/2025 GER0741 Wittenburg - Germania M
+         Gara internazionale - ENL SL - Slalom Speciale - GS GIOVANI / SENIOR"
 
-    def fetch_events(
+        oppure (annullata):
+
+        "Sci alpino 14/11/2025 Annullata ITA5797 - Italia F
+         Gara internazionale - NJR GS - Slalom Gigante - G_ GIOVANI"
+        """
+
+        if not txt.startswith("Sci alpino "):
+            return None
+
+        # pattern con 'Annullata' opzionale prima del codice
+        pattern = (
+            r"Sci alpino\s+"
+            r"(?P<date>\d{2}/\d{2}/\d{4})\s+"
+            r"(?:(?:Annullata|ANNULLATA)\s+)?"
+            r"(?P<code>[A-Z0-9_]+)\s+"
+            r"(?P<place_country>.+?)\s+"
+            r"(?P<gender>M|F|MF)\s+"
+            r"(?P<desc>.+)$"
+        )
+
+        m = re.match(pattern, txt)
+        if not m:
+            return None
+
+        date_str = m.group("date")
+        code = m.group("code")
+        place_country = m.group("place_country").strip()
+        gender = m.group("gender")
+        desc = m.group("desc").strip()
+
+        # Data
+        try:
+            d = datetime.strptime(date_str, "%d/%m/%Y").date()
+        except ValueError:
+            return None
+
+        # Place & nation (es. "Wittenburg - Germania")
+        place = place_country
+        nation: Optional[str] = None
+        if " - " in place_country:
+            before, after = place_country.split(" - ", 1)
+            before = before.strip()
+            after = after.strip()
+            # se primo pezzo è vuoto (caso "ITA5797 - Italia"), prendi il secondo come place
+            if before:
+                place = before
+                nation = after or None
+            else:
+                place = after or place
+                nation = None
+
+        # Nome gara = prima parte della descrizione prima del primo " - "
+        name = desc
+        if " - " in desc:
+            name = desc.split(" - ", 1)[0].strip()
+
+        # Disciplina corta: cerca SL / GS / SG / DH / AC / SC / PSL ecc. nella descrizione
+        discipline = None
+        disc_match = re.search(
+            r"\b(SL|GS|SG|DH|AC|SC|PSL|PAR|KB)\b", desc
+        )
+        if disc_match:
+            discipline = disc_match.group(1)
+
+        return RaceEvent(
+            start_date=d,
+            discipline=discipline,
+            place=place,
+            nation=nation,
+            name=name,
+            code=code,
+            gender=gender,
+            federation=Federation.FISI,
+            raw={"text": txt},
+        )
+
+    def list_events(
         self,
         season: int,
-        discipline: Optional[str] = None,  # "SL"/"GS"/"SG"/"DH" oppure None
-        nation: Optional[str] = None,      # "ITA", "AUT", ecc. oppure None
+        discipline: Optional[str] = None,
+        nation: Optional[str] = None,
+        region: Optional[str] = None,  # non usato per ora
     ) -> List[RaceEvent]:
-        """Ritorna eventi FIS (uomo + donna) filtrati per stagione/disciplina/nazione."""
-        html_pages: List[str] = []
-        for url in (self.MEN_URL, self.WOMEN_URL):
-            try:
-                html_pages.append(self.http_client(url, None))
-            except Exception:
-                # se una delle due pagine fallisce continuiamo con l’altra
-                continue
+        html = self._fetch_html()
+        if not html:
+            return []
 
-        all_events: List[RaceEvent] = []
-        for html in html_pages:
-            all_events.extend(
-                self._parse_neveitalia_html(
-                    html=html,
-                    season=season,
-                    discipline=discipline,
-                    nation=nation,
-                )
-            )
-
-        all_events.sort(key=lambda ev: ev.start_date)
-        return all_events
-
-    # ---------- parsing HTML ----------
-
-    def _parse_neveitalia_html(
-        self,
-        html: str,
-        season: int,
-        discipline: Optional[str],
-        nation: Optional[str],
-    ) -> List[RaceEvent]:
-        parser = _NeveitaliaCalendarParser()
-        parser.feed(html)
+        texts = _extract_anchor_texts(html)
 
         events: List[RaceEvent] = []
-
-        for date_txt, place_txt, event_txt in parser.events_raw:
-            # data: "2025-10-26 10:00" → prendiamo solo AAAA-MM-GG
-            date_part = date_txt.strip().split()[0]
-            try:
-                d = datetime.strptime(date_part, "%Y-%m-%d").date()
-            except ValueError:
+        for txt in texts:
+            if not txt.startswith("Sci alpino "):
+                continue
+            ev = self._parse_event_from_text(txt)
+            if ev is None:
                 continue
 
-            # stagione: anno == season oppure season+1 (es. 2025/2026)
-            if d.year not in (season, season + 1):
+            # filtro stagione: accetta stagione ±1 per sicurezza
+            if ev.start_date.year not in {season - 1, season, season + 1}:
                 continue
 
-            # disciplina: mappiamo dall’italiano al codice
-            disc_code = self._map_discipline(event_txt)
-            if discipline and disc_code != discipline:
-                continue
+            events.append(ev)
 
-            # nazione: parte tra parentesi nel place, es. "Soelden (AUT)"
-            m = re.search(r"\(([A-Z]{3})\)", place_txt)
-            nation_code = m.group(1) if m else None
-            if nation and nation_code and nation_code != nation:
-                continue
+        # filtri aggiuntivi opzionali
+        if discipline:
+            d_up = discipline.upper()
+            events = [
+                e for e in events
+                if e.discipline and e.discipline.upper() == d_up
+            ]
 
-            events.append(
-                RaceEvent(
-                    start_date=d,
-                    place=place_txt.strip(),
-                    nation=nation_code,
-                    name=event_txt.strip(),
-                    discipline=disc_code,
-                    federation=Federation.FIS,
-                )
-            )
+        if nation:
+            n_low = nation.lower()
+            events = [
+                e for e in events
+                if e.nation and n_low in e.nation.lower()
+            ]
+
+        # nessun filtro su region per ora
 
         return events
 
-    # ---------- mapping discipline ----------
 
-    @staticmethod
-    def _map_discipline(text: str) -> Optional[str]:
-        t = text.lower()
-        # l’ordine è importante: prima super-g, poi discesa, poi gigante, poi slalom
-        if "super-g" in t or "super g" in t:
-            return "SG"
-        if "discesa" in t:
-            return "DH"
-        if "gigante" in t:
-            return "GS"
-        if "slalom" in t:
-            return "SL"
-        return None
+# ---------------------- FIS CALENDAR (wrapper) ----------------------
 
 
-# ---------------------------------------------------------------------------
-# Provider FISI – per ora stub (ritorna lista vuota)
-# ---------------------------------------------------------------------------
+class FISCalendarProvider:
+    """
+    Per ora usiamo lo stesso calendario FISI come sorgente dati.
+    In futuro si potrà collegare un feed FIS separato (Neveitalia, FIS API, ecc.).
+    """
 
-class FISICalendarProvider:
-    """Placeholder per calendario FISI, per ora disattivato."""
+    def __init__(self, fisi_provider: Optional[FISICalendarProvider] = None) -> None:
+        self._fisi = fisi_provider or FISICalendarProvider()
 
-    def __init__(
-        self,
-        http_client: Optional[HttpClient] = None,
-        committee_slugs: Optional[dict[str, str]] = None,
-    ) -> None:
-        self.http_client: HttpClient = http_client or FISCalendarProvider._default_http_client
-        self.committee_slugs = committee_slugs or {}
-
-    def fetch_events(
+    def list_events(
         self,
         season: int,
         discipline: Optional[str] = None,
         nation: Optional[str] = None,
         region: Optional[str] = None,
     ) -> List[RaceEvent]:
-        # TODO: implementare quando avremo una sorgente FISI affidabile
-        return []
+        # delega a FISI, per non lasciare vuota la sezione FIS
+        events = self._fisi.list_events(
+            season=season,
+            discipline=discipline,
+            nation=nation,
+            region=region,
+        )
+        # NON cambiamo federation per non complicare troppo:
+        # in UI al momento la federation non viene mostrata.
+        return events
 
 
-# ---------------------------------------------------------------------------
-# Facade: RaceCalendarService
-# ---------------------------------------------------------------------------
+# ---------------------- SERVICE ----------------------
+
 
 class RaceCalendarService:
-    """Punto di accesso unico per Streamlit (FIS + FISI)."""
+    """
+    Punto unico di accesso per il calendario gare dell'app.
+    Unisce provider FIS / FISI e applica i filtri richiesti dallo streamlit_app.
+    """
 
     def __init__(
         self,
-        fis_provider: FISCalendarProvider,
+        fis_provider: Optional[FISCalendarProvider] = None,
         fisi_provider: Optional[FISICalendarProvider] = None,
     ) -> None:
-        self.fis_provider = fis_provider
-        self.fisi_provider = fisi_provider
+        self._fis_provider = fis_provider or FISCalendarProvider()
+        self._fisi_provider = fisi_provider or FISICalendarProvider()
 
     def list_events(
         self,
         season: int,
-        federation: Optional[Federation],
-        discipline: Optional[str],
-        nation: Optional[str],
-        region: Optional[str],
+        federation: Optional[Federation] = None,
+        discipline: Optional[str] = None,
+        nation: Optional[str] = None,
+        region: Optional[str] = None,
     ) -> List[RaceEvent]:
         events: List[RaceEvent] = []
 
-        if federation in (Federation.FIS, None):
+        # Se "Tutte", federation è None → prendiamo entrambi i provider
+        if federation is None or federation == Federation.FIS:
             events.extend(
-                self.fis_provider.fetch_events(
-                    season=season,
-                    discipline=discipline,
-                    nation=nation,
-                )
-            )
-
-        if self.fisi_provider is not None and federation in (Federation.FISI, None):
-            events.extend(
-                self.fisi_provider.fetch_events(
+                self._fis_provider.list_events(
                     season=season,
                     discipline=discipline,
                     nation=nation,
@@ -293,5 +304,22 @@ class RaceCalendarService:
                 )
             )
 
-        events.sort(key=lambda ev: ev.start_date)
-        return events
+        if federation is None or federation == Federation.FISI:
+            events.extend(
+                self._fisi_provider.list_events(
+                    season=season,
+                    discipline=discipline,
+                    nation=nation,
+                    region=region,
+                )
+            )
+
+        # Deduplica (caso FIS/FISI che leggono la stessa sorgente)
+        unique: Dict[tuple, RaceEvent] = {}
+        for e in events:
+            key = (e.code, e.start_date, e.place, e.name)
+            unique[key] = e
+
+        out = list(unique.values())
+        out.sort(key=lambda e: (e.start_date, e.place, e.name))
+        return out
