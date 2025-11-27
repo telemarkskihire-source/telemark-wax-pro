@@ -8,7 +8,7 @@ from __future__ import annotations
 import os
 import sys
 import importlib
-from datetime import datetime, time as dtime
+from datetime import datetime, date, time as dtime
 from typing import Optional, Dict, Any
 
 import requests
@@ -346,8 +346,16 @@ else:
             region=region_filter,
         )
 
+    # ---- filtro: solo gare entro 7 giorni da oggi ----
+    if events:
+        max_day = today + timedelta(days=7)
+        events = [
+            ev for ev in events
+            if today <= ev.start_date <= max_day
+        ]
+
     if not events:
-        st.info("Nessuna gara trovata per i filtri selezionati.")
+        st.info("Nessuna gara trovata nei prossimi 7 giorni per i filtri selezionati.")
     else:
         labels = [race_event_label(ev) for ev in events]
         label_to_event = {lbl: ev for lbl, ev in zip(labels, events)}
