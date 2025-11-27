@@ -72,7 +72,7 @@ st.markdown(
 }}
 html, body, .stApp {{
   background:var(--bg);
-  color:var(--fg);
+  color:#e5e7eb;
 }}
 [data-testid="stHeader"] {{
   background:transparent;
@@ -302,6 +302,12 @@ else:
         unsafe_allow_html=True,
     )
 
+    # --- flag sviluppo per filtro 7 giorni ---
+    dev_mode = st.checkbox(
+        "Modalità sviluppo: mostra tutte le gare (ignora limite 7 giorni)",
+        value=True,
+    )
+
     today = datetime.utcnow().date()
     default_season = today.year if today.month >= 7 else today.year - 1
 
@@ -346,8 +352,8 @@ else:
             region=region_filter,
         )
 
-    # --- filtro: SOLO gare entro i prossimi 7 giorni ---
-    if events:
+    # --- filtro: SOLO gare entro i prossimi 7 giorni (disattivabile in dev) ---
+    if events and not dev_mode:
         max_delta = timedelta(days=7)
         events = [
             ev for ev in events
@@ -355,7 +361,10 @@ else:
         ]
 
     if not events:
-        st.info("Nessuna gara trovata per i filtri selezionati (nei prossimi 7 giorni).")
+        msg = "Nessuna gara trovata per i filtri selezionati."
+        if not dev_mode:
+            msg += " (nei prossimi 7 giorni)"
+        st.info(msg)
     else:
         labels = [race_event_label(ev) for ev in events]
         label_to_event = {lbl: ev for lbl, ev in zip(labels, events)}
