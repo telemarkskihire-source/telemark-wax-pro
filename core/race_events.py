@@ -2,7 +2,7 @@
 # Telemark · Pro Wax & Tune
 #
 # Providers:
-# - FIS: scraping NeveItalia (uomini + donne) — versione robusta base
+# - FIS: scraping NeveItalia (uomini + donne) — parser robusto su tabelle calendario
 # - ASIVA: calendario Valle d’Aosta codificato a mano (estratto),
 #          con filtri per mese e categoria (Partec.)
 
@@ -14,6 +14,8 @@ from enum import Enum
 from typing import List, Optional, Dict, Tuple
 
 import re
+import unicodedata
+
 import requests
 from bs4 import BeautifulSoup
 
@@ -40,7 +42,7 @@ class RaceEvent:
     end_date: date
     nation: Optional[str] = None
     region: Optional[str] = None
-    category: Optional[str] = None  # Partec. (A_M, U1_F, ecc.)
+    category: Optional[str] = None  # Partec (A_M, U1_F, ecc.)
     raw_type: Optional[str] = None  # Tipo (FIS_NJR, PM_REG, …)
     level: Optional[str] = None     # WC, REG, ecc.
 
@@ -54,7 +56,6 @@ class RaceEvent:
 # ---------------------------------------------------------------------------
 
 _MONTHS_IT = {
-    # abbreviazioni classiche
     "gen": 1,
     "feb": 2,
     "mar": 3,
@@ -67,7 +68,10 @@ _MONTHS_IT = {
     "ott": 10,
     "nov": 11,
     "dic": 12,
-    # nomi estesi (per sicurezza)
+}
+
+# varianti possibili tipo "ottobre", "dicembre" ecc.
+_MONTHS_IT_FULL = {
     "gennaio": 1,
     "febbraio": 2,
     "marzo": 3,
@@ -82,60 +86,78 @@ _MONTHS_IT = {
     "dicembre": 12,
 }
 
-_WEEKDAYS_IT = {
-    "lun", "lunedi", "lunedì",
-    "mar", "martedi", "martedì",
-    "mer", "mercoledi", "mercoledì",
-    "gio", "giovedi", "giovedì",
-    "ven", "venerdi", "venerdì",
-    "sab", "sabato",
-    "dom", "domenica",
-}
+
+def _normalize_text(s: str) -> str:
+    """Normalizza testo per confronti: maiuscolo, senza accenti, trim."""
+    if not s:
+        return ""
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(ch for ch in s if not unicodedata.combining(ch))
+    return s.strip().upper()
 
 
 def _parse_date_it(raw: str) -> Optional[date]:
     """
-    Parser "robusto" italiano, usato sia per ASIVA sia per FIS.
-
-    Formati supportati (anche con giorno della settimana davanti):
+    Formati supportati (molto permissivi, per adattarsi a NeveItalia / ASIVA):
     - "9 dic 2025"
-    - "lun 9 dic 2025"
-    - "lunedi 9 dicembre 2025"
-    - "21-22 dic 2025"  -> prende la prima data che trova
+    - "10 gennaio 2026"
+    - "09/12/2025", "09-12-2025", "09.12.2025"
+    - "9 dic"  (in questo caso si assume stagione "corrente" o successiva -> usiamo l'anno corrente)
     """
     if not raw:
         return None
 
-    txt = raw.lower()
-    # normalizzi separatori
-    txt = txt.replace("–", "-")
-    txt = txt.replace(",", " ")
+    s = raw.strip().lower()
 
-    # regex che cerca pattern tipo "9 dic 2025" o "9 dicembre 2025"
-    m = re.search(
-        r"(\d{1,2})\s+([a-zàèéìòù]{3,9})\s+(\d{4})",
-        txt,
-    )
-    if not m:
-        return None
-
-    try:
+    # --- 1) formato numerico tipo 09/12/2025, 09-12-2025, 09.12.2025 ---
+    m = re.match(r"^\s*(\d{1,2})[./-](\d{1,2})[./-](\d{2,4})\s*$", s)
+    if m:
         day = int(m.group(1))
-        month_str = m.group(2).strip()
+        month = int(m.group(2))
         year = int(m.group(3))
+        if year < 100:  # tipo '25' -> 2025
+            year = 2000 + year
+        try:
+            return date(year, month, day)
+        except Exception:
+            return None
 
-        # togli accenti per sicurezza
-        month_key = (
-            month_str
-            .replace("à", "a")
-            .replace("è", "e")
-            .replace("é", "e")
-            .replace("ì", "i")
-            .replace("ò", "o")
-            .replace("ù", "u")
-        )
+    # --- 2) formato testo italiano tipo "9 dic 2025" o "10 gennaio 2026" ---
+    parts = s.split()
+    try:
+        # se non abbiamo 2 o 3 parti, lasciamo perdere
+        if len(parts) < 2:
+            return None
 
-        month = _MONTHS_IT.get(month_key, _MONTHS_IT.get(month_key[:3]))
+        day = int(parts[0])
+
+        year: Optional[int] = None
+        month: Optional[int] = None
+
+        # cerca un token che sia l'anno
+        for token in parts[1:]:
+            if token.isdigit():
+                yy = int(token)
+                if yy < 100:  # '25' -> 2025
+                    yy = 2000 + yy
+                year = yy
+                break
+
+        # se l'anno non è presente, usiamo l'anno corrente
+        if year is None:
+            year = date.today().year
+
+        # cerca un token che sia il mese (abbreviazione o mese completo)
+        for token in parts[1:]:
+            mm = _MONTHS_IT.get(token[:3])
+            if mm:
+                month = mm
+                break
+            mm_full = _MONTHS_IT_FULL.get(token)
+            if mm_full:
+                month = mm_full
+                break
+
         if not month:
             return None
 
@@ -145,7 +167,6 @@ def _parse_date_it(raw: str) -> Optional[date]:
 
 
 def _map_discipline(text: str) -> Discipline:
-    """Mappa una stringa generica (spec / disciplina) a Discipline."""
     t = (text or "").upper()
 
     # ci basta riconoscere la disciplina base
@@ -157,8 +178,8 @@ def _map_discipline(text: str) -> Discipline:
         return Discipline.SG
     if "DH" in t:
         return Discipline.DH
-    if "SX" in t or "SCX" in t or "PAR" in t:
-        # usiamo AC come "altra combinata / specialità"
+    if "SX" in t or "PARALLEL" in t or "PARAL" in t:
+        # usiamo AC come "speciale/variazione"
         try:
             return Discipline.AC
         except Exception:
@@ -168,34 +189,19 @@ def _map_discipline(text: str) -> Discipline:
     return Discipline.GS
 
 
-def _guess_nation(cols: List[str]) -> Optional[str]:
-    """
-    Heuristica per recuperare una sigla nazione tipo "AUT", "ITA" ecc.
-    Cerca un campo di 3 lettere tutte maiuscole.
-    """
-    for c in cols:
-        c2 = c.strip().upper()
-        if re.fullmatch(r"[A-Z]{3}", c2):
-            return c2
-    return None
-
-
 # ---------------------------------------------------------------------------
-# FIS PROVIDER — NEVEITALIA (BASE)
+# FIS PROVIDER — NEVEITALIA (BASE, SENZA FILTRO MESE/CAT)
 # ---------------------------------------------------------------------------
 
 class FISCalendarProvider:
     """
     Scraping da NeveItalia:
-    - Maschile:  https://www.neveitalia.it/sport/scialpino/calendario
+    - Maschile: https://www.neveitalia.it/sport/scialpino/calendario
     - Femminile: https://www.neveitalia.it/sport/scialpino/calendario/coppa-del-mondo-femminile
 
-    Implementazione robusta ma semplice:
-    - cerca tutte le righe <tr> con almeno 3-4 <td>
-    - la prima colonna è la data
-    - la seconda è la località
-    - disciplina individuata dal primo campo che contiene SL/GS/SG/DH/…
-    - nome gara: ultima colonna (o penultima se l’ultima è vuota)
+    L’HTML può cambiare, quindi:
+    - cerchiamo le tabelle che hanno una header row con "Data" e "Località"
+    - poi individuiamo le colonne "Data", "Località", "Disciplina/Gara", "Evento" in modo dinamico
     """
 
     BASE_URLS = [
@@ -203,79 +209,133 @@ class FISCalendarProvider:
         "https://www.neveitalia.it/sport/scialpino/calendario/coppa-del-mondo-femminile",
     ]
 
-    UA = {"User-Agent": "telemark-wax-pro/4.1"}
+    UA = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0 Safari/537.36 Telemark-Wax-Tune/4.0"
+        )
+    }
 
     def _fetch(self, url: str) -> str:
-        r = requests.get(url, headers=self.UA, timeout=15)
+        r = requests.get(url, headers=self.UA, timeout=20)
         r.raise_for_status()
         return r.text
 
-    def _parse_table_rows(self, soup: BeautifulSoup) -> List[RaceEvent]:
+    # ---- parsing tabella calendario ----
+
+    def _parse_calendar_table(self, table) -> List[RaceEvent]:
+        """
+        Prova a estrarre eventi da una singola <table>.
+        Ritorna una lista di RaceEvent se la tabella assomiglia a un calendario FIS,
+        altrimenti una lista vuota.
+        """
+
+        # header row (th o td)
+        header_row = table.find("tr")
+        if not header_row:
+            return []
+
+        header_cells = header_row.find_all(["th", "td"])
+        if not header_cells:
+            return []
+
+        headers_norm = [_normalize_text(h.get_text()) for h in header_cells]
+
+        # dobbiamo avere almeno una colonna "DATA" e una "LOCALITA'"
+        if not any("DATA" in h for h in headers_norm):
+            return []
+        if not any("LOCALITA" in h for h in headers_norm):
+            return []
+
+        # mappa colonna -> indice
+        col_idx: Dict[str, int] = {}
+        for idx, h in enumerate(headers_norm):
+            if "DATA" in h and "DATA" not in col_idx:
+                col_idx["date"] = idx
+            if "LOCALITA" in h and "place" not in col_idx:
+                col_idx["place"] = idx
+            if any(key in h for key in ("GARA", "DISCIPLINA", "SPECIAL", "PROVA")) and "disc" not in col_idx:
+                col_idx["disc"] = idx
+            if any(key in h for key in ("EVENTO", "DENOMINAZIONE", "COMPETIZIONE", "TITOLO")) and "name" not in col_idx:
+                col_idx["name"] = idx
+            if "NAZIONE" in h and "nation" not in col_idx:
+                col_idx["nation"] = idx
+
+        # Data e Località sono obbligatorie
+        if "date" not in col_idx or "place" not in col_idx:
+            return []
+
         events: List[RaceEvent] = []
 
-        # per sicurezza, prendiamo TUTTE le righe <tr> che hanno almeno 3 <td>
-        for row in soup.find_all("tr"):
-            tds = row.find_all("td")
-            if len(tds) < 3:
+        # righe dati (tutti i tr successivi)
+        for row in header_row.find_next_siblings("tr"):
+            cells = row.find_all("td")
+            if not cells:
                 continue
 
-            cols = [c.get_text(strip=True) for c in tds]
-            if not cols[0]:
+            # se non abbiamo abbastanza colonne per data/località, skip
+            if len(cells) <= max(col_idx.values()):
                 continue
 
-            # 1) Data
-            raw_date = cols[0]
-            dt = _parse_date_it(raw_date)
-            if not dt:
+            try:
+                raw_date = cells[col_idx["date"]].get_text(strip=True)
+                dt = _parse_date_it(raw_date)
+                if not dt:
+                    continue
+
+                place = cells[col_idx["place"]].get_text(strip=True)
+
+                disc_txt = ""
+                if "disc" in col_idx and col_idx["disc"] < len(cells):
+                    disc_txt = cells[col_idx["disc"]].get_text(strip=True)
+
+                name = ""
+                if "name" in col_idx and col_idx["name"] < len(cells):
+                    name = cells[col_idx["name"]].get_text(strip=True)
+
+                nation = None
+                if "nation" in col_idx and col_idx["nation"] < len(cells):
+                    n_txt = cells[col_idx["nation"]].get_text(strip=True)
+                    nation = n_txt or None
+
+                # fallback ragionevoli
+                if not name:
+                    # se manca un nome "ufficiale", costruiamo qualcosa di leggibile
+                    name = f"Coppa del Mondo {disc_txt or ''}".strip()
+
+                ev = RaceEvent(
+                    federation=Federation.FIS,
+                    codex=None,
+                    name=name,
+                    place=place,
+                    discipline=_map_discipline(disc_txt),
+                    start_date=dt,
+                    end_date=dt,
+                    nation=nation,
+                    region=None,
+                    category=None,
+                    raw_type="FIS",
+                    level="WC",
+                )
+                events.append(ev)
+            except Exception:
+                # se una riga fa casino, andiamo avanti
                 continue
-
-            # 2) Località (in genere seconda colonna)
-            place = cols[1] if len(cols) > 1 else ""
-
-            # 3) Disciplina: primo campo che contiene sigle note
-            discipline_txt = ""
-            for c in cols:
-                uc = c.upper()
-                if any(k in uc for k in ("SL", "GS", "SG", "DH", "SX", "SCX", "PAR")):
-                    discipline_txt = c
-                    break
-
-            # se non trova nulla, prova terza colonna
-            if not discipline_txt and len(cols) > 2:
-                discipline_txt = cols[2]
-
-            # 4) Nome gara: ultimo campo non vuoto
-            name = ""
-            for c in reversed(cols):
-                if c:
-                    name = c
-                    break
-            if not name:
-                name = f"Gara FIS {discipline_txt or ''}".strip()
-
-            nation = _guess_nation(cols)
-
-            ev = RaceEvent(
-                federation=Federation.FIS,
-                codex=None,  # Neveitalia non espone facilmente il codex FIS
-                name=name,
-                place=place,
-                discipline=_map_discipline(discipline_txt),
-                start_date=dt,
-                end_date=dt,
-                nation=nation,
-                region=None,
-                category=None,
-                raw_type="FIS",
-                level="WC",
-            )
-            events.append(ev)
 
         return events
 
     def _parse(self, html: str) -> List[RaceEvent]:
         soup = BeautifulSoup(html, "html.parser")
-        return self._parse_table_rows(soup)
+        events: List[RaceEvent] = []
+
+        # cerchiamo tutte le tabelle e teniamo solo quelle che sembrano un calendario
+        for table in soup.find_all("table"):
+            evs = self._parse_calendar_table(table)
+            if evs:
+                events.extend(evs)
+
+        return events
 
     def list_events(
         self,
@@ -286,7 +346,7 @@ class FISCalendarProvider:
         month: Optional[int] = None,
         category: Optional[str] = None,
     ) -> List[RaceEvent]:
-        # per ora ignoriamo month/category/region su FIS, ma lasciamo le firme
+        # per ora ignoriamo month/category su FIS (filtriamo solo stagione + disciplina)
         all_events: List[RaceEvent] = []
 
         for url in self.BASE_URLS:
@@ -294,10 +354,10 @@ class FISCalendarProvider:
                 html = self._fetch(url)
                 all_events.extend(self._parse(html))
             except Exception:
-                # in caso di errore su una delle due pagine non blocchiamo tutto
+                # se uno dei due URL fallisce (403, ecc.), ignoriamo e andiamo avanti
                 continue
 
-        # filtro stagione: es. season=2025 => includo 2025-2026
+        # filtro stagione: per esempio season=2025 => includi 2025-2026
         filtered: List[RaceEvent] = []
         for ev in all_events:
             y = ev.start_date.year
@@ -305,7 +365,6 @@ class FISCalendarProvider:
                 continue
             filtered.append(ev)
 
-        # disciplina
         if discipline_filter:
             code = discipline_filter.upper()
             filtered = [
@@ -314,17 +373,15 @@ class FISCalendarProvider:
                 if ev.discipline and ev.discipline.value.upper() == code
             ]
 
-        # nazione (se disponibile)
         if nation_filter:
             nf = nation_filter.upper()
             filtered = [
-                ev for ev in filtered
+                ev
+                for ev in filtered
                 if (ev.nation or "").upper() == nf
             ]
 
-        # mese (per FIS, opzionale ma utile)
-        if month is not None:
-            filtered = [ev for ev in filtered if ev.start_date.month == month]
+        # region_filter non lo usiamo (per ora NeveItalia non ha regioni strutturate)
 
         return filtered
 
@@ -336,7 +393,7 @@ class FISCalendarProvider:
 # struttura compattata:
 # codex, data_str, tipo, spec, category (Partec.), place, name
 _ASIVA_RAW_EVENTS: List[Tuple[str, str, str, str, str, str, str]] = [
-    # ---------------- DICEMBRE 2025 ----------------
+    # ---------------- DECEMBRE 2025 ----------------
     ("ITA5827", "9 dic 2025", "FIS_NJR", "GS", "F", "Courmayeur", "Trofeo ODL"),
     ("ITA0857", "9 dic 2025", "FIS_NJR", "GS", "M", "Courmayeur", "Trofeo ODL"),
     ("ITA5829", "10 dic 2025", "FIS_NJR", "GS", "F", "Courmayeur", "Trofeo ODL"),
@@ -369,8 +426,10 @@ _ASIVA_RAW_EVENTS: List[Tuple[str, str, str, str, str, str, str]] = [
     ("ITA5862", "23 dic 2025", "FIS", "GS", "F", "Frachey - Ayas", "Trofeo Pulverit"),
     ("ITA0894", "23 dic 2025", "FIS", "GS", "M", "Frachey - Ayas", "Trofeo Pulverit"),
 
-    ("AA0009", "21 dic 2025", "CHI_FL", "SL (3 manche)", "A_M", "Valtournenche", "Trofeo Igor Gorgonzola Flipper"),
-    ("AA0010", "21 dic 2025", "CHI_FL", "SL (3 manche)", "A_F", "Valtournenche", "Trofeo Igor Gorgonzola Flipper"),
+    ("AA0009", "21 dic 2025", "CHI_FL", "SL (3 manche)", "A_M", "Valtournenche",
+     "Trofeo Igor Gorgonzola Flipper"),
+    ("AA0010", "21 dic 2025", "CHI_FL", "SL (3 manche)", "A_F", "Valtournenche",
+     "Trofeo Igor Gorgonzola Flipper"),
 
     ("AA0015", "23 dic 2025", "G_MAS GSG", "GS", "GSM", "Torgnon", "Trofeo Sci Club Torgnon"),
     ("AA0020", "23 dic 2025", "G_MAS GSG", "GS", "GSM", "Torgnon", "Trofeo Sci Club Torgnon"),
@@ -384,10 +443,14 @@ _ASIVA_RAW_EVENTS: List[Tuple[str, str, str, str, str, str, str]] = [
     ("AA0024", "23 dic 2025", "G_MAS GSG", "GS", "MCF", "Torgnon", "Trofeo Sci Club Torgnon"),
 
     # ---------------- GENNAIO 2026 (estratto) ----------------
-    ("AA0033", "10 gen 2026", "PUL_FL", "SL (3 manche)", "P1_M", "Frachey - Ayas", "Trofeo Casadei Flipper"),
-    ("AA0034", "10 gen 2026", "PUL_FL", "SL (3 manche)", "P1_F", "Frachey - Ayas", "Trofeo Casadei Flipper"),
-    ("AA0035", "11 gen 2026", "PUL_FL", "SL (3 manche)", "P2_M", "Frachey - Ayas", "Trofeo Casadei Flipper"),
-    ("AA0036", "11 gen 2026", "PUL_FL", "SL (3 manche)", "P2_F", "Frachey - Ayas", "Trofeo Casadei Flipper"),
+    ("AA0033", "10 gen 2026", "PUL_FL", "SL (3 manche)", "P1_M", "Frachey - Ayas",
+     "Trofeo Casadei Flipper"),
+    ("AA0034", "10 gen 2026", "PUL_FL", "SL (3 manche)", "P1_F", "Frachey - Ayas",
+     "Trofeo Casadei Flipper"),
+    ("AA0035", "11 gen 2026", "PUL_FL", "SL (3 manche)", "P2_M", "Frachey - Ayas",
+     "Trofeo Casadei Flipper"),
+    ("AA0036", "11 gen 2026", "PUL_FL", "SL (3 manche)", "P2_F", "Frachey - Ayas",
+     "Trofeo Casadei Flipper"),
 
     ("ITA5879", "10 gen 2026", "FIS_NJR", "GS", "F", "Pila - Gressan", "Trofeo Asto"),
     ("ITA0911", "10 gen 2026", "FIS_NJR", "GS", "M", "Pila - Gressan", "Trofeo Asto"),
@@ -446,31 +509,51 @@ _ASIVA_RAW_EVENTS: List[Tuple[str, str, str, str, str, str, str]] = [
     ("AA0206", "15 mar 2026", "PUL_GG", "GS (2 manche)", "U2_F", "Antagnod - Ayas",
      "Trofeo Telemark Ski & Bike Hire Gran Gigante"),
 
-    ("AA0185", "8 mar 2026", "PM_REG", "GS", "A_M", "Breuil Cervinia", "Trofeo Azzurri del Cervino"),
-    ("AA0186", "8 mar 2026", "PM_REG", "GS", "A_F", "Breuil Cervinia", "Trofeo Azzurri del Cervino"),
+    ("AA0185", "8 mar 2026", "PM_REG", "GS", "A_M", "Breuil Cervinia",
+     "Trofeo Azzurri del Cervino"),
+    ("AA0186", "8 mar 2026", "PM_REG", "GS", "A_F", "Breuil Cervinia",
+     "Trofeo Azzurri del Cervino"),
 
     # Pila – Caldarelli Assicurazioni (master)
-    ("AA0175", "8 mar 2026", "G_MAS GSG", "GS", "GSM", "Pila - Gressan", "Trofeo Caldarelli Assicurazioni"),
-    ("AA0180", "8 mar 2026", "G_MAS GSG", "GS", "GSM", "Pila - Gressan", "Trofeo Caldarelli Assicurazioni"),
-    ("AA0177", "8 mar 2026", "G_MAS GSG", "GS", "MAM", "Pila - Gressan", "Trofeo Caldarelli Assicurazioni"),
-    ("AA0182", "8 mar 2026", "G_MAS GSG", "GS", "MAM", "Pila - Gressan", "Trofeo Caldarelli Assicurazioni"),
-    ("AA0178", "8 mar 2026", "G_MAS GSG", "GS", "MBM", "Pila - Gressan", "Trofeo Caldarelli Assicurazioni"),
-    ("AA0183", "8 mar 2026", "G_MAS GSG", "GS", "MBM", "Pila - Gressan", "Trofeo Caldarelli Assicurazioni"),
-    ("AA0176", "8 mar 2026", "G_MAS GSG", "GS", "GSF", "Pila - Gressan", "Trofeo Caldarelli Assicurazioni"),
-    ("AA0181", "8 mar 2026", "G_MAS GSG", "GS", "GSF", "Pila - Gressan", "Trofeo Caldarelli Assicurazioni"),
-    ("AA0179", "8 mar 2026", "G_MAS GSG", "GS", "MCF", "Pila - Gressan", "Trofeo Caldarelli Assicurazioni"),
-    ("AA0184", "8 mar 2026", "G_MAS GSG", "GS", "MCF", "Pila - Gressan", "Trofeo Caldarelli Assicurazioni"),
+    ("AA0175", "8 mar 2026", "G_MAS GSG", "GS", "GSM", "Pila - Gressan",
+     "Trofeo Caldarelli Assicurazioni"),
+    ("AA0180", "8 mar 2026", "G_MAS GSG", "GS", "GSM", "Pila - Gressan",
+     "Trofeo Caldarelli Assicurazioni"),
+    ("AA0177", "8 mar 2026", "G_MAS GSG", "GS", "MAM", "Pila - Gressan",
+     "Trofeo Caldarelli Assicurazioni"),
+    ("AA0182", "8 mar 2026", "G_MAS GSG", "GS", "MAM", "Pila - Gressan",
+     "Trofeo Caldarelli Assicurazioni"),
+    ("AA0178", "8 mar 2026", "G_MAS GSG", "GS", "MBM", "Pila - Gressan",
+     "Trofeo Caldarelli Assicurazioni"),
+    ("AA0183", "8 mar 2026", "G_MAS GSG", "GS", "MBM", "Pila - Gressan",
+     "Trofeo Caldarelli Assicurazioni"),
+    ("AA0176", "8 mar 2026", "G_MAS GSG", "GS", "GSF", "Pila - Gressan",
+     "Trofeo Caldarelli Assicurazioni"),
+    ("AA0181", "8 mar 2026", "G_MAS GSG", "GS", "GSF", "Pila - Gressan",
+     "Trofeo Caldarelli Assicurazioni"),
+    ("AA0179", "8 mar 2026", "G_MAS GSG", "GS", "MCF", "Pila - Gressan",
+     "Trofeo Caldarelli Assicurazioni"),
+    ("AA0184", "8 mar 2026", "G_MAS GSG", "GS", "MCF", "Pila - Gressan",
+     "Trofeo Caldarelli Assicurazioni"),
 
     # ---------------- APRILE 2026 (estratto – Campionati ITA + Valtournenche) ----------------
-    ("XA0148", "8 apr 2026", "CI_ALL", "GS", "A_M", "Pila - Gressan", "Campionati Italiani Allievi"),
-    ("XA0149", "8 apr 2026", "CI_ALL", "GS", "A_F", "Pila - Gressan", "Campionati Italiani Allievi"),
-    ("XA0150", "8 apr 2026", "CI_RAG", "SL", "R_M", "Pila - Gressan", "Campionati Italiani Ragazzi"),
-    ("XA0151", "8 apr 2026", "CI_RAG", "SL", "R_F", "Pila - Gressan", "Campionati Italiani Ragazzi"),
+    ("XA0148", "8 apr 2026", "CI_ALL", "GS", "A_M", "Pila - Gressan",
+     "Campionati Italiani Allievi"),
+    ("XA0149", "8 apr 2026", "CI_ALL", "GS", "A_F", "Pila - Gressan",
+     "Campionati Italiani Allievi"),
+    ("XA0150", "8 apr 2026", "CI_RAG", "SL", "R_M", "Pila - Gressan",
+     "Campionati Italiani Ragazzi"),
+    ("XA0151", "8 apr 2026", "CI_RAG", "SL", "R_F", "Pila - Gressan",
+     "Campionati Italiani Ragazzi"),
 
-    ("XA0160", "12 apr 2026", "CI_ALL", "SL", "A_M", "Pila - Gressan", "Campionati Italiani Allievi"),
-    ("XA0161", "12 apr 2026", "CI_ALL", "SL", "A_F", "Pila - Gressan", "Campionati Italiani Allievi"),
-    ("XA0162", "12 apr 2026", "CI_RAG", "SX", "R_M", "Pila - Gressan", "Campionati Italiani Ragazzi"),
-    ("XA0163", "12 apr 2026", "CI_RAG", "SX", "R_F", "Pila - Gressan", "Campionati Italiani Ragazzi"),
+    ("XA0160", "12 apr 2026", "CI_ALL", "SL", "A_M", "Pila - Gressan",
+     "Campionati Italiani Allievi"),
+    ("XA0161", "12 apr 2026", "CI_ALL", "SL", "A_F", "Pila - Gressan",
+     "Campionati Italiani Allievi"),
+    ("XA0162", "12 apr 2026", "CI_RAG", "SX", "R_M", "Pila - Gressan",
+     "Campionati Italiani Ragazzi"),
+    ("XA0163", "12 apr 2026", "CI_RAG", "SX", "R_F", "Pila - Gressan",
+     "Campionati Italiani Ragazzi"),
 
     ("AA0243", "11 apr 2026", "PI_PUL", "GS", "P1_M", "Valtournenche",
      "Trofeo Fondation Pro Montagna Finale Regionale Baby"),
@@ -490,15 +573,23 @@ _ASIVA_RAW_EVENTS: List[Tuple[str, str, str, str, str, str, str]] = [
     ("AA0250", "12 apr 2026", "PI_PUL", "GS", "U2_F", "Valtournenche",
      "Trofeo Fondation Pro Montagna Finale Regionale Cuccioli"),
 
-    ("ITA6087", "15 apr 2026", "FIS", "SL", "F", "Valtournenche", "Trofeo Comune di Valtournenche"),
-    ("ITA1117", "15 apr 2026", "FIS", "SL", "M", "Valtournenche", "Trofeo Comune di Valtournenche"),
-    ("ITA6088", "16 apr 2026", "FIS", "SL", "F", "Valtournenche", "Trofeo Comune di Valtournenche"),
-    ("ITA1118", "16 apr 2026", "FIS", "SL", "M", "Valtournenche", "Trofeo Comune di Valtournenche"),
+    ("ITA6087", "15 apr 2026", "FIS", "SL", "F", "Valtournenche",
+     "Trofeo Comune di Valtournenche"),
+    ("ITA1117", "15 apr 2026", "FIS", "SL", "M", "Valtournenche",
+     "Trofeo Comune di Valtournenche"),
+    ("ITA6088", "16 apr 2026", "FIS", "SL", "F", "Valtournenche",
+     "Trofeo Comune di Valtournenche"),
+    ("ITA1118", "16 apr 2026", "FIS", "SL", "M", "Valtournenche",
+     "Trofeo Comune di Valtournenche"),
 
-    ("ITA6089", "17 apr 2026", "FIS", "GS", "F", "Frachey - Ayas", "Coppa Sci Club Val d'Ayas"),
-    ("ITA1119", "17 apr 2026", "FIS", "GS", "M", "Frachey - Ayas", "Coppa Sci Club Val d'Ayas"),
-    ("ITA6090", "18 apr 2026", "FIS", "GS", "F", "Frachey - Ayas", "Coppa Sci Club Val d'Ayas"),
-    ("ITA1120", "18 apr 2026", "FIS", "GS", "M", "Frachey - Ayas", "Coppa Sci Club Val d'Ayas"),
+    ("ITA6089", "17 apr 2026", "FIS", "GS", "F", "Frachey - Ayas",
+     "Coppa Sci Club Val d'Ayas"),
+    ("ITA1119", "17 apr 2026", "FIS", "GS", "M", "Frachey - Ayas",
+     "Coppa Sci Club Val d'Ayas"),
+    ("ITA6090", "18 apr 2026", "FIS", "GS", "F", "Frachey - Ayas",
+     "Coppa Sci Club Val d'Ayas"),
+    ("ITA1120", "18 apr 2026", "FIS", "GS", "M", "Frachey - Ayas",
+     "Coppa Sci Club Val d'Ayas"),
 ]
 
 # set di categorie ASIVA (Partec) per il menu a tendina
