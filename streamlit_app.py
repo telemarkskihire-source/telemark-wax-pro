@@ -127,27 +127,22 @@ UA = {"User-Agent": "telemark-wax-pro/2.0"}
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def geocode_race_place(query: str, nation: Optional[str] = None) -> Optional[Dict[str, Any]]:
+def geocode_race_place(query: str) -> Optional[Dict[str, Any]]:
     """
     Geocoding per le località di gara.
 
-    Logica:
-    1. Query = nome località [+ nazione se disponibile].
-    2. Prova a trovare un risultato con quota >= MIN_ELEVATION_M.
-    3. Se non esiste, prende comunque il risultato con quota massima
-       (così la mappa SI MUOVE sempre, anche se la località è bassa).
+    Logica semplice (come prima, ma più robusta):
+    1. Query = nome località pulito.
+    2. Cerca fino a 10 risultati.
+    3. Se trova qualcosa sopra MIN_ELEVATION_M → usa il primo.
+    4. Altrimenti prende comunque quello con quota più alta.
     """
     q = (query or "").strip()
     if not q:
         return None
 
-    search_q = q
-    if nation:
-        # es. "Beaver Creek USA" → di solito orienta già abbastanza
-        search_q = f"{q} {nation}"
-
     params = {
-        "name": search_q,
+        "name": q,
         "language": "it",
         "count": 10,
         "format": "json",
@@ -168,28 +163,26 @@ def geocode_race_place(query: str, nation: Optional[str] = None) -> Optional[Dic
     if not results:
         return None
 
-    best_high = None      # primo >= MIN_ELEVATION_M
-    best_any = None       # risultato con quota più alta
+    best_high = None
+    best_any = None
     best_any_elev = -9999.0
 
     for it in results:
-        elev = it.get("elevation")
-        elev_f: Optional[float]
+        elev_val = it.get("elevation")
         try:
-            elev_f = float(elev) if elev is not None else None
+            elev = float(elev_val) if elev_val is not None else None
         except Exception:
-            elev_f = None
+            elev = None
 
-        # tieni traccia del più alto in assoluto
-        if elev_f is not None and elev_f > best_any_elev:
-            best_any_elev = elev_f
+        # tieni il più alto in assoluto
+        if elev is not None and elev > best_any_elev:
+            best_any_elev = elev
             best_any = it
         elif best_any is None:
-            # se tutti senza elevation, tieni il primo
             best_any = it
 
-        # prendi il primo che supera la soglia "montagna"
-        if elev_f is not None and elev_f >= MIN_ELEVATION_M and best_high is None:
+        # primo che supera la soglia montagna
+        if elev is not None and elev >= MIN_ELEVATION_M and best_high is None:
             best_high = it
 
     chosen = best_high or best_any
@@ -231,27 +224,35 @@ def race_event_label(ev: RaceEvent) -> str:
     return f"{d_txt} · {disc} · {ev.place}{nat_txt} · {ev.name}"
 
 
+def _clean_place_for_geocoder(raw_place: str) -> str:
+    """
+    Pulisce il nome località per il geocoder:
+    - toglie la parte tra parentesi: "Soelden (AUT)" -> "Soelden"
+    - usa solo la parte prima del ' - ' : "Pila - Gressan" -> "Pila"
+    """
+    txt = raw_place or ""
+    # taglia alle parentesi
+    txt = txt.split("(")[0].strip()
+    # se c'è un " - " prendo il primo pezzo (tipico ASIVA)
+    if " - " in txt:
+        txt = txt.split(" - ")[0].strip()
+    if not txt:
+        txt = raw_place.strip()
+    return txt
+
+
 def center_ctx_on_race_location(ctx: Dict[str, Any], event: RaceEvent) -> Dict[str, Any]:
     """
-    Centra la mappa sulla località di gara.
-
-    - usa solo la parte prima di eventuali parentesi nel nome località
-      (es. "Soelden (AUT)" → "Soelden")
-    - passa anche il codice nazione (AUT, USA, ecc.) al geocoder
+    Centra la mappa sulla località di gara usando il nome pulito.
     """
-    raw_place = event.place or ""
-    query_name = raw_place.split("(")[0].strip() or raw_place.strip()
+    query_name = _clean_place_for_geocoder(event.place or "")
 
     base = ensure_base_location()
     lat = base["lat"]
     lon = base["lon"]
     label = base["label"]
 
-    nation = None
-    if event.nation:
-        nation = event.nation
-
-    geo = geocode_race_place(query_name, nation=nation)
+    geo = geocode_race_place(query_name)
     if geo:
         lat = geo["lat"]
         lon = geo["lon"]
@@ -468,7 +469,7 @@ else:
         ctx["race_event"] = selected_event
         ctx["race_datetime"] = race_datetime
 
-        # centra sempre sulla località gara (ora con geocoding più tollerante)
+        # centra sulla località gara (ASIVA + FIS)
         ctx = center_ctx_on_race_location(ctx, selected_event)
 
         # mappa context specifico per forza-refresh
@@ -492,7 +493,7 @@ else:
         st.markdown("### Mappa & piste per la gara")
         ctx = render_map(T, ctx) or ctx
 
-        # DEM con ombreggiatura (usa ctx['race_datetime'] internamente)
+        # DEM con ombreggiatura
         st.markdown("### Esposizione & pendenza sulla pista selezionata")
         render_dem(T, ctx)
 
