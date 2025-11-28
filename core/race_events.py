@@ -1,7 +1,8 @@
 # core/race_events.py
-# Calendari gare per Telemark · Pro Wax & Tune
-# - FIS: scraping Neveitalia (maschile + femminile)
-# - ASIVA: parsing diretto da testo fornito (Valle d'Aosta)
+# Telemark · Pro Wax & Tune
+# Providers:
+# - FIS: scraping NeveItalia (uomini + donne)
+# - ASIVA: eventi incollati manualmente (Valle d’Aosta)
 
 from __future__ import annotations
 
@@ -9,7 +10,7 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from enum import Enum
 from typing import List, Optional
-import re
+
 import requests
 from bs4 import BeautifulSoup
 
@@ -17,7 +18,7 @@ from .race_tuning import Discipline
 
 
 # ---------------------------------------------------------------------------
-# MODELLO BASE
+# ENUM & MODELLO
 # ---------------------------------------------------------------------------
 
 class Federation(str, Enum):
@@ -46,88 +47,135 @@ class RaceEvent:
 
 
 # ---------------------------------------------------------------------------
-# FIS – NEVEITALIA (maschile + femminile)
+# MAPPING
 # ---------------------------------------------------------------------------
 
-NEVEITALIA_M = "https://www.neveitalia.it/sport/scialpino/calendario"
-NEVEITALIA_F = "https://www.neveitalia.it/sport/scialpino/calendario/coppa-del-mondo-femminile"
-
-MONTHS = {
-    "GEN": 1, "FEB": 2, "MAR": 3, "APR": 4, "MAG": 5, "GIU": 6,
-    "LUG": 7, "AGO": 8, "SET": 9, "OTT": 10, "NOV": 11, "DIC": 12
+_MONTHS_IT = {
+    "gen": 1,
+    "feb": 2,
+    "mar": 3,
+    "apr": 4,
+    "mag": 5,
+    "giu": 6,
+    "lug": 7,
+    "ago": 8,
+    "set": 9,
+    "ott": 10,
+    "nov": 11,
+    "dic": 12,
 }
 
-UA = {"User-Agent": "telemark-wax-pro/4.0"}
 
-def _guess_discipline(text: str) -> Discipline:
-    t = text.upper()
-    if "SLALOM" in t:
+def _parse_date_it(raw: str) -> Optional[date]:
+    """
+    Formati supportati:
+    - "9 dic 2025"
+    - "10 gen 2026"
+    """
+    try:
+        parts = raw.strip().lower().split()
+        if len(parts) != 3:
+            return None
+
+        day = int(parts[0])
+        month = _MONTHS_IT.get(parts[1])
+        year = int(parts[2])
+
+        if not month:
+            return None
+
+        return date(year, month, day)
+
+    except Exception:
+        return None
+
+
+def _map_discipline(text: str) -> Discipline:
+    t = (text or "").upper()
+
+    if "SL" in t:
         return Discipline.SL
-    if "GIGANTE" in t:
+    if "GS" in t:
         return Discipline.GS
-    if "SUPER" in t or "SUPERG" in t:
+    if "SG" in t:
         return Discipline.SG
-    if "DISCESA" in t or "DOWNHILL" in t:
+    if "DH" in t:
         return Discipline.DH
+    if "AC" in t or "COMB" in t:
+        try:
+            return Discipline.AC  # type: ignore
+        except Exception:
+            return Discipline.GS
+
     return Discipline.GS
 
 
-def _parse_neveitalia_html(html: str, gender: str) -> List[RaceEvent]:
-    soup = BeautifulSoup(html, "html.parser")
-    text = soup.get_text("\n")
-    lines = [l.strip() for l in text.split("\n") if len(l.strip()) > 5]
-
-    events: List[RaceEvent] = []
-
-    date_regex = re.compile(r"(\d{1,2})\s([A-Z]{3})\s(\d{4})")
-
-    current_date = None
-
-    for line in lines:
-
-        # cerca data
-        m = date_regex.search(line)
-        if m:
-            day = int(m.group(1))
-            month = MONTHS.get(m.group(2))
-            year = int(m.group(3))
-
-            if month:
-                current_date = date(year, month, day)
-            else:
-                current_date = None
-            continue
-
-        if not current_date:
-            continue
-
-        # Possibile formato:
-        # "Val d’Isere (FRA) – Slalom Gigante Maschile"
-        if ("(" in line and ")" in line) and len(line) < 120:
-            place = line.split("–")[0].strip()
-            name = line.strip()
-
-            ev = RaceEvent(
-                federation=Federation.FIS,
-                codex=None,
-                name=f"{name} ({gender})",
-                place=place,
-                discipline=_guess_discipline(name),
-                start_date=current_date,
-                end_date=current_date,
-                nation=None,
-                region=None,
-                category=gender,
-                raw_type="WC",
-                level="WORLD_CUP",
-            )
-
-            events.append(ev)
-
-    return events
-
+# ---------------------------------------------------------------------------
+# FIS PROVIDER — NEVEITALIA
+# ---------------------------------------------------------------------------
 
 class FISCalendarProvider:
+    """
+    Scraping da NeveItalia:
+    - Maschile: https://www.neveitalia.it/sport/scialpino/calendario
+    - Femminile: https://www.neveitalia.it/sport/scialpino/calendario/coppa-del-mondo-femminile
+    """
+
+    BASE_URLS = [
+        "https://www.neveitalia.it/sport/scialpino/calendario",
+        "https://www.neveitalia.it/sport/scialpino/calendario/coppa-del-mondo-femminile",
+    ]
+
+    UA = {"User-Agent": "telemark-wax-pro/4.0"}
+
+    def _fetch(self, url: str) -> str:
+        r = requests.get(url, headers=self.UA, timeout=15)
+        r.raise_for_status()
+        return r.text
+
+    def _parse(self, html: str) -> List[RaceEvent]:
+        soup = BeautifulSoup(html, "html.parser")
+
+        cards = soup.find_all("div", class_="race") + soup.find_all("article")
+        events: List[RaceEvent] = []
+
+        # Metodo robusto: cerca tabelle e item ripetuti
+        for row in soup.find_all("tr"):
+            cols = [c.get_text(strip=True) for c in row.find_all("td")]
+            if len(cols) < 4:
+                continue
+
+            try:
+                raw_date = cols[0]
+                place = cols[1]
+                discipline = cols[2]
+                name = cols[3]
+
+                dt = _parse_date_it(raw_date)
+                if not dt:
+                    continue
+
+                ev = RaceEvent(
+                    federation=Federation.FIS,
+                    codex=None,
+                    name=name,
+                    place=place,
+                    discipline=_map_discipline(discipline),
+                    start_date=dt,
+                    end_date=dt,
+                    nation=None,
+                    region=None,
+                    category=None,
+                    raw_type="FIS",
+                    level="WC",
+                )
+
+                events.append(ev)
+
+            except Exception:
+                continue
+
+        return events
 
     def list_events(
         self,
@@ -137,116 +185,28 @@ class FISCalendarProvider:
         region_filter: Optional[str] = None,
     ) -> List[RaceEvent]:
 
-        events = []
+        all_events: List[RaceEvent] = []
 
-        try:
-            r1 = requests.get(NEVEITALIA_M, headers=UA, timeout=12)
-            r2 = requests.get(NEVEITALIA_F, headers=UA, timeout=12)
+        for url in self.BASE_URLS:
+            try:
+                html = self._fetch(url)
+                all_events.extend(self._parse(html))
+            except Exception:
+                pass
 
-            r1.raise_for_status()
-            r2.raise_for_status()
-
-            events += _parse_neveitalia_html(r1.text, "M")
-            events += _parse_neveitalia_html(r2.text, "F")
-
-        except Exception:
-            return []
-
-        # filtro stagione
-        events = [e for e in events if e.start_date.year in (season, season + 1)]
-
-        # filtro disciplina
         if discipline_filter:
             code = discipline_filter.upper()
-            events = [e for e in events if e.discipline and e.discipline.value.upper() == code]
+            all_events = [
+                ev for ev in all_events
+                if ev.discipline and ev.discipline.value.upper() == code
+            ]
 
-        return events
+        return all_events
 
 
 # ---------------------------------------------------------------------------
-# ASIVA – parsing diretto dal tuo testo
+# ASIVA PROVIDER — DATI INCOLLATI (NO SCRAPING)
 # ---------------------------------------------------------------------------
-
-ASIVA_RAW_TEXT = """
-ITA0857  9 dic 2025 FIS_NJR GS M Courmayeur Trofeo ODL
-ITA5829  10 dic 2025 FIS_NJR GS F Courmayeur Trofeo ODL
-ITA0859  10 dic 2025 FIS_NJR GS M Courmayeur Trofeo ODL
-AA0001   16 dic 2025 PM_REG GS Pila - Gressan Top 50
-AA0002   16 dic 2025 PM_REG GS Pila - Gressan Top 50
-AA0003   16 dic 2025 PM_REG SL Pila - Gressan Top 50
-AA0004   16 dic 2025 PM_REG SL Pila - Gressan Top 50
-AA0005   17 dic 2025 PM_REG SL Pila - Gressan Top 50
-AA0006   17 dic 2025 PM_REG SL Pila - Gressan Top 50
-AA0007   17 dic 2025 PM_REG GS Pila - Gressan Top 50
-AA0008   17 dic 2025 PM_REG GS Pila - Gressan Top 50
-"""
-
-ASIVA_DATE_RE = re.compile(r"(\d{1,2})\s(dic|gen|feb|mar|apr|mag|giu|lug|ago|set|ott|nov)\s(2025|2026)", re.IGNORECASE)
-
-def _parse_asiva() -> List[RaceEvent]:
-    events = []
-
-    for line in ASIVA_RAW_TEXT.splitlines():
-        line = line.strip()
-        if len(line) < 10:
-            continue
-
-        parts = re.split(r"\s{2,}|\t", line)
-
-        if not parts:
-            continue
-
-        codex = parts[0].strip()
-        date_match = ASIVA_DATE_RE.search(line)
-        if not date_match:
-            continue
-
-        day = int(date_match.group(1))
-        month = MONTHS.get(date_match.group(2).upper())
-        year = int(date_match.group(3))
-
-        if not month:
-            continue
-
-        d = date(year, month, day)
-
-        place = ""
-        if "Courmayeur" in line:
-            place = "Courmayeur"
-        elif "Pila" in line:
-            place = "Pila - Gressan"
-        elif "La Thuile" in line:
-            place = "La Thuile"
-        elif "Valtournenche" in line:
-            place = "Valtournenche"
-        elif "Frachey" in line or "Ayas" in line:
-            place = "Frachey - Ayas"
-        elif "Torgnon" in line:
-            place = "Torgnon"
-        else:
-            place = "Valle d'Aosta"
-
-        discipline = Discipline.GS if "GS" in line else Discipline.SL
-
-        ev = RaceEvent(
-            federation=Federation.ASIVA,
-            codex=codex,
-            name=line,
-            place=place,
-            discipline=discipline,
-            start_date=d,
-            end_date=d,
-            nation="ITA",
-            region="Valle d'Aosta",
-            category=None,
-            raw_type="ASIVA",
-            level="REGIONAL",
-        )
-
-        events.append(ev)
-
-    return events
-
 
 class ASIVACalendarProvider:
 
@@ -258,12 +218,49 @@ class ASIVACalendarProvider:
         region_filter: Optional[str] = None,
     ) -> List[RaceEvent]:
 
-        events = _parse_asiva()
-        events = [e for e in events if e.start_date.year in (season, season + 1)]
+        raw_data = [
+            ("ITA0857", "9 dic 2025", "GS", "Courmayeur", "Trofeo ODL"),
+            ("ITA5829", "10 dic 2025", "GS", "Courmayeur", "Trofeo ODL"),
+            ("ITA0859", "10 dic 2025", "GS", "Courmayeur", "Trofeo ODL"),
+            ("AA0001", "16 dic 2025", "GS", "Pila - Gressan", "Top 50"),
+            ("AA0002", "16 dic 2025", "GS", "Pila - Gressan", "Top 50"),
+            ("AA0003", "16 dic 2025", "SL", "Pila - Gressan", "Top 50"),
+            ("AA0004", "16 dic 2025", "SL", "Pila - Gressan", "Top 50"),
+            ("XA0184", "19 dic 2025", "GS", "Pila - Gressan", "Trofeo Coni"),
+            ("ITA5858", "22 dic 2025", "GS", "Frachey - Ayas", "Trofeo Pulverit"),
+            ("ITA5862", "23 dic 2025", "GS", "Frachey - Ayas", "Trofeo Pulverit"),
+        ]
+
+        events: List[RaceEvent] = []
+
+        for codex, date_raw, spec, place, name in raw_data:
+
+            dt = _parse_date_it(date_raw)
+            if not dt:
+                continue
+
+            ev = RaceEvent(
+                federation=Federation.ASIVA,
+                codex=codex,
+                name=name,
+                place=place,
+                discipline=_map_discipline(spec),
+                start_date=dt,
+                end_date=dt,
+                nation="ITA",
+                region="Valle d'Aosta",
+                raw_type="ASIVA",
+                level="REG",
+            )
+
+            events.append(ev)
 
         if discipline_filter:
             code = discipline_filter.upper()
-            events = [e for e in events if e.discipline and e.discipline.value.upper() == code]
+            events = [
+                ev for ev in events
+                if ev.discipline and ev.discipline.value.upper() == code
+            ]
 
         return events
 
@@ -274,9 +271,13 @@ class ASIVACalendarProvider:
 
 class RaceCalendarService:
 
-    def __init__(self):
-        self._fis = FISCalendarProvider()
-        self._asiva = ASIVACalendarProvider()
+    def __init__(
+        self,
+        fis_provider: FISCalendarProvider,
+        asiva_provider: ASIVACalendarProvider,
+    ):
+        self._fis = fis_provider
+        self._asiva = asiva_provider
 
     def list_events(
         self,
@@ -290,10 +291,26 @@ class RaceCalendarService:
         events: List[RaceEvent] = []
 
         if federation is None or federation == Federation.FIS:
-            events += self._fis.list_events(season, discipline)
+            try:
+                events.extend(
+                    self._fis.list_events(
+                        season=season,
+                        discipline_filter=discipline,
+                    )
+                )
+            except Exception:
+                pass
 
         if federation is None or federation == Federation.ASIVA:
-            events += self._asiva.list_events(season, discipline)
+            try:
+                events.extend(
+                    self._asiva.list_events(
+                        season=season,
+                        discipline_filter=discipline,
+                    )
+                )
+            except Exception:
+                pass
 
-        events.sort(key=lambda e: (e.start_date, e.place))
+        events.sort(key=lambda ev: (ev.start_date, ev.name))
         return events
