@@ -352,14 +352,10 @@ def recommend_skis_for_day(
     for ski in SKI_DATABASE:
         if not (ski.level_min <= lvl <= ski.level_max):
             continue
-
         if ski.usage not in allowed_usages:
             continue
-
         if ski.snow_focus != cond_code and ski.snow_focus != "mixed":
-            # consenti sempre "mixed" come jolly
             continue
-
         out.append(ski)
 
     # fallback: se vuoto, rilassa il filtro neve
@@ -396,7 +392,6 @@ st.sidebar.text(f"Search.VERSION: {getattr(search_mod, 'VERSION', SEARCH_VERSION
 st.title("Telemark · Pro Wax & Tune")
 
 ctx: Dict[str, Any] = {"lang": lang}
-
 today_utc = datetime.utcnow().date()
 
 # =====================================================
@@ -412,11 +407,15 @@ if page == "Località & Mappa":
     ctx.update(sel)
     st.session_state["lat"] = sel["lat"]
     st.session_state["lon"] = sel["lon"]
-    st.session_state["place_label"] = sel["label"]
+
+    # usa place_label aggiornato se presente (click su pista)
+    display_label = st.session_state.get("place_label", sel["label"])
+    ctx["place_label"] = display_label
+    st.session_state["place_label"] = display_label
 
     st.markdown(
         f'<div class="card">'
-        f'<span class="small"><strong>Località selezionata:</strong> {sel["label"]}</span>'
+        f'<span class="small"><strong>Località selezionata:</strong> {display_label}</span>'
         f"</div>",
         unsafe_allow_html=True,
     )
@@ -432,7 +431,6 @@ if page == "Località & Mappa":
     # ---------------- METEO LOCALITÀ ----------------
     st.markdown("## 4) Meteo località & profilo giornata")
 
-    # data/ora di riferimento per la sciata
     col_d, col_t = st.columns(2)
     with col_d:
         ref_date_free = st.date_input(
@@ -447,12 +445,11 @@ if page == "Località & Mappa":
             key="free_ref_time",
         )
 
-    # costruiamo un RaceEvent fittizio solo per riusare il modello meteo
     dummy_event = RaceEvent(
         federation=Federation.ASIVA,
         codex=None,
         name="Free ski",
-        place=sel["label"],
+        place=ctx["place_label"],
         discipline=Discipline.GS,
         start_date=ref_date_free,
         end_date=ref_date_free,
@@ -470,7 +467,6 @@ if page == "Località & Mappa":
     if profile_local is None:
         st.warning("Impossibile costruire il profilo meteo per questa località.")
     else:
-        # DataFrame base
         df = pd.DataFrame(
             {
                 "time": profile_local.times,
@@ -488,10 +484,9 @@ if page == "Località & Mappa":
         ).set_index("time")
 
         st.caption("Grafici riferiti all'intera giornata (00–24) per la località selezionata.")
-
         df_reset = df.reset_index()
 
-        # ---- prepara dati per modulo wax (session_state["_meteo_res"]) ----
+        # ---- prepara dati per modulo wax ----
         wax_df = df_reset.copy()
         wax_df["time_local"] = wax_df["time"]
         wax_df["T_surf"] = wax_df["snow_temp"]
@@ -647,17 +642,16 @@ if page == "Località & Mappa":
         st.altair_chart(chart_icons, use_container_width=True)
 
         # ----- condizione neve al momento di riferimento -----
-        # scegli riga più vicina all'orario scelto
         ts_ref = datetime.combine(ref_date_free, ref_time_free)
-        idx = (df_reset["time"] - ts_ref).abs().idxmin()
-        row_ref = df_reset.iloc[idx]
-        # usa la funzione di wax per classificare neve
+        idx = (wax_df["time_local"] - ts_ref).abs().idxmin()
+        row_ref = wax_df.loc[idx]          # <<< QUI: uso wax_df, non df_reset
         snow_label = wax_mod.classify_snow(row_ref)
+
         st.markdown(
             f"<div class='card small'>"
             f"<b>Condizione neve stimata alle {ref_time_free.strftime('%H:%M')}</b>: "
-            f"{snow_label} · T neve ~ {row_ref['snow_temp']:.1f} °C · "
-            f"UR ~ {row_ref['rh']:.0f}%</div>",
+            f"{snow_label} · T neve ~ {row_ref['T_surf']:.1f} °C · "
+            f"UR ~ {row_ref['RH']:.0f}%</div>",
             unsafe_allow_html=True,
         )
 
@@ -756,8 +750,8 @@ if page == "Località & Mappa":
             st.info("Non è stato possibile calcolare il tuning dinamico per questa località.")
         else:
             rec_loc = get_tuning_recommendation(dyn_loc.input_params)
+            side_angle = 90.0 - rec_loc.side_bevel_deg
 
-            side_angle = 90.0 - rec_loc.side_bevel_deg  # 87°, 88° ecc.
             c1t, c2t, c3t = st.columns(3)
             c1t.metric("Angolo lamina (side)", f"{side_angle:.1f}°")
             c2t.metric("Base bevel", f"{rec_loc.base_bevel_deg:.1f}°")
@@ -777,7 +771,6 @@ if page == "Località & Mappa":
 
         # ---------------- SCIOLINE & TUNING DETTAGLIATO (LOCALITÀ) ----------------
         st.markdown("## 7) ❄️ Scioline & tuning dettagliato (località)")
-
         wax_mod.render_wax(T, ctx)
 
 # =====================================================
@@ -1187,8 +1180,8 @@ else:
                 st.info("Non è stato possibile calcolare il tuning dinamico per questa gara.")
             else:
                 rec = get_tuning_recommendation(dyn.input_params)
-
                 side_angle = 90.0 - rec.side_bevel_deg
+
                 c1t, c2t, c3t = st.columns(3)
                 c1t.metric("Angolo lamina (side)", f"{side_angle:.1f}°")
                 c2t.metric("Base bevel", f"{rec.base_bevel_deg:.1f}°")
