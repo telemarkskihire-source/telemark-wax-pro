@@ -1,15 +1,28 @@
 # streamlit_app.py
 # Telemark · Pro Wax & Tune
+#
 # Pagina 1: Località & Mappa
-# Pagina 2: Racing / Calendari + Mappa, DEM, Meteo & Tuning dinamico
+#   - Mappa & DEM
+#   - Meteo località
+#   - Sci ideale per la giornata (consiglio sci)
+#   - Tuning dinamico (località)
+#   - Scioline & tuning (wax_logic) basato su meteo locale
+#
+# Pagina 2: Racing / Calendari
+#   - Calendari FIS + ASIVA
+#   - Mappa & DEM sulla località gara
+#   - Meteo giornata di gara
+#   - Tuning dinamico gara
+#   - Scioline & tuning (wax_logic) per la gara
 
 from __future__ import annotations
 
 import os
 import sys
 import importlib
-from datetime import datetime, time as dtime, timedelta
-from typing import Optional, Dict, Any
+from dataclasses import dataclass
+from datetime import datetime, date as Date, time as dtime, timedelta
+from typing import Optional, Dict, Any, List
 
 import requests
 import pandas as pd
@@ -48,7 +61,7 @@ from core.race_tuning import (
 )
 from core.race_integration import get_wc_tuning_for_event, SkierLevel as WCSkierLevel
 from core import meteo as meteo_mod
-from core import wax_logic  # pannello scioline
+from core import wax_logic as wax_mod  # modulo scioline
 
 import core.search as search_mod  # debug
 
@@ -63,45 +76,45 @@ st.set_page_config(
 )
 
 st.markdown(
-    f"""
+    """
 <style>
-:root {{
+:root {
   --bg:#0b0f13;
   --panel:#121821;
   --muted:#9aa4af;
   --fg:#e5e7eb;
   --line:#1f2937;
-}}
-html, body, .stApp {{
+}
+html, body, .stApp {
   background:var(--bg);
   color:#e5e7eb;
-}}
-[data-testid="stHeader"] {{
+}
+[data-testid="stHeader"] {
   background:transparent;
-}}
-section.main > div {{
+}
+section.main > div {
   padding-top: 0.6rem;
-}}
-h1,h2,h3,h4 {{
+}
+h1,h2,h3,h4 {
   color:#fff;
   letter-spacing: .2px;
-}}
-hr {{
+}
+hr {
   border:none;
   border-top:1px solid var(--line);
   margin:.75rem 0;
-}}
-.card {{
+}
+.card {
   background: var(--panel);
   border:1px solid var(--line);
   border-radius:12px;
   padding:.9rem .95rem;
-}}
-.small {{
+}
+.small {
   font-size:.85rem;
   color:#cbd5e1;
-}}
-.badge {{
+}
+.badge {
   display:inline-flex;
   align-items:center;
   gap:.35rem;
@@ -111,7 +124,7 @@ hr {{
   padding:.15rem .55rem;
   font-size:.8rem;
   color:#e2e8f0;
-}}
+}
 </style>
 """,
     unsafe_allow_html=True,
@@ -130,13 +143,13 @@ UA = {"User-Agent": "telemark-wax-pro/2.0"}
 @st.cache_data(ttl=3600, show_spinner=False)
 def geocode_race_place(query: str) -> Optional[Dict[str, Any]]:
     """
-    Geocoding per le località di gara.
+    Geocoding per le località di gara / comprensori.
 
-    Logica semplice (robusta):
+    Logica:
     1. Query = nome località pulito.
     2. Cerca fino a 10 risultati.
     3. Se trova qualcosa sopra MIN_ELEVATION_M → usa il primo.
-    4. Altrimenti prende comunque quello con quota più alta.
+    4. Altrimenti prende quello con quota più alta disponibile.
     """
     q = (query or "").strip()
     if not q:
@@ -175,14 +188,12 @@ def geocode_race_place(query: str) -> Optional[Dict[str, Any]]:
         except Exception:
             elev = None
 
-        # tieni il più alto in assoluto
         if elev is not None and elev > best_any_elev:
             best_any_elev = elev
             best_any = it
         elif best_any is None:
             best_any = it
 
-        # primo che supera la soglia montagna
         if elev is not None and elev >= MIN_ELEVATION_M and best_high is None:
             best_high = it
 
@@ -227,7 +238,7 @@ def race_event_label(ev: RaceEvent) -> str:
 
 def _clean_place_for_geocoder(raw_place: str) -> str:
     """
-    Pulisce il nome località per il geocoder:
+    Località "bella" per il geocoder:
     - toglie la parte tra parentesi: "Soelden (AUT)" -> "Soelden"
     - usa solo la parte prima del ' - ' : "Pila - Gressan" -> "Pila"
     """
@@ -241,7 +252,9 @@ def _clean_place_for_geocoder(raw_place: str) -> str:
 
 
 def center_ctx_on_race_location(ctx: Dict[str, Any], event: RaceEvent) -> Dict[str, Any]:
-    """Centra la mappa sulla località di gara usando il nome pulito."""
+    """
+    Centra la mappa sulla località di gara usando il nome pulito.
+    """
     query_name = _clean_place_for_geocoder(event.place or "")
 
     base = ensure_base_location()
@@ -264,6 +277,98 @@ def center_ctx_on_race_location(ctx: Dict[str, Any], event: RaceEvent) -> Dict[s
     st.session_state["place_label"] = label
 
     return ctx
+
+
+# ---------------------- MODELLO SCI IDEALE ----------------------
+@dataclass
+class SkiModel:
+    brand: str
+    model: str
+    level_min: int  # 1=principiante, 2=intermedio, 3=avanzato, 4=race
+    level_max: int
+    snow_focus: str  # "hard", "mixed", "soft"
+    usage: str       # "pista", "sl", "gs", "allmountain", "freeride", "touring"
+    notes: str = ""
+
+
+SKI_DATABASE: List[SkiModel] = [
+    # Pista allround
+    SkiModel("Atomic", "Redster Q7 Revoshock C", 2, 3, "mixed", "pista", "Allround pista stabile ma facile."),
+    SkiModel("Atomic", "Redster G9 RS", 3, 4, "hard", "gs", "GS race-oriented, raggio lungo."),
+    SkiModel("Head", "Supershape e-Magnum", 2, 4, "mixed", "pista", "Carving stretto, molto reattivo."),
+    SkiModel("Head", "Worldcup Rebels e-SL", 3, 4, "hard", "sl", "SL agonistico, cambi rapidissimi."),
+    SkiModel("Rossignol", "Hero Elite ST Ti", 2, 4, "mixed", "sl", "Slalom da pista, tollerante."),
+    SkiModel("Rossignol", "Hero Elite MT Ti", 2, 3, "mixed", "pista", "Multi-turn, raggio medio."),
+    SkiModel("Salomon", "S/Max 10", 2, 3, "mixed", "pista", "Per sciatori in crescita, facile ma preciso."),
+    SkiModel("Salomon", "S/Race GS 12", 3, 4, "hard", "gs", "GS solido per agonisti Master/FIS."),
+    # All-mountain / freeride
+    SkiModel("Nordica", "Enforcer 88", 2, 4, "soft", "allmountain", "All-mountain solido, tanta stabilità."),
+    SkiModel("Blizzard", "Rustler 9", 2, 4, "soft", "freeride", "Per neve fresca e mista."),
+    SkiModel("Volkl", "Deacon 84", 2, 4, "mixed", "allmountain", "Pista larga + fuori traccia leggero."),
+    SkiModel("Fischer", "Ranger 96", 2, 4, "soft", "freeride", "Freeride versatile."),
+    # Touring
+    SkiModel("Dynafit", "Blacklight 88", 3, 4, "mixed", "touring", "Skialp leggero, per salite lunghe."),
+    SkiModel("K2", "Wayback 88", 2, 4, "mixed", "touring", "Touring equilibrato, molto usato."),
+]
+
+
+def _cond_code_from_snow_label(label: str) -> str:
+    label_low = (label or "").lower()
+    if any(k in label_low for k in ["bagnata", "primaverile", "pioggia", "umida"]):
+        return "soft"
+    if any(k in label_low for k in ["ghiacciata", "rigelata", "iniettata"]):
+        return "hard"
+    return "mixed"
+
+
+def recommend_skis_for_day(
+    level_tag: str,
+    usage_pref: str,
+    snow_label: str,
+) -> List[SkiModel]:
+    # livello utente
+    level_map = {
+        "beginner": 1,
+        "intermediate": 2,
+        "advanced": 3,
+        "race": 4,
+    }
+    lvl = level_map.get(level_tag, 2)
+
+    cond_code = _cond_code_from_snow_label(snow_label)
+
+    # mapping uso preferito → categorie
+    usage_map = {
+        "Pista allround": {"pista"},
+        "SL / raggi stretti": {"sl"},
+        "GS / raggi medi": {"gs", "pista"},
+        "All-mountain": {"allmountain", "pista"},
+        "Freeride": {"freeride"},
+        "Skialp / touring": {"touring"},
+    }
+    allowed_usages = usage_map.get(usage_pref, {"pista"})
+
+    out: List[SkiModel] = []
+    for ski in SKI_DATABASE:
+        if not (ski.level_min <= lvl <= ski.level_max):
+            continue
+
+        if ski.usage not in allowed_usages:
+            continue
+
+        if ski.snow_focus != cond_code and ski.snow_focus != "mixed":
+            # consenti sempre "mixed" come jolly
+            continue
+
+        out.append(ski)
+
+    # fallback: se vuoto, rilassa il filtro neve
+    if not out:
+        for ski in SKI_DATABASE:
+            if ski.usage in allowed_usages and ski.level_min <= lvl <= ski.level_max:
+                out.append(ski)
+
+    return out[:6]
 
 
 # ---------------------- SIDEBAR ----------------------
@@ -292,7 +397,11 @@ st.title("Telemark · Pro Wax & Tune")
 
 ctx: Dict[str, Any] = {"lang": lang}
 
-# =============== PAGINA 1: LOCALITÀ & MAPPA ===============
+today_utc = datetime.utcnow().date()
+
+# =====================================================
+# PAGINA 1: LOCALITÀ & MAPPA
+# =====================================================
 if page == "Località & Mappa":
     st.markdown("## 🌍 Località")
 
@@ -312,16 +421,368 @@ if page == "Località & Mappa":
         unsafe_allow_html=True,
     )
 
-    # mappa
-    st.markdown("## 4) Mappa & piste")
+    # ---------------- Mappa & DEM ----------------
+    st.markdown("## 2) Mappa & piste")
     ctx["map_context"] = "local"
     ctx = render_map(T, ctx) or ctx
 
-    # DEM
-    st.markdown("## 5) Esposizione & pendenza")
+    st.markdown("## 3) Esposizione & pendenza")
     render_dem(T, ctx)
 
-# =============== PAGINA 2: RACING / CALENDARI ===============
+    # ---------------- METEO LOCALITÀ ----------------
+    st.markdown("## 4) Meteo località & profilo giornata")
+
+    # data/ora di riferimento per la sciata
+    col_d, col_t = st.columns(2)
+    with col_d:
+        ref_date_free = st.date_input(
+            "Giorno di riferimento",
+            value=today_utc,
+            key="free_ref_date",
+        )
+    with col_t:
+        ref_time_free = st.time_input(
+            "Orario di riferimento (inizio sciata)",
+            value=st.session_state.get("free_ref_time", dtime(hour=10, minute=0)),
+            key="free_ref_time",
+        )
+
+    # costruiamo un RaceEvent fittizio solo per riusare il modello meteo
+    dummy_event = RaceEvent(
+        federation=Federation.ASIVA,
+        codex=None,
+        name="Free ski",
+        place=sel["label"],
+        discipline=Discipline.GS,
+        start_date=ref_date_free,
+        end_date=ref_date_free,
+        nation=None,
+        region=None,
+        category=None,
+        raw_type="FREE",
+        level="LOCAL",
+    )
+    ctx["race_event"] = dummy_event
+    race_dt_free = datetime.combine(ref_date_free, ref_time_free)
+    ctx["race_datetime"] = race_dt_free
+
+    profile_local = meteo_mod.build_meteo_profile_for_race_day(ctx)
+    if profile_local is None:
+        st.warning("Impossibile costruire il profilo meteo per questa località.")
+    else:
+        # DataFrame base
+        df = pd.DataFrame(
+            {
+                "time": profile_local.times,
+                "temp_air": profile_local.temp_air,
+                "snow_temp": profile_local.snow_temp,
+                "rh": profile_local.rh,
+                "cloudcover": profile_local.cloudcover,
+                "windspeed": profile_local.windspeed,
+                "precipitation": profile_local.precip,
+                "snowfall": profile_local.snowfall,
+                "shade_index": profile_local.shade_index,
+                "snow_moisture_index": profile_local.snow_moisture_index,
+                "glide_index": profile_local.glide_index,
+            }
+        ).set_index("time")
+
+        st.caption("Grafici riferiti all'intera giornata (00–24) per la località selezionata.")
+
+        df_reset = df.reset_index()
+
+        # ---- prepara dati per modulo wax (session_state["_meteo_res"]) ----
+        wax_df = df_reset.copy()
+        wax_df["time_local"] = wax_df["time"]
+        wax_df["T_surf"] = wax_df["snow_temp"]
+        wax_df["RH"] = wax_df["rh"]
+        wax_df["wind"] = wax_df["windspeed"]
+        wax_df["cloud"] = wax_df["cloudcover"] / 100.0
+
+        if "snow_moisture_index" in wax_df.columns:
+            wax_df["liq_water_pct"] = wax_df["snow_moisture_index"] * 5.0
+        else:
+            wax_df["liq_water_pct"] = 0.0
+
+        def _ptyp(row):
+            pr = float(row.get("precipitation", 0.0))
+            sf = float(row.get("snowfall", 0.0))
+            if sf > 0.1 and pr - sf > 0.1:
+                return "mixed"
+            if sf > 0.1:
+                return "snow"
+            if pr > 0.1:
+                return "rain"
+            return None
+
+        wax_df["ptyp"] = wax_df.apply(_ptyp, axis=1)
+
+        st.session_state["_meteo_res"] = wax_df[
+            ["time_local", "T_surf", "RH", "wind", "liq_water_pct", "cloud", "ptyp"]
+        ]
+        st.session_state["ref_day"] = ref_date_free
+
+        # ---- grafici principali ----
+        temp_long = df_reset.melt(
+            id_vars="time",
+            value_vars=["temp_air", "snow_temp"],
+            var_name="series",
+            value_name="value",
+        )
+        chart_temp = (
+            alt.Chart(temp_long)
+            .mark_line()
+            .encode(
+                x=alt.X("time:T", title=None),
+                y=alt.Y("value:Q", title=None),
+                color=alt.Color("series:N", title=None),
+                tooltip=[],
+            )
+            .properties(height=180)
+        )
+
+        chart_rh = (
+            alt.Chart(df_reset)
+            .mark_line()
+            .encode(
+                x=alt.X("time:T", title=None),
+                y=alt.Y("rh:Q", title=None),
+                tooltip=[],
+            )
+            .properties(height=180)
+        )
+
+        chart_shade = (
+            alt.Chart(df_reset)
+            .mark_line()
+            .encode(
+                x=alt.X("time:T", title=None),
+                y=alt.Y("shade_index:Q", title=None),
+                tooltip=[],
+            )
+            .properties(height=180)
+        )
+
+        chart_glide = (
+            alt.Chart(df_reset)
+            .mark_line()
+            .encode(
+                x=alt.X("time:T", title=None),
+                y=alt.Y("glide_index:Q", title=None),
+                tooltip=[],
+            )
+            .properties(height=180)
+        )
+
+        wind_long = df_reset.melt(
+            id_vars="time",
+            value_vars=["windspeed", "cloudcover"],
+            var_name="series",
+            value_name="value",
+        )
+        chart_wind_cloud = (
+            alt.Chart(wind_long)
+            .mark_line()
+            .encode(
+                x=alt.X("time:T", title=None),
+                y=alt.Y("value:Q", title=None),
+                color=alt.Color("series:N", title=None),
+                tooltip=[],
+            )
+            .properties(height=200)
+        )
+
+        c_a, c_b = st.columns(2)
+        with c_a:
+            st.markdown("**Temperatura aria vs neve**")
+            st.altair_chart(chart_temp, use_container_width=True)
+
+            st.markdown("**Umidità relativa (%)**")
+            st.altair_chart(chart_rh, use_container_width=True)
+        with c_b:
+            st.markdown("**Indice ombreggiatura** (0 sole, 1 ombra/luce piatta)")
+            st.altair_chart(chart_shade, use_container_width=True)
+
+            st.markdown("**Indice scorrevolezza teorica** (0–1)")
+            st.altair_chart(chart_glide, use_container_width=True)
+
+        st.markdown("**Vento (km/h) e copertura nuvolosa (%)**")
+        st.altair_chart(chart_wind_cloud, use_container_width=True)
+
+        # icone meteo
+        icon_df = df_reset.copy()
+        icons = []
+        for _, row in icon_df.iterrows():
+            cc = float(row["cloudcover"])
+            pr = float(row.get("precipitation", 0.0))
+            sf = float(row.get("snowfall", 0.0))
+            if sf > 0.2:
+                icon = "❄️"
+            elif pr > 0.2:
+                icon = "🌧️"
+            else:
+                if cc < 20:
+                    icon = "☀️"
+                elif cc < 60:
+                    icon = "🌤️"
+                else:
+                    icon = "☁️"
+            icons.append(icon)
+
+        icon_df["icon"] = icons
+        icon_df["y"] = 0
+        chart_icons = (
+            alt.Chart(icon_df)
+            .mark_text(size=18)
+            .encode(
+                x=alt.X("time:T", title=None),
+                y=alt.Y("y:Q", axis=None),
+                text="icon:N",
+                tooltip=[],
+            )
+            .properties(height=60)
+        )
+
+        st.markdown("**Sintesi meteo giornata (icone)**")
+        st.altair_chart(chart_icons, use_container_width=True)
+
+        # ----- condizione neve al momento di riferimento -----
+        # scegli riga più vicina all'orario scelto
+        ts_ref = datetime.combine(ref_date_free, ref_time_free)
+        idx = (df_reset["time"] - ts_ref).abs().idxmin()
+        row_ref = df_reset.iloc[idx]
+        # usa la funzione di wax per classificare neve
+        snow_label = wax_mod.classify_snow(row_ref)
+        st.markdown(
+            f"<div class='card small'>"
+            f"<b>Condizione neve stimata alle {ref_time_free.strftime('%H:%M')}</b>: "
+            f"{snow_label} · T neve ~ {row_ref['snow_temp']:.1f} °C · "
+            f"UR ~ {row_ref['rh']:.0f}%</div>",
+            unsafe_allow_html=True,
+        )
+
+        # ---------------- SCI IDEALE PER LA GIORNATA ----------------
+        st.markdown("## 5) Sci ideale per la giornata")
+
+        col_l, col_u = st.columns(2)
+        with col_l:
+            ski_level_label = st.selectbox(
+                "Livello sciatore (sci ideale)",
+                [
+                    ("Principiante", "beginner"),
+                    ("Intermedio", "intermediate"),
+                    ("Avanzato", "advanced"),
+                    ("Race / agonista", "race"),
+                ],
+                index=1,
+                format_func=lambda x: x[0],
+                key="ski_level_loc",
+            )
+        with col_u:
+            usage_pref = st.selectbox(
+                "Uso principale",
+                [
+                    "Pista allround",
+                    "SL / raggi stretti",
+                    "GS / raggi medi",
+                    "All-mountain",
+                    "Freeride",
+                    "Skialp / touring",
+                ],
+                index=0,
+                key="ski_usage_loc",
+            )
+
+        chosen_level_tag = ski_level_label[1]
+        skis = recommend_skis_for_day(
+            level_tag=chosen_level_tag,
+            usage_pref=usage_pref,
+            snow_label=snow_label,
+        )
+
+        if skis:
+            st.markdown("**Suggerimenti modelli (multi-marca):**")
+            for ski in skis:
+                st.markdown(
+                    f"<div class='card small'>"
+                    f"<b>{ski.brand} · {ski.model}</b><br>"
+                    f"Categoria: {ski.usage} · Focus neve: {ski.snow_focus}<br>"
+                    f"{ski.notes}"
+                    f"</div>",
+                    unsafe_allow_html=True,
+                )
+        else:
+            st.info("Nessun modello suggerito per questi filtri (lista interna vuota).")
+
+        # ---------------- TUNING DINAMICO LOCALITÀ ----------------
+        st.markdown("## 6) 🎯 Tuning dinamico (località)")
+
+        level_choice = st.selectbox(
+            "Livello sciatore per il tuning",
+            [
+                ("WC / Coppa del Mondo", TuneSkierLevel.WC),
+                ("FIS / Continental", TuneSkierLevel.FIS),
+                ("Esperto", TuneSkierLevel.EXPERT),
+                ("Turistico evoluto", TuneSkierLevel.TOURIST),
+            ],
+            format_func=lambda x: x[0],
+            key="dyn_level_loc",
+        )
+        chosen_dyn_level = level_choice[1]
+        st.session_state["dyn_level_tag"] = chosen_dyn_level.value
+
+        disc_loc = st.selectbox(
+            "Disciplina principale",
+            [d for d in Discipline],
+            index=1,  # GS
+            key="dyn_disc_loc",
+        )
+
+        injected_loc = st.checkbox(
+            "Pista iniettata / ghiacciata",
+            value=False,
+            key="dyn_injected_loc",
+        )
+
+        dyn_loc = meteo_mod.build_dynamic_tuning_for_race(
+            profile=profile_local,
+            ctx=ctx,
+            discipline=disc_loc,
+            skier_level=chosen_dyn_level,
+            injected=injected_loc,
+        )
+
+        if dyn_loc is None:
+            st.info("Non è stato possibile calcolare il tuning dinamico per questa località.")
+        else:
+            rec_loc = get_tuning_recommendation(dyn_loc.input_params)
+
+            side_angle = 90.0 - rec_loc.side_bevel_deg  # 87°, 88° ecc.
+            c1t, c2t, c3t = st.columns(3)
+            c1t.metric("Angolo lamina (side)", f"{side_angle:.1f}°")
+            c2t.metric("Base bevel", f"{rec_loc.base_bevel_deg:.1f}°")
+            c3t.metric("Profilo", rec_loc.risk_level.capitalize())
+
+            st.markdown(
+                f"- **Neve stimata**: {dyn_loc.input_params.snow_temp_c:.1f} °C "
+                f"({dyn_loc.snow_type.value})\n"
+                f"- **Aria all'ora scelta**: {dyn_loc.input_params.air_temp_c:.1f} °C\n"
+                f"- **Struttura soletta suggerita**: {rec_loc.structure_pattern}\n"
+                f"- **Wax group suggerito**: {rec_loc.wax_group}\n"
+                f"- **VLT consigliata maschera/occhiale**: "
+                f"{dyn_loc.vlt_pct:.0f}% ({dyn_loc.vlt_label})\n"
+                f"- **Note edges**: {rec_loc.notes}\n"
+            )
+            st.caption(dyn_loc.summary)
+
+        # ---------------- SCIOLINE & TUNING DETTAGLIATO (LOCALITÀ) ----------------
+        st.markdown("## 7) ❄️ Scioline & tuning dettagliato (località)")
+
+        wax_mod.render_wax(T, ctx)
+
+# =====================================================
+# PAGINA 2: RACING / CALENDARI
+# =====================================================
 else:
     st.markdown("## 🏁 Racing / Calendari gare")
 
@@ -339,13 +800,12 @@ else:
         unsafe_allow_html=True,
     )
 
-    # --- flag sviluppo per filtro 7 giorni ---
     dev_mode = st.checkbox(
         "Modalità sviluppo: mostra tutte le gare (ignora limite 7 giorni)",
         value=True,
     )
 
-    today = datetime.utcnow().date()
+    today = today_utc
     default_season = today.year if today.month >= 7 else today.year - 1
 
     c1, c2, c3 = st.columns(3)
@@ -377,7 +837,6 @@ else:
         )
         discipline_filter: Optional[str] = None if disc_choice == "Tutte" else disc_choice
 
-    # --- Filtro mese + categoria ASIVA (Partec.) -----------------------
     c4, c5 = st.columns(2)
     with c4:
         months_labels = [
@@ -393,7 +852,7 @@ else:
         )
         month_filter: Optional[int] = None
         if month_choice != "Tutti i mesi":
-            month_filter = months_labels.index(month_choice)  # 1–12
+            month_filter = months_labels.index(month_choice)
 
     with c5:
         if federation == Federation.ASIVA or federation is None:
@@ -422,7 +881,6 @@ else:
             category=category_filter,
         )
 
-    # --- filtro: SOLO gare entro i prossimi 7 giorni (disattivabile in dev) ---
     if events and not dev_mode:
         max_delta = timedelta(days=7)
         events = [
@@ -466,10 +924,7 @@ else:
         ctx["race_event"] = selected_event
         ctx["race_datetime"] = race_datetime
 
-        # centra sulla località gara (ASIVA + FIS)
         ctx = center_ctx_on_race_location(ctx, selected_event)
-
-        # mappa context specifico per forza-refresh
         ctx["map_context"] = (
             f"race_{selected_event.start_date.isoformat()}_{selected_event.place}"
         )
@@ -486,11 +941,10 @@ else:
             unsafe_allow_html=True,
         )
 
-        # mappa & piste
+        # Mappa & DEM gara
         st.markdown("### Mappa & piste per la gara")
         ctx = render_map(T, ctx) or ctx
 
-        # DEM con ombreggiatura
         st.markdown("### Esposizione & pendenza sulla pista selezionata")
         render_dem(T, ctx)
 
@@ -500,10 +954,10 @@ else:
             params_dict, data_dict = wc
             st.markdown("### Tuning WC di base (preset)")
 
+            side_wc_angle = 90.0 - params_dict["side_bevel_deg"]
             c1m, c2m, c3m = st.columns(3)
-            c1m.metric("Base bevel", f"{params_dict['base_bevel_deg']:.1f}°")
-            # qui lasciamo ancora il bevel perché è un preset WC "di riferimento"
-            c2m.metric("Side bevel", f"{params_dict['side_bevel_deg']:.1f}°")
+            c1m.metric("Angolo lamina WC (side)", f"{side_wc_angle:.1f}°")
+            c2m.metric("Base bevel", f"{params_dict['base_bevel_deg']:.1f}°")
             c3m.metric("Profilo", str(params_dict["risk_level"]).title())
 
             st.markdown(
@@ -516,7 +970,7 @@ else:
                 f"- **Note**: {data_dict['notes']}"
             )
 
-        # ---------- METEO & GRAFICI GARA ----------
+        # ---------- METEO & PROFILO GARA ----------
         st.markdown("### 📈 Meteo & profilo giornata gara")
 
         profile = meteo_mod.build_meteo_profile_for_race_day(ctx)
@@ -540,9 +994,41 @@ else:
             ).set_index("time")
 
             st.caption("Grafici riferiti all'intera giornata di gara (00–24).")
+
             df_reset = df.reset_index()
 
-            # aria vs neve
+            # dati per modulo wax
+            wax_df = df_reset.copy()
+            wax_df["time_local"] = wax_df["time"]
+            wax_df["T_surf"] = wax_df["snow_temp"]
+            wax_df["RH"] = wax_df["rh"]
+            wax_df["wind"] = wax_df["windspeed"]
+            wax_df["cloud"] = wax_df["cloudcover"] / 100.0
+
+            if "snow_moisture_index" in wax_df.columns:
+                wax_df["liq_water_pct"] = wax_df["snow_moisture_index"] * 5.0
+            else:
+                wax_df["liq_water_pct"] = 0.0
+
+            def _ptyp_r(row):
+                pr = float(row.get("precipitation", 0.0))
+                sf = float(row.get("snowfall", 0.0))
+                if sf > 0.1 and pr - sf > 0.1:
+                    return "mixed"
+                if sf > 0.1:
+                    return "snow"
+                if pr > 0.1:
+                    return "rain"
+                return None
+
+            wax_df["ptyp"] = wax_df.apply(_ptyp_r, axis=1)
+
+            st.session_state["_meteo_res"] = wax_df[
+                ["time_local", "T_surf", "RH", "wind", "liq_water_pct", "cloud", "ptyp"]
+            ]
+            st.session_state["ref_day"] = selected_event.start_date
+
+            # grafici
             temp_long = df_reset.melt(
                 id_vars="time",
                 value_vars=["temp_air", "snow_temp"],
@@ -561,7 +1047,6 @@ else:
                 .properties(height=180)
             )
 
-            # umidità
             chart_rh = (
                 alt.Chart(df_reset)
                 .mark_line()
@@ -573,7 +1058,6 @@ else:
                 .properties(height=180)
             )
 
-            # ombreggiatura
             chart_shade = (
                 alt.Chart(df_reset)
                 .mark_line()
@@ -585,7 +1069,6 @@ else:
                 .properties(height=180)
             )
 
-            # glide
             chart_glide = (
                 alt.Chart(df_reset)
                 .mark_line()
@@ -597,7 +1080,6 @@ else:
                 .properties(height=180)
             )
 
-            # vento + nuvole
             wind_long = df_reset.melt(
                 id_vars="time",
                 value_vars=["windspeed", "cloudcover"],
@@ -633,14 +1115,13 @@ else:
             st.markdown("**Vento (km/h) e copertura nuvolosa (%)**")
             st.altair_chart(chart_wind_cloud, use_container_width=True)
 
-            # ---- icone meteo stile Meteoblue ----
+            # icone meteo
             icon_df = df_reset.copy()
             icons = []
             for _, row in icon_df.iterrows():
                 cc = float(row["cloudcover"])
                 pr = float(row.get("precipitation", 0.0))
                 sf = float(row.get("snowfall", 0.0))
-
                 if sf > 0.2:
                     icon = "❄️"
                 elif pr > 0.2:
@@ -656,7 +1137,6 @@ else:
 
             icon_df["icon"] = icons
             icon_df["y"] = 0
-
             chart_icons = (
                 alt.Chart(icon_df)
                 .mark_text(size=18)
@@ -672,8 +1152,8 @@ else:
             st.markdown("**Sintesi meteo giornata (icone)**")
             st.altair_chart(chart_icons, use_container_width=True)
 
-            # ---------- TUNING DINAMICO BASATO SU METEO ----------
-            st.markdown("### 🎯 Tuning dinamico basato su meteo reale")
+            # ---------- TUNING DINAMICO GARA ----------
+            st.markdown("### 🎯 Tuning dinamico basato su meteo reale (gara)")
 
             level_choice = st.selectbox(
                 "Livello sciatore per questo tuning",
@@ -684,16 +1164,15 @@ else:
                     ("Turistico evoluto", TuneSkierLevel.TOURIST),
                 ],
                 format_func=lambda x: x[0],
+                key="dyn_level_race",
             )
             chosen_level = level_choice[1]
-            # memorizzo il livello in session_state per il modulo wax
-            st.session_state["dyn_skier_level"] = getattr(
-                chosen_level, "value", str(chosen_level)
-            ).lower()
+            st.session_state["dyn_level_tag"] = chosen_level.value
 
             injected_flag = st.checkbox(
                 "Pista iniettata / ghiacciata",
                 value=True if wc is not None else False,
+                key="dyn_injected_race",
             )
 
             dyn = meteo_mod.build_dynamic_tuning_for_race(
@@ -709,12 +1188,10 @@ else:
             else:
                 rec = get_tuning_recommendation(dyn.input_params)
 
-                # side_bevel → angolo spigolo (90° - bevel)
-                edge_angle = 90.0 - rec.side_bevel_deg
-
+                side_angle = 90.0 - rec.side_bevel_deg
                 c1t, c2t, c3t = st.columns(3)
-                c1t.metric("Base bevel", f"{rec.base_bevel_deg:.1f}°")
-                c2t.metric("Angolo spigolo", f"{edge_angle:.1f}°")
+                c1t.metric("Angolo lamina (side)", f"{side_angle:.1f}°")
+                c2t.metric("Base bevel", f"{rec.base_bevel_deg:.1f}°")
                 c3t.metric("Profilo", rec.risk_level.capitalize())
 
                 st.markdown(
@@ -729,6 +1206,6 @@ else:
                 )
                 st.caption(dyn.summary)
 
-            # ---------- SCIOLINE & TUNING DETTAGLIATO (WAX PANEL) ----------
-            st.markdown("### 🧊 Scioline & tuning dettagliato")
-            wax_logic.render_wax(T, ctx)
+            # ---------- SCIOLINE & TUNING DETTAGLIATO (GARA) ----------
+            st.markdown("### ❄️ Scioline & tuning dettagliato (gara)")
+            wax_mod.render_wax(T, ctx)
