@@ -48,6 +48,7 @@ from core.race_tuning import (
 )
 from core.race_integration import get_wc_tuning_for_event, SkierLevel as WCSkierLevel
 from core import meteo as meteo_mod
+from core import wax_logic  # <<< AGGIUNTO
 
 import core.search as search_mod  # debug
 
@@ -723,3 +724,7 @@ else:
                     f"- **Note edges**: {rec.notes}\n"
                 )
                 st.caption(dyn.summary)
+
+            # ---------- SCIOLINE & TUNING DETTAGLIATO (WAX PANEL) ----------
+            st.markdown("### 🧊 Scioline & tuning dettagliato")
+            wax_logic.render_wax(T, ctx, profile)
