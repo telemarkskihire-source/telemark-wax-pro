@@ -34,7 +34,7 @@ from core.dem_tools import render_dem
 from core.race_events import (
     RaceCalendarService,
     FISCalendarProvider,
-    FISICalendarProvider,
+    ASIVACalendarProvider,
     Federation,
     RaceEvent,
 )
@@ -117,8 +117,8 @@ hr {{
 
 # ---------------------- SERVIZI CALENDARIO ----------------------
 _FIS_PROVIDER = FISCalendarProvider()
-_FISI_PROVIDER = FISICalendarProvider()
-_RACE_SERVICE = RaceCalendarService(_FIS_PROVIDER, _FISI_PROVIDER)
+_ASIVA_PROVIDER = ASIVACalendarProvider()
+_RACE_SERVICE = RaceCalendarService(_FIS_PROVIDER, _ASIVA_PROVIDER)
 
 # ---------------------- GEOCODER GARE --------------------------
 MIN_ELEVATION_M = 1000.0
@@ -323,13 +323,13 @@ else:
     with c2:
         fed_choice = st.selectbox(
             "Federazione",
-            ["Tutte", "FIS", "FISI"],
+            ["Tutte", "FIS", "ASIVA"],
             index=1,
         )
         if fed_choice == "FIS":
             federation: Optional[Federation] = Federation.FIS
-        elif fed_choice == "FISI":
-            federation = Federation.FISI
+        elif fed_choice == "ASIVA":
+            federation = Federation.ASIVA
         else:
             federation = None
     with c3:
@@ -343,7 +343,7 @@ else:
     nation_filter: Optional[str] = None
     region_filter: Optional[str] = None
 
-    with st.spinner("Scarico calendario gare (Neveitalia)…"):
+    with st.spinner("Scarico calendario gare (Neveitalia / ASIVA)…"):
         events = _RACE_SERVICE.list_events(
             season=season,
             federation=federation,
