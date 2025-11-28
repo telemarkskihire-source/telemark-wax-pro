@@ -10,7 +10,6 @@ import sys
 import importlib
 from datetime import datetime, time as dtime, timedelta
 from typing import Optional, Dict, Any
-import unicodedata
 
 import requests
 import pandas as pd
@@ -122,66 +121,33 @@ _FIS_PROVIDER = FISCalendarProvider()
 _ASIVA_PROVIDER = ASIVACalendarProvider()
 _RACE_SERVICE = RaceCalendarService(_FIS_PROVIDER, _ASIVA_PROVIDER)
 
-
-    
-    
 # ---------------------- GEOCODER GARE --------------------------
 MIN_ELEVATION_M = 1000.0
 UA = {"User-Agent": "telemark-wax-pro/2.0"}
 
-# punti "partenza impianti" principali (affinabili a mano)
-# NB: sono approssimativi, puoi correggere numeri lat/lon se hai i tuoi GPX
-import unicodedata
-import re
-
-
-def _norm_place_key(s: str) -> str:
-    """Normalizza una stringa di località in una chiave compatta."""
-    if not s:
-        return ""
-    s = unicodedata.normalize("NFKD", s)
-    s = "".join(ch for ch in s if not unicodedata.combining(ch))
-    s = s.lower()
-    # uniforma separatori
-    s = s.replace("'", " ").replace("-", " ")
-    s = re.sub(r"\s+", " ", s).strip()
-    return s.replace(" ", "")
-
-
-LOCALITY_LIFT_POINTS = {
-    # Monterosa / Ayas
-    _norm_place_key("Champoluc"): (45.8292, 7.7337),        # partenza funivia Crest
-    _norm_place_key("Frachey"): (45.8363, 7.7462),          # partenza funifor Frachey
-    _norm_place_key("Antagnod - Ayas"): (45.8139, 7.7246),
-
-    # Pila
-    _norm_place_key("Pila - Gressan"): (45.7427, 7.3189),   # stazione a monte Pila (campo gare)
-    _norm_place_key("Pila"): (45.7427, 7.3189),
-
-    # Gressoney
-    _norm_place_key("Gressoney - La - Trinité"): (45.8151, 7.8273),
-    _norm_place_key("Gressoney - Saint - Jean"): (45.7765, 7.8240),
-
-    # Cervino
-    _norm_place_key("Breuil Cervinia"): (45.9365, 7.6297),
-    _norm_place_key("Valtournenche"): (45.8853, 7.6226),
-
-    # Altre VdA
-    _norm_place_key("La Thuile"): (45.7187, 6.9475),
-    _norm_place_key("Torgnon"): (45.8067, 7.5684),
-    _norm_place_key("Champorcher"): (45.6122, 7.6332),
-    _norm_place_key("Valgrisenche"): (45.6569, 7.0369),
-}
-
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def geocode_race_place(query: str) -> Optional[Dict[str, Any]]:
+def geocode_race_place(query: str, nation: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """
+    Geocoding per le località di gara.
+
+    Logica:
+    1. Query = nome località [+ nazione se disponibile].
+    2. Prova a trovare un risultato con quota >= MIN_ELEVATION_M.
+    3. Se non esiste, prende comunque il risultato con quota massima
+       (così la mappa SI MUOVE sempre, anche se la località è bassa).
+    """
     q = (query or "").strip()
     if not q:
         return None
 
+    search_q = q
+    if nation:
+        # es. "Beaver Creek USA" → di solito orienta già abbastanza
+        search_q = f"{q} {nation}"
+
     params = {
-        "name": q,
+        "name": search_q,
         "language": "it",
         "count": 10,
         "format": "json",
@@ -199,34 +165,47 @@ def geocode_race_place(query: str) -> Optional[Dict[str, Any]]:
         return None
 
     results = js.get("results") or []
-    best = None
-    for it in results:
-        elev = it.get("elevation")
-        if elev is None:
-            continue
-        try:
-            if float(elev) < MIN_ELEVATION_M:
-                continue
-        except Exception:
-            continue
-        best = it
-        break
-
-    if not best:
+    if not results:
         return None
 
-    cc = (best.get("country_code") or "").upper()
-    name = best.get("name") or ""
-    admin1 = best.get("admin1") or best.get("admin2") or ""
+    best_high = None      # primo >= MIN_ELEVATION_M
+    best_any = None       # risultato con quota più alta
+    best_any_elev = -9999.0
+
+    for it in results:
+        elev = it.get("elevation")
+        elev_f: Optional[float]
+        try:
+            elev_f = float(elev) if elev is not None else None
+        except Exception:
+            elev_f = None
+
+        # tieni traccia del più alto in assoluto
+        if elev_f is not None and elev_f > best_any_elev:
+            best_any_elev = elev_f
+            best_any = it
+        elif best_any is None:
+            # se tutti senza elevation, tieni il primo
+            best_any = it
+
+        # prendi il primo che supera la soglia "montagna"
+        if elev_f is not None and elev_f >= MIN_ELEVATION_M and best_high is None:
+            best_high = it
+
+    chosen = best_high or best_any
+    if not chosen:
+        return None
+
+    cc = (chosen.get("country_code") or "").upper()
+    name = chosen.get("name") or ""
+    admin1 = chosen.get("admin1") or chosen.get("admin2") or ""
     base = f"{name}, {admin1}".strip().replace(" ,", ",")
-    flag = "".join(
-        chr(127397 + ord(c)) for c in cc
-    ) if len(cc) == 2 else "🏳️"
+    flag = "".join(chr(127397 + ord(c)) for c in cc) if len(cc) == 2 else "🏳️"
     label = f"{flag}  {base} — {cc}"
 
     return {
-        "lat": float(best.get("latitude", 0.0)),
-        "lon": float(best.get("longitude", 0.0)),
+        "lat": float(chosen.get("latitude", 0.0)),
+        "lon": float(chosen.get("longitude", 0.0)),
         "label": label,
     }
 
@@ -253,35 +232,30 @@ def race_event_label(ev: RaceEvent) -> str:
 
 
 def center_ctx_on_race_location(ctx: Dict[str, Any], event: RaceEvent) -> Dict[str, Any]:
-    raw_place = (event.place or "").strip()
+    """
+    Centra la mappa sulla località di gara.
 
-    # 1) prendi solo la parte "località" prima di "- Ayas", ecc.
-    candidate = raw_place
-    for sep in [" - ", "–", "/"]:
-        if sep in candidate:
-            candidate = candidate.split(sep)[0].strip()
-            break
-
-    # se è tipo "Champoluc - Ayas" → "Champoluc"
-    # "Gressoney - La - Trinité" rimane intera (ci pensa la normalizzazione)
-    norm = _norm_place_key(candidate)
+    - usa solo la parte prima di eventuali parentesi nel nome località
+      (es. "Soelden (AUT)" → "Soelden")
+    - passa anche il codice nazione (AUT, USA, ecc.) al geocoder
+    """
+    raw_place = event.place or ""
+    query_name = raw_place.split("(")[0].strip() or raw_place.strip()
 
     base = ensure_base_location()
     lat = base["lat"]
     lon = base["lon"]
     label = base["label"]
 
-    # 2) se abbiamo un punto impianto noto, usiamo quello
-    if norm in LOCALITY_LIFT_POINTS:
-        lat, lon = LOCALITY_LIFT_POINTS[norm]
-        label = f"{candidate} · partenza impianti (preset)"
-    else:
-        # 3) fallback: geocoding generico montano
-        geo = geocode_race_place(candidate)
-        if geo:
-            lat = geo["lat"]
-            lon = geo["lon"]
-            label = geo["label"]
+    nation = None
+    if event.nation:
+        nation = event.nation
+
+    geo = geocode_race_place(query_name, nation=nation)
+    if geo:
+        lat = geo["lat"]
+        lon = geo["lon"]
+        label = geo["label"]
 
     ctx["lat"] = lat
     ctx["lon"] = lon
@@ -494,7 +468,7 @@ else:
         ctx["race_event"] = selected_event
         ctx["race_datetime"] = race_datetime
 
-        # centra sempre sulla località gara
+        # centra sempre sulla località gara (ora con geocoding più tollerante)
         ctx = center_ctx_on_race_location(ctx, selected_event)
 
         # mappa context specifico per forza-refresh
@@ -550,7 +524,6 @@ else:
         if profile is None:
             st.warning("Impossibile costruire il profilo meteo per questa gara.")
         else:
-            # DataFrame per grafici
             df = pd.DataFrame(
                 {
                     "time": profile.times,
@@ -568,8 +541,6 @@ else:
             ).set_index("time")
 
             st.caption("Grafici riferiti all'intera giornata di gara (00–24).")
-
-            # ---- grafici statici Altair, SENZA tooltip ----
             df_reset = df.reset_index()
 
             # aria vs neve
@@ -663,7 +634,7 @@ else:
             st.markdown("**Vento (km/h) e copertura nuvolosa (%)**")
             st.altair_chart(chart_wind_cloud, use_container_width=True)
 
-            # ---- Grafico icone meteo stile Meteoblue ----
+            # ---- icone meteo stile Meteoblue ----
             icon_df = df_reset.copy()
             icons = []
             for _, row in icon_df.iterrows():
