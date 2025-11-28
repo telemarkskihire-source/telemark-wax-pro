@@ -10,6 +10,7 @@ import sys
 import importlib
 from datetime import datetime, time as dtime, timedelta
 from typing import Optional, Dict, Any
+import unicodedata
 
 import requests
 import pandas as pd
@@ -125,28 +126,49 @@ _RACE_SERVICE = RaceCalendarService(_FIS_PROVIDER, _ASIVA_PROVIDER)
 MIN_ELEVATION_M = 1000.0
 UA = {"User-Agent": "telemark-wax-pro/2.0"}
 
-# Override locali → coordinate precise ski-area (non comune)
-LOCALITY_OVERRIDES: Dict[str, tuple[float, float]] = {
+# Punti chiave per località sciistiche (coordinate zona piste)
+# NB: usiamo token (champoluc, frachey, pila, ecc.) sulla stringa normalizzata
+LOCALITY_KEYPOINTS: Dict[str, tuple[float, float, str]] = {
     # Ayas / Champoluc / Frachey / Antagnod
-    "Champoluc - Ayas": (45.828, 7.746),
-    "Frachey - Ayas": (45.820, 7.720),
-    "Antagnod - Ayas": (45.807, 7.686),
-    # Pila
-    "Pila - Gressan": (45.622, 7.316),
-    "Pila-Gressan": (45.622, 7.316),
+    "champoluc": (45.833, 7.731, "Champoluc – Crest / Telemark"),
+    "frachey": (45.819, 7.717, "Frachey – funifor"),
+    "antagnod": (45.807, 7.686, "Antagnod – ski area"),
+    # Pila / Gressan
+    "pila": (45.619, 7.316, "Pila – ski area"),
     # Cervinia / Valtournenche
-    "Breuil Cervinia": (45.935, 7.629),
-    "Valtournenche": (45.884, 7.623),
+    "cervinia": (45.935, 7.629, "Breuil Cervinia – ski area"),
+    "valtournenche": (45.884, 7.623, "Valtournenche – Salette"),
     # Monte Rosa
-    "Gressoney - La - Trinité": (45.824, 7.838),
-    "Gressoney - Saint - Jean": (45.779, 7.828),
+    "gressoney la trinite": (45.824, 7.838, "Gressoney-La-Trinité – Staffal"),
+    "gressoney saint jean": (45.779, 7.828, "Gressoney-Saint-Jean – Weissmatten"),
     # Altre VdA
-    "La Thuile": (45.716, 6.948),
-    "Torgnon": (45.809, 7.571),
-    "Champorcher": (45.630, 7.583),
-    "Crevacol": (45.843, 7.187),
-    "Valgrisenche": (45.641, 7.037),
+    "la thuile": (45.716, 6.948, "La Thuile – Les Suches"),
+    "torgnon": (45.809, 7.571, "Torgnon – Chantorné"),
+    "champorcher": (45.630, 7.583, "Champorcher – Laris"),
+    "crevacol": (45.843, 7.187, "Crevacol – ski area"),
+    "valgrisenche": (45.641, 7.037, "Valgrisenche – ski area"),
 }
+
+
+def normalize_place(txt: str) -> str:
+    """
+    Normalizza il nome località:
+    - rimuove accenti
+    - porta in minuscolo
+    - toglie punteggiatura base
+    - compatta gli spazi
+    """
+    if not txt:
+        return ""
+    # rimuovi accenti
+    txt = unicodedata.normalize("NFKD", txt)
+    txt = "".join(c for c in txt if not unicodedata.combining(c))
+    txt = txt.lower()
+    for ch in [",", ".", "'", "’"]:
+        txt = txt.replace(ch, " ")
+    txt = txt.replace(" - ", " ")
+    txt = " ".join(txt.split())
+    return txt
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -229,36 +251,38 @@ def race_event_label(ev: RaceEvent) -> str:
 
 def center_ctx_on_race_location(ctx: Dict[str, Any], event: RaceEvent) -> Dict[str, Any]:
     """
-    Centra la mappa sulla LOCALITÀ di gara (Pila, Frachey, Valtournenche…),
-    non sul comune. Logica:
-      1) se place matcha una chiave in LOCALITY_OVERRIDES -> usa quelle coord
-      2) altrimenti prova geocoding sulla sola località (prima di ' - ')
-      3) fallback: location base (Champoluc)
+    Centra la mappa sulla LOCALITÀ di gara (Champoluc, Frachey, Pila, ecc.)
+    e non sul comune.
+
+    Logica:
+      1) normalizza event.place
+      2) se un token di LOCALITY_KEYPOINTS è contenuto nel nome → usa quei coord
+      3) altrimenti prova geocoding sulla sola località (prima del ' - ')
+      4) fallback: location base (Champoluc-Champlan)
     """
     raw_place = (event.place or "").strip()
+    name_norm = normalize_place(raw_place)
 
-    lat: Optional[float] = None
-    lon: Optional[float] = None
-    label: Optional[str] = None
+    base = ensure_base_location()
+    lat = base["lat"]
+    lon = base["lon"]
+    label = base["label"]
 
-    # 1) Override ski-area precisi
-    for key, (olat, olon) in LOCALITY_OVERRIDES.items():
-        if raw_place.lower().startswith(key.lower()):
+    # 1) match su token località note (piste)
+    matched = False
+    for token, (olat, olon, descr) in LOCALITY_KEYPOINTS.items():
+        if token in name_norm:
             lat, lon = olat, olon
-            label = f"🏁 {key} — IT"
+            label = f"🏁 {descr}"
+            matched = True
             break
 
-    # 2) Se non ho override, provo geocoding sulla LOCALITÀ pura
-    if lat is None or lon is None:
+    # 2) se non ho match, provo geocoding sulla località "pura"
+    if not matched:
         # es. "Frachey - Ayas" -> "Frachey"
         query_name = raw_place.split("(")[0].strip() or raw_place
         if " - " in query_name:
             query_name = query_name.split(" - ")[0].strip()
-
-        base = ensure_base_location()
-        lat = base["lat"]
-        lon = base["lon"]
-        label = base["label"]
 
         geo = geocode_race_place(query_name)
         if geo:
