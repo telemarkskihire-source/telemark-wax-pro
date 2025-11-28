@@ -122,52 +122,56 @@ _FIS_PROVIDER = FISCalendarProvider()
 _ASIVA_PROVIDER = ASIVACalendarProvider()
 _RACE_SERVICE = RaceCalendarService(_FIS_PROVIDER, _ASIVA_PROVIDER)
 
+
+    
+    
 # ---------------------- GEOCODER GARE --------------------------
 MIN_ELEVATION_M = 1000.0
 UA = {"User-Agent": "telemark-wax-pro/2.0"}
 
-# Punti chiave per località sciistiche (zona piste, non il paese in fondo)
-LOCALITY_KEYPOINTS: Dict[str, tuple[float, float, str]] = {
-    # Ayas / Champoluc / Frachey / Antagnod
-    "champoluc": (45.8365, 7.7318, "Champoluc – Crest / Telemark"),
-    "frachey": (45.8234, 7.7188, "Frachey – funifor"),
-    "antagnod": (45.8070, 7.6860, "Antagnod – ski area"),
-    # Pila / Gressan
-    "pila": (45.6205, 7.3237, "Pila – ski area"),
-    # Cervinia / Valtournenche
-    "cervinia": (45.9366, 7.6290, "Breuil Cervinia – ski area"),
-    "valtournenche": (45.8740, 7.6200, "Valtournenche – Salette"),
-    # Monte Rosa
-    "gressoney la trinite": (45.8240, 7.8380, "Gressoney-La-Trinité – Staffal"),
-    "gressoney saint jean": (45.7790, 7.8280, "Gressoney-Saint-Jean – Weissmatten"),
-    # Altre VdA
-    "la thuile": (45.7200, 6.9500, "La Thuile – Les Suches"),
-    "torgnon": (45.8090, 7.5710, "Torgnon – Chantorné"),
-    "champorcher": (45.6300, 7.5830, "Champorcher – Laris"),
-    "crevacol": (45.8430, 7.1870, "Crevacol – ski area"),
-    "valgrisenche": (45.6410, 7.0370, "Valgrisenche – ski area"),
-}
+# punti "partenza impianti" principali (affinabili a mano)
+# NB: sono approssimativi, puoi correggere numeri lat/lon se hai i tuoi GPX
+import unicodedata
+import re
 
 
-def normalize_place(txt: str) -> str:
-    """
-    Normalizza il nome località:
-    - rimuove accenti
-    - porta in minuscolo
-    - sostituisce -, /, (), virgola, punto con spazi
-    - compatta gli spazi
-    """
-    if not txt:
+def _norm_place_key(s: str) -> str:
+    """Normalizza una stringa di località in una chiave compatta."""
+    if not s:
         return ""
-    # rimuovi accenti
-    txt = unicodedata.normalize("NFKD", txt)
-    txt = "".join(c for c in txt if not unicodedata.combining(c))
-    txt = txt.lower()
-    # sostituisco vari separatori con spazio
-    for ch in [",", ".", "'", "’", "(", ")", "/", "-"]:
-        txt = txt.replace(ch, " ")
-    txt = " ".join(txt.split())
-    return txt
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(ch for ch in s if not unicodedata.combining(ch))
+    s = s.lower()
+    # uniforma separatori
+    s = s.replace("'", " ").replace("-", " ")
+    s = re.sub(r"\s+", " ", s).strip()
+    return s.replace(" ", "")
+
+
+LOCALITY_LIFT_POINTS = {
+    # Monterosa / Ayas
+    _norm_place_key("Champoluc"): (45.8292, 7.7337),        # partenza funivia Crest
+    _norm_place_key("Frachey"): (45.8363, 7.7462),          # partenza funifor Frachey
+    _norm_place_key("Antagnod - Ayas"): (45.8139, 7.7246),
+
+    # Pila
+    _norm_place_key("Pila - Gressan"): (45.7427, 7.3189),   # stazione a monte Pila (campo gare)
+    _norm_place_key("Pila"): (45.7427, 7.3189),
+
+    # Gressoney
+    _norm_place_key("Gressoney - La - Trinité"): (45.8151, 7.8273),
+    _norm_place_key("Gressoney - Saint - Jean"): (45.7765, 7.8240),
+
+    # Cervino
+    _norm_place_key("Breuil Cervinia"): (45.9365, 7.6297),
+    _norm_place_key("Valtournenche"): (45.8853, 7.6226),
+
+    # Altre VdA
+    _norm_place_key("La Thuile"): (45.7187, 6.9475),
+    _norm_place_key("Torgnon"): (45.8067, 7.5684),
+    _norm_place_key("Champorcher"): (45.6122, 7.6332),
+    _norm_place_key("Valgrisenche"): (45.6569, 7.0369),
+}
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -249,41 +253,31 @@ def race_event_label(ev: RaceEvent) -> str:
 
 
 def center_ctx_on_race_location(ctx: Dict[str, Any], event: RaceEvent) -> Dict[str, Any]:
-    """
-    Centra la mappa sulla LOCALITÀ di gara (Champoluc, Frachey, Pila, ecc.)
-    e non sul comune.
-
-    Logica:
-      1) normalizza event.place
-      2) se un token di LOCALITY_KEYPOINTS è contenuto nel nome → usa quei coord piste
-      3) altrimenti prova geocoding sulla località (prima del ' - ')
-      4) fallback: location base (Champoluc-Champlan)
-    """
     raw_place = (event.place or "").strip()
-    name_norm = normalize_place(raw_place)
+
+    # 1) prendi solo la parte "località" prima di "- Ayas", ecc.
+    candidate = raw_place
+    for sep in [" - ", "–", "/"]:
+        if sep in candidate:
+            candidate = candidate.split(sep)[0].strip()
+            break
+
+    # se è tipo "Champoluc - Ayas" → "Champoluc"
+    # "Gressoney - La - Trinité" rimane intera (ci pensa la normalizzazione)
+    norm = _norm_place_key(candidate)
 
     base = ensure_base_location()
     lat = base["lat"]
     lon = base["lon"]
     label = base["label"]
 
-    # 1) match su token località note (piste)
-    matched = False
-    for token, (olat, olon, descr) in LOCALITY_KEYPOINTS.items():
-        if token in name_norm:
-            lat, lon = olat, olon
-            label = f"🏁 {descr}"
-            matched = True
-            break
-
-    # 2) se non ho match, provo geocoding sulla località "pura"
-    if not matched:
-        # es. "Frachey - Ayas" -> "Frachey"
-        query_name = raw_place.split("(")[0].strip() or raw_place
-        if " - " in query_name:
-            query_name = query_name.split(" - ")[0].strip()
-
-        geo = geocode_race_place(query_name)
+    # 2) se abbiamo un punto impianto noto, usiamo quello
+    if norm in LOCALITY_LIFT_POINTS:
+        lat, lon = LOCALITY_LIFT_POINTS[norm]
+        label = f"{candidate} · partenza impianti (preset)"
+    else:
+        # 3) fallback: geocoding generico montano
+        geo = geocode_race_place(candidate)
         if geo:
             lat = geo["lat"]
             lon = geo["lon"]
