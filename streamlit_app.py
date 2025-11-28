@@ -6,9 +6,8 @@ from __future__ import annotations
 import os
 import sys
 import importlib
-from dataclasses import dataclass
 from datetime import datetime, date as Date, time as dtime, timedelta
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any
 
 import requests
 import pandas as pd
@@ -21,7 +20,6 @@ for name in list(sys.modules.keys()):
     if name == "core" or name.startswith("core."):
         del sys.modules[name]
 
-# --- IMPORT MODULI CORE ---
 from core.i18n import L
 from core.search import (
     country_selectbox,
@@ -42,13 +40,13 @@ from core.race_events import (
 from core.race_tuning import (
     Discipline,
     SkierLevel as TuneSkierLevel,
-    SnowType,
-    TuningParamsInput,
     get_tuning_recommendation,
 )
 from core.race_integration import get_wc_tuning_for_event, SkierLevel as WCSkierLevel
 from core import meteo as meteo_mod
 from core import wax_logic as wax_mod
+
+# selettore sci spostato in core/pages/ski_selector.py
 from core.pages.ski_selector import recommend_skis_for_day
 
 import core.search as search_mod  # debug
@@ -199,9 +197,35 @@ def geocode_race_place(query: str) -> Optional[Dict[str, Any]]:
 
 # ---------------------- SUPPORTO -------------------------------
 def ensure_base_location() -> Dict[str, Any]:
+    """
+    Restituisce la località "base" da usare:
+      - se in session_state ci sono lat/lon (click mappa o gara), usa quelli
+      - altrimenti usa la selezione corrente del searchbox
+      - fallback: Champoluc di default
+    """
     sel = get_current_selection()
+
+    lat_ss = st.session_state.get("lat")
+    lon_ss = st.session_state.get("lon")
+    label_ss = st.session_state.get("place_label")
+
+    if lat_ss is not None and lon_ss is not None:
+        if label_ss:
+            label = label_ss
+        elif sel is not None:
+            label = sel.get("label", "Località personalizzata")
+        else:
+            label = "Località personalizzata"
+        return {
+            "lat": float(lat_ss),
+            "lon": float(lon_ss),
+            "label": label,
+            "source": "session",
+        }
+
     if sel:
         return sel
+
     return {
         "lat": 45.83333,
         "lon": 7.73333,
@@ -377,9 +401,7 @@ if page == "Località & Mappa":
             }
         ).set_index("time")
 
-        st.caption(
-            "Grafici riferiti all'intera giornata (00–24) per la località selezionata."
-        )
+        st.caption("Grafici riferiti all'intera giornata (00–24) per la località selezionata.")
         df_reset = df.reset_index()
 
         # ---- prepara dati per modulo wax ----
@@ -646,7 +668,7 @@ if page == "Località & Mappa":
             st.info("Non è stato possibile calcolare il tuning dinamico per questa località.")
         else:
             rec_loc = get_tuning_recommendation(dyn_loc.input_params)
-            side_angle = 90.0 - rec_loc.side_bevel_deg
+            side_angle = 90.0 - rec_loc.side_bevel_deg  # 87°, 88° ecc.
 
             c1t, c2t, c3t = st.columns(3)
             c1t.metric("Angolo lamina (side)", f"{side_angle:.1f}°")
@@ -670,7 +692,7 @@ if page == "Località & Mappa":
         wax_mod.render_wax(T, ctx)
 
 # =====================================================
-# PAGINA 2: RACING / CALENDARI  (versione “buona” ripristinata)
+# PAGINA 2: RACING / CALENDARI
 # =====================================================
 else:
     st.markdown("## 🏁 Racing / Calendari gare")
@@ -730,18 +752,9 @@ else:
     with c4:
         months_labels = [
             "Tutti i mesi",
-            "Gennaio",
-            "Febbraio",
-            "Marzo",
-            "Aprile",
-            "Maggio",
-            "Giugno",
-            "Luglio",
-            "Agosto",
-            "Settembre",
-            "Ottobre",
-            "Novembre",
-            "Dicembre",
+            "Gennaio", "Febbraio", "Marzo", "Aprile",
+            "Maggio", "Giugno", "Luglio", "Agosto",
+            "Settembre", "Ottobre", "Novembre", "Dicembre",
         ]
         month_choice = st.selectbox(
             "Mese (FIS + ASIVA)",
@@ -830,11 +843,11 @@ else:
         st.markdown(
             f'<div class="card">'
             f'<div class="small"><strong>Gara selezionata:</strong> '
-            f"{race_event_label(selected_event)}</div>"
+            f'{race_event_label(selected_event)}</div>'
             f'<div class="small">Partenza prevista: '
             f'{race_datetime.strftime("%Y-%m-%d · %H:%M")}</div>'
             f'<div class="small"><strong>Località mappa per questa gara:</strong> '
-            f"{ctx.get('place_label','')}</div>"
+            f'{ctx.get("place_label","")}</div>'
             f"</div>",
             unsafe_allow_html=True,
         )
@@ -1051,12 +1064,10 @@ else:
             )
 
             if dyn is None:
-                st.info(
-                    "Non è stato possibile calcolare il tuning dinamico per questa gara."
-                )
+                st.info("Non è stato possibile calcolare il tuning dinamico per questa gara.")
             else:
                 rec = get_tuning_recommendation(dyn.input_params)
-                side_angle = 90.0 - rec.side_bevel_deg
+                side_angle = 90.0 - rec.side_bevel_deg  # 87°, 88° ecc.
 
                 c1t, c2t, c3t = st.columns(3)
                 c1t.metric("Angolo lamina (side)", f"{side_angle:.1f}°")
