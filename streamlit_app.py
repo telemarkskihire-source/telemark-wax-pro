@@ -21,6 +21,7 @@ for name in list(sys.modules.keys()):
     if name == "core" or name.startswith("core."):
         del sys.modules[name]
 
+# --- IMPORT MODULI CORE ---
 from core.i18n import L
 from core.search import (
     country_selectbox,
@@ -48,7 +49,7 @@ from core.race_tuning import (
 from core.race_integration import get_wc_tuning_for_event, SkierLevel as WCSkierLevel
 from core import meteo as meteo_mod
 from core import wax_logic as wax_mod
-from core.pages.ski_selector import recommend_skis_for_day  # <-- NUOVO IMPORT
+from core.pages.ski_selector import recommend_skis_for_day
 
 import core.search as search_mod  # debug
 
@@ -376,7 +377,9 @@ if page == "Località & Mappa":
             }
         ).set_index("time")
 
-        st.caption("Grafici riferiti all'intera giornata (00–24) per la località selezionata.")
+        st.caption(
+            "Grafici riferiti all'intera giornata (00–24) per la località selezionata."
+        )
         df_reset = df.reset_index()
 
         # ---- prepara dati per modulo wax ----
@@ -727,9 +730,18 @@ else:
     with c4:
         months_labels = [
             "Tutti i mesi",
-            "Gennaio", "Febbraio", "Marzo", "Aprile",
-            "Maggio", "Giugno", "Luglio", "Agosto",
-            "Settembre", "Ottobre", "Novembre", "Dicembre",
+            "Gennaio",
+            "Febbraio",
+            "Marzo",
+            "Aprile",
+            "Maggio",
+            "Giugno",
+            "Luglio",
+            "Agosto",
+            "Settembre",
+            "Ottobre",
+            "Novembre",
+            "Dicembre",
         ]
         month_choice = st.selectbox(
             "Mese (FIS + ASIVA)",
@@ -818,11 +830,11 @@ else:
         st.markdown(
             f'<div class="card">'
             f'<div class="small"><strong>Gara selezionata:</strong> '
-            f'{race_event_label(selected_event)}</div>'
+            f"{race_event_label(selected_event)}</div>"
             f'<div class="small">Partenza prevista: '
             f'{race_datetime.strftime("%Y-%m-%d · %H:%M")}</div>'
             f'<div class="small"><strong>Località mappa per questa gara:</strong> '
-            f'{ctx.get("place_label","")}</div>'
+            f"{ctx.get('place_label','')}</div>"
             f"</div>",
             unsafe_allow_html=True,
         )
@@ -1039,7 +1051,9 @@ else:
             )
 
             if dyn is None:
-                st.info("Non è stato possibile calcolare il tuning dinamico per questa gara.")
+                st.info(
+                    "Non è stato possibile calcolare il tuning dinamico per questa gara."
+                )
             else:
                 rec = get_tuning_recommendation(dyn.input_params)
                 side_angle = 90.0 - rec.side_bevel_deg
