@@ -3,7 +3,7 @@
 #
 # - RaceEvent: modello unico per eventi FIS / FISI
 # - Federation: enum federazioni
-# - FISCalendarProvider: placeholder (da collegare a FIS / Neveitalia)
+# - FISCalendarProvider: scraping calendario Coppa del Mondo da Neveitalia
 # - FISICalendarProvider: scraping calendario ASIVA (Valle d'Aosta)
 # - RaceCalendarService: aggregatore, usato da streamlit_app.py
 
@@ -14,6 +14,7 @@ from datetime import date, datetime
 from enum import Enum
 from typing import List, Optional
 
+import re
 import requests
 from bs4 import BeautifulSoup
 
@@ -50,18 +51,146 @@ class RaceEvent:
 
 
 # ---------------------------------------------------------------------------
-#  PROVIDER FIS – (placeholder, da completare se/quando serve)
+#  PROVIDER FIS – NEVEITALIA (Coppa del Mondo M/F)
 # ---------------------------------------------------------------------------
+
+_NEVE_MEN_URL = "https://www.neveitalia.it/sport/scialpino/calendario"
+_NEVE_WOMEN_URL = "https://www.neveitalia.it/sport/scialpino/calendario/coppa-del-mondo-femminile"
+
+
+def _map_discipline_from_name(event_name: str) -> Discipline:
+    """
+    Cerca di capire la disciplina dal testo evento Neveitalia.
+    Esempi:
+      - 'Slalom Maschile'        -> SL
+      - 'Slalom Gigante Maschile'-> GS
+      - 'Super-G Maschile'       -> SG
+      - 'Discesa Maschile'       -> DH
+    """
+    t = event_name.lower()
+
+    if "gigante" in t:
+        return Discipline.GS
+    if "slalom" in t:
+        return Discipline.SL
+    if "super-g" in t or "super g" in t or "supergigante" in t:
+        return Discipline.SG
+    if "discesa" in t:
+        return Discipline.DH
+    if "combinata" in t:
+        try:
+            return Discipline.AC  # type: ignore[attr-defined]
+        except Exception:
+            return Discipline.GS
+
+    # fallback
+    return Discipline.GS
+
+
+def _parse_neveitalia_lines(
+    html: str,
+    season: int,
+    category_label: str,
+) -> List[RaceEvent]:
+    """
+    Parsifica il testo di Neveitalia cercando righe tipo:
+
+      2025-10-26 Soelden (AUT)Slalom Gigante Maschile
+      2025-11-28 18:00 Copper Mountain, CO (USA)Slalom Gigante Maschile
+
+    Logica:
+      - match iniziale con data (e opzionale ora)
+      - il resto è "luogo + evento"
+      - usiamo l'ultima parentesi chiusa ) per separare place da nome evento
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    text = soup.get_text("\n")
+
+    events: List[RaceEvent] = []
+
+    # regex: data, opzionale orario, resto riga
+    line_re = re.compile(
+        r"^(?P<date>\d{4}-\d{2}-\d{2})(?:\s+(?P<time>\d{2}:\d{2}))?\s+(?P<rest>.+)$"
+    )
+
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        m = line_re.match(line)
+        if not m:
+            continue
+
+        date_str = m.group("date")
+        rest = m.group("rest").strip()
+
+        # parse data
+        try:
+            dt = datetime.strptime(date_str, "%Y-%m-%d").date()
+        except Exception:
+            continue
+
+        # filtro stagione (es: 2025-26 -> anno iniziale 2025)
+        # teniamo gli eventi con anno == season o season+1
+        if dt.year not in (season, season + 1):
+            continue
+
+        # separa place / event usando l'ultima ')'
+        idx = rest.rfind(")")
+        if idx == -1:
+            # se non troviamo ')', ci rinunciamo: il formato è diverso
+            continue
+
+        place_part = rest[: idx + 1].strip()
+        event_name = rest[idx + 1 :].strip()
+        if not place_part or not event_name:
+            continue
+
+        # estrai nazione fra parentesi (AUT), (FIN) ecc.
+        nation_match = re.search(r"\(([A-Z]{3})\)", place_part)
+        nation = nation_match.group(1) if nation_match else None
+
+        discipline = _map_discipline_from_name(event_name)
+
+        ev = RaceEvent(
+            federation=Federation.FIS,
+            codex=None,  # Neveitalia non espone il codex FIS qui
+            name=event_name,
+            place=place_part,
+            discipline=discipline,
+            start_date=dt,
+            end_date=dt,
+            nation=nation,
+            region=None,          # gare globali, nessuna regione specifica
+            category=category_label,
+            raw_type="CdM",
+            level="WC",
+        )
+        events.append(ev)
+
+    return events
+
 
 class FISCalendarProvider:
     """
     Provider FIS.
 
-    Al momento è un placeholder che restituisce una lista vuota.
-    L'idea è di collegarlo in futuro a:
-    - API ufficiali FIS
-    - oppure scraping/JSON Neveitalia (come versione precedente)
+    Legge il calendario di Coppa del Mondo da Neveitalia per:
+      - Maschile:  _NEVE_MEN_URL
+      - Femminile: _NEVE_WOMEN_URL
+
+    NB: lo scraping dipende dal layout attuale del sito Neveitalia.
+    Se cambiano il formato delle righe, questo sarà il punto da aggiornare.
     """
+
+    USER_AGENT = "telemark-wax-pro/3.0 (FIS-Neveitalia-scraper)"
+
+    def _fetch_html(self, url: str) -> str:
+        headers = {"User-Agent": self.USER_AGENT}
+        r = requests.get(url, headers=headers, timeout=15)
+        r.raise_for_status()
+        return r.text
 
     def list_events(
         self,
@@ -70,12 +199,57 @@ class FISCalendarProvider:
         nation_filter: Optional[str] = None,
         region_filter: Optional[str] = None,
     ) -> List[RaceEvent]:
-        # TODO: implementare collegamento reale al calendario FIS
-        return []
+        events: List[RaceEvent] = []
+
+        # Maschile
+        try:
+            html_m = self._fetch_html(_NEVE_MEN_URL)
+            events_m = _parse_neveitalia_lines(
+                html=html_m,
+                season=season,
+                category_label="WC-M",
+            )
+            events.extend(events_m)
+        except Exception:
+            pass
+
+        # Femminile
+        try:
+            html_w = self._fetch_html(_NEVE_WOMEN_URL)
+            events_w = _parse_neveitalia_lines(
+                html=html_w,
+                season=season,
+                category_label="WC-F",
+            )
+            events.extend(events_w)
+        except Exception:
+            pass
+
+        # filtro disciplina (stringa, es. "GS", "SL") se richiesto
+        if discipline_filter:
+            code = discipline_filter.strip().upper()
+            events = [
+                ev
+                for ev in events
+                if ev.discipline and ev.discipline.value.upper() == code
+            ]
+
+        # filtro nazione se richiesto
+        if nation_filter:
+            nf = nation_filter.strip().upper()
+            events = [
+                ev
+                for ev in events
+                if (ev.nation or "").upper() == nf
+            ]
+
+        # per ora region_filter non è usato (gare globali)
+        return events
 
 
 # ---------------------------------------------------------------------------
 #  PROVIDER FISI (ASIVA Valle d'Aosta) – SCRAPING
+#  (lasciato come nel tuo codice, lo useremo su pagina separata FISI)
 # ---------------------------------------------------------------------------
 
 ASIVA_BASE_URL = "https://www.asiva.it/calendario-gare/"
@@ -133,7 +307,6 @@ def _map_discipline_from_spec(abbr: str) -> Discipline:
     if code == "DH":
         return Discipline.DH
     if code in {"AC", "SC", "COMBI"}:
-        # combinata: usa AC se esiste nel tuo enum, altrimenti GS
         try:
             return Discipline.AC  # type: ignore[attr-defined]
         except Exception:
@@ -173,7 +346,6 @@ class FISICalendarProvider:
         if not table:
             return []
 
-        # usiamo tbody se presente, altrimenti tutte le tr
         tbody = table.find("tbody") or table
         rows = tbody.find_all("tr")
 
@@ -181,8 +353,7 @@ class FISICalendarProvider:
 
         for row in rows:
             cols = row.find_all("td")
-            # struttura vista nello screenshot:
-            # 0=CODEX, 1=PROGR., 2=DATA, 3=TIPO, 4=SPEC., 5=PARTEC., 6=DENOMINAZIONE, ...
+            # struttura vista: 0=CODEX, 1=PROGR., 2=DATA, 3=TIPO, 4=SPEC., 5=PARTEC., 6=DENOMINAZIONE, ...
             if len(cols) < 7:
                 continue
 
@@ -200,9 +371,6 @@ class FISICalendarProvider:
 
                 discipline = _map_discipline_from_spec(spec)
 
-                # Nel calendario ASIVA il luogo è implicito: per ora fissiamo
-                # Valle d'Aosta come place generico. In futuro si può leggere
-                # da eventuali colonne/tooltip aggiuntivi.
                 place = "Valle d'Aosta"
 
                 ev = RaceEvent(
@@ -222,7 +390,6 @@ class FISICalendarProvider:
                 events.append(ev)
 
             except Exception:
-                # se una singola riga fallisce, proseguiamo con le altre
                 continue
 
         return events
@@ -236,9 +403,6 @@ class FISICalendarProvider:
     ) -> List[RaceEvent]:
         """
         Ritorna le gare ASIVA/FISI per la stagione indicata.
-
-        discipline_filter: stringa come "GS", "SL" ecc. (come in streamlit_app)
-        nation_filter / region_filter al momento non usati (Valle d'Aosta fissa).
         """
         try:
             html = self._fetch_html(season_start=season)
@@ -247,7 +411,6 @@ class FISICalendarProvider:
 
         events = self._parse_events_from_html(html, season_start=season)
 
-        # filtro disciplina (stringa, es. "GS") se richiesto
         if discipline_filter:
             code = discipline_filter.strip().upper()
             events = [
@@ -256,7 +419,6 @@ class FISICalendarProvider:
                 if ev.discipline and ev.discipline.value.upper() == code
             ]
 
-        # se un domani vorrai filtrare per nazione/regione, puoi farlo qui
         return events
 
 
@@ -271,7 +433,9 @@ class RaceCalendarService:
     Viene istanziato in streamlit_app.py con:
       _RACE_SERVICE = RaceCalendarService(_FIS_PROVIDER, _FISI_PROVIDER)
 
-    Il metodo principale è list_events(…).
+    list_events(...) unisce:
+      - calendario FIS (Neveitalia, maschile+femminile)
+      - calendario FISI (ASIVA – Valle d'Aosta)
     """
 
     def __init__(
@@ -290,16 +454,9 @@ class RaceCalendarService:
         nation: Optional[str] = None,
         region: Optional[str] = None,
     ) -> List[RaceEvent]:
-        """
-        Restituisce la lista di RaceEvent per:
-          - stagione (anno iniziale)
-          - federazione (FIS, FISI o None = entrambe)
-          - disciplina (stringa tipo "GS", "SL"... oppure None)
-          - filtri nazione/regione (per ora usati solo a livello logico)
-        """
         events: List[RaceEvent] = []
 
-        # FIS
+        # FIS (Neveitalia)
         if federation is None or federation == Federation.FIS:
             try:
                 events_fis = self._fis.list_events(
@@ -310,7 +467,6 @@ class RaceCalendarService:
                 )
                 events.extend(events_fis)
             except Exception:
-                # se FIS fallisce, non blocchiamo tutto
                 pass
 
         # FISI (ASIVA)
@@ -326,6 +482,5 @@ class RaceCalendarService:
             except Exception:
                 pass
 
-        # Ordina per data (e, secondariamente, per nome)
         events.sort(key=lambda ev: (ev.start_date, ev.name))
         return events
