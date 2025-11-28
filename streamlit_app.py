@@ -41,6 +41,8 @@ from core.race_events import (
 from core.race_tuning import (
     Discipline,
     SkierLevel as TuneSkierLevel,
+    SnowType,
+    TuningParamsInput,
     get_tuning_recommendation,
 )
 from core.race_integration import get_wc_tuning_for_event, SkierLevel as WCSkierLevel
@@ -198,7 +200,9 @@ def race_event_label(ev: RaceEvent) -> str:
     d_txt = ev.start_date.strftime("%Y-%m-%d")
     nation = ev.nation or ""
     nat_txt = f" ({nation})" if nation else ""
-    return f"{d_txt} · {disc} · {ev.place}{nat_txt} · {ev.name}"
+    # includo codex per avere label univoca e più info
+    codex_txt = f"[{ev.codex}] " if ev.codex else ""
+    return f"{d_txt} · {disc} · {codex_txt}{ev.place}{nat_txt} · {ev.name}"
 
 
 def center_ctx_on_race_location(ctx: Dict[str, Any], event: RaceEvent) -> Dict[str, Any]:
@@ -243,13 +247,6 @@ page = st.sidebar.radio(
     index=0,
 )
 
-# stile mappa condiviso
-map_style = st.sidebar.selectbox(
-    "Stile mappa",
-    ["OpenStreetMap", "Satellite", "Terrain"],
-    index=0,
-)
-
 search_path = os.path.abspath(search_mod.__file__)
 st.sidebar.markdown("**Debug search.py**")
 st.sidebar.code(search_path, language="bash")
@@ -282,8 +279,7 @@ if page == "Località & Mappa":
 
     # mappa
     st.markdown("## 4) Mappa & piste")
-    ctx["map_style"] = map_style
-    ctx["map_context"] = f"local_{sel['label']}"
+    ctx["map_context"] = "local"
     ctx = render_map(T, ctx) or ctx
 
     # DEM
@@ -317,7 +313,8 @@ else:
     today = datetime.utcnow().date()
     default_season = today.year if today.month >= 7 else today.year - 1
 
-    c1, c2, c3 = st.columns(3)
+    # -------- FILTRI: stagione / federazione / disciplina / mese --------
+    c1, c2, c3, c4 = st.columns(4)
     with c1:
         season = st.number_input(
             "Stagione (anno iniziale)",
@@ -345,23 +342,22 @@ else:
             index=0,
         )
         discipline_filter: Optional[str] = None if disc_choice == "Tutte" else disc_choice
-
-    # ---- filtro MESE (soprattutto per ASIVA) ----
-    month_map = {
-        "Tutti i mesi": None,
-        "Novembre": 11,
-        "Dicembre": 12,
-        "Gennaio": 1,
-        "Febbraio": 2,
-        "Marzo": 3,
-        "Aprile": 4,
-    }
-    month_choice = st.selectbox(
-        "Mese (per ASIVA / gare locali)",
-        list(month_map.keys()),
-        index=0,
-    )
-    month_filter = month_map[month_choice]
+    with c4:
+        month_labels = [
+            "Tutti i mesi",
+            "Gennaio", "Febbraio", "Marzo", "Aprile",
+            "Maggio", "Giugno", "Luglio", "Agosto",
+            "Settembre", "Ottobre", "Novembre", "Dicembre",
+        ]
+        selected_month_label = st.selectbox(
+            "Mese",
+            month_labels,
+            index=0,
+        )
+        if selected_month_label == "Tutti i mesi":
+            month_filter: Optional[int] = None
+        else:
+            month_filter = month_labels.index(selected_month_label)
 
     nation_filter: Optional[str] = None
     region_filter: Optional[str] = None
@@ -422,9 +418,8 @@ else:
         # centra sempre sulla località gara
         ctx = center_ctx_on_race_location(ctx, selected_event)
 
-        # mappa context specifico per forza-refresh (usa label, univoca)
-        ctx["map_style"] = map_style
-        ctx["map_context"] = f"race_{selected_label}"
+        # mappa context specifico per forza-refresh (usa anche codex se presente)
+        ctx["map_context"] = f"race_{selected_event.start_date.isoformat()}_{selected_event.codex or selected_event.place}"
 
         st.markdown(
             f'<div class="card">'
