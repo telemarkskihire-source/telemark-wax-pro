@@ -126,27 +126,26 @@ _RACE_SERVICE = RaceCalendarService(_FIS_PROVIDER, _ASIVA_PROVIDER)
 MIN_ELEVATION_M = 1000.0
 UA = {"User-Agent": "telemark-wax-pro/2.0"}
 
-# Punti chiave per località sciistiche (coordinate zona piste)
-# NB: usiamo token (champoluc, frachey, pila, ecc.) sulla stringa normalizzata
+# Punti chiave per località sciistiche (zona piste, non il paese in fondo)
 LOCALITY_KEYPOINTS: Dict[str, tuple[float, float, str]] = {
     # Ayas / Champoluc / Frachey / Antagnod
-    "champoluc": (45.833, 7.731, "Champoluc – Crest / Telemark"),
-    "frachey": (45.819, 7.717, "Frachey – funifor"),
-    "antagnod": (45.807, 7.686, "Antagnod – ski area"),
+    "champoluc": (45.8365, 7.7318, "Champoluc – Crest / Telemark"),
+    "frachey": (45.8234, 7.7188, "Frachey – funifor"),
+    "antagnod": (45.8070, 7.6860, "Antagnod – ski area"),
     # Pila / Gressan
-    "pila": (45.619, 7.316, "Pila – ski area"),
+    "pila": (45.6205, 7.3237, "Pila – ski area"),
     # Cervinia / Valtournenche
-    "cervinia": (45.935, 7.629, "Breuil Cervinia – ski area"),
-    "valtournenche": (45.884, 7.623, "Valtournenche – Salette"),
+    "cervinia": (45.9366, 7.6290, "Breuil Cervinia – ski area"),
+    "valtournenche": (45.8740, 7.6200, "Valtournenche – Salette"),
     # Monte Rosa
-    "gressoney la trinite": (45.824, 7.838, "Gressoney-La-Trinité – Staffal"),
-    "gressoney saint jean": (45.779, 7.828, "Gressoney-Saint-Jean – Weissmatten"),
+    "gressoney la trinite": (45.8240, 7.8380, "Gressoney-La-Trinité – Staffal"),
+    "gressoney saint jean": (45.7790, 7.8280, "Gressoney-Saint-Jean – Weissmatten"),
     # Altre VdA
-    "la thuile": (45.716, 6.948, "La Thuile – Les Suches"),
-    "torgnon": (45.809, 7.571, "Torgnon – Chantorné"),
-    "champorcher": (45.630, 7.583, "Champorcher – Laris"),
-    "crevacol": (45.843, 7.187, "Crevacol – ski area"),
-    "valgrisenche": (45.641, 7.037, "Valgrisenche – ski area"),
+    "la thuile": (45.7200, 6.9500, "La Thuile – Les Suches"),
+    "torgnon": (45.8090, 7.5710, "Torgnon – Chantorné"),
+    "champorcher": (45.6300, 7.5830, "Champorcher – Laris"),
+    "crevacol": (45.8430, 7.1870, "Crevacol – ski area"),
+    "valgrisenche": (45.6410, 7.0370, "Valgrisenche – ski area"),
 }
 
 
@@ -155,7 +154,7 @@ def normalize_place(txt: str) -> str:
     Normalizza il nome località:
     - rimuove accenti
     - porta in minuscolo
-    - toglie punteggiatura base
+    - sostituisce -, /, (), virgola, punto con spazi
     - compatta gli spazi
     """
     if not txt:
@@ -164,9 +163,9 @@ def normalize_place(txt: str) -> str:
     txt = unicodedata.normalize("NFKD", txt)
     txt = "".join(c for c in txt if not unicodedata.combining(c))
     txt = txt.lower()
-    for ch in [",", ".", "'", "’"]:
+    # sostituisco vari separatori con spazio
+    for ch in [",", ".", "'", "’", "(", ")", "/", "-"]:
         txt = txt.replace(ch, " ")
-    txt = txt.replace(" - ", " ")
     txt = " ".join(txt.split())
     return txt
 
@@ -256,8 +255,8 @@ def center_ctx_on_race_location(ctx: Dict[str, Any], event: RaceEvent) -> Dict[s
 
     Logica:
       1) normalizza event.place
-      2) se un token di LOCALITY_KEYPOINTS è contenuto nel nome → usa quei coord
-      3) altrimenti prova geocoding sulla sola località (prima del ' - ')
+      2) se un token di LOCALITY_KEYPOINTS è contenuto nel nome → usa quei coord piste
+      3) altrimenti prova geocoding sulla località (prima del ' - ')
       4) fallback: location base (Champoluc-Champlan)
     """
     raw_place = (event.place or "").strip()
