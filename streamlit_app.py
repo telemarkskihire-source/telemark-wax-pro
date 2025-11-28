@@ -37,6 +37,7 @@ from core.race_events import (
     ASIVACalendarProvider,
     Federation,
     RaceEvent,
+    ASIVA_PARTEC_CODES,
 )
 from core.race_tuning import (
     Discipline,
@@ -119,19 +120,6 @@ hr {{
 _FIS_PROVIDER = FISCalendarProvider()
 _ASIVA_PROVIDER = ASIVACalendarProvider()
 _RACE_SERVICE = RaceCalendarService(_FIS_PROVIDER, _ASIVA_PROVIDER)
-
-# categorie possibili per ASIVA (Partec.)
-ASIVA_PARTEC_CODES = [
-    "M", "F",
-    "A_M", "A_F",
-    "R_M", "R_F",
-    "P1_M", "P1_F",
-    "P2_M", "P2_F",
-    "U1_M", "U1_F",
-    "U2_M", "U2_F",
-    "GSM", "GSF",
-    "MAM", "MBM", "MCF",
-]
 
 # ---------------------- GEOCODER GARE --------------------------
 MIN_ELEVATION_M = 1000.0
@@ -217,21 +205,10 @@ def race_event_label(ev: RaceEvent) -> str:
 
 
 def center_ctx_on_race_location(ctx: Dict[str, Any], event: RaceEvent) -> Dict[str, Any]:
-    # di base usa le coordinate correnti (se ci sono) oppure default Champoluc
-    base = {
-        "lat": ctx.get("lat"),
-        "lon": ctx.get("lon"),
-        "label": ctx.get("place_label"),
-    }
-    if base["lat"] is None or base["lon"] is None:
-        fallback = ensure_base_location()
-        base["lat"] = fallback["lat"]
-        base["lon"] = fallback["lon"]
-        base["label"] = fallback["label"]
-
     raw_place = event.place or ""
     query_name = raw_place.split("(")[0].strip() or raw_place.strip()
 
+    base = ensure_base_location()
     lat = base["lat"]
     lon = base["lon"]
     label = base["label"]
@@ -299,16 +276,6 @@ if page == "Località & Mappa":
         unsafe_allow_html=True,
     )
 
-    # scelta layout mappa (ripristinata)
-    map_style_choice = st.radio(
-        "Stile mappa",
-        ["Satellite", "OpenStreetMap"],
-        index=0,
-        horizontal=True,
-        key="local_map_style",
-    )
-    ctx["map_style"] = "satellite" if map_style_choice == "Satellite" else "osm"
-
     # mappa
     st.markdown("## 4) Mappa & piste")
     ctx["map_context"] = "local"
@@ -345,7 +312,6 @@ else:
     today = datetime.utcnow().date()
     default_season = today.year if today.month >= 7 else today.year - 1
 
-    # Filtri principali
     c1, c2, c3 = st.columns(3)
     with c1:
         season = st.number_input(
@@ -375,7 +341,7 @@ else:
         )
         discipline_filter: Optional[str] = None if disc_choice == "Tutte" else disc_choice
 
-    # Filtro mese + categoria (per risolvere la lista infinita ASIVA)
+    # --- Filtro mese + categoria ASIVA (Partec.) -----------------------
     c4, c5 = st.columns(2)
     with c4:
         months_labels = [
@@ -394,14 +360,16 @@ else:
             month_filter = months_labels.index(month_choice)  # 1–12
 
     with c5:
-        # toggle categorie ASIVA
+        # toggle categorie ASIVA solo se ha senso
         if federation == Federation.ASIVA or federation is None:
             cat_label = st.selectbox(
                 "Categoria ASIVA (Partec.)",
                 ["Tutte"] + ASIVA_PARTEC_CODES,
                 index=0,
             )
-            category_filter: Optional[str] = None if cat_label == "Tutte" else cat_label
+            category_filter: Optional[str] = (
+                None if cat_label == "Tutte" else cat_label
+            )
         else:
             category_filter = None
 
@@ -423,7 +391,8 @@ else:
     if events and not dev_mode:
         max_delta = timedelta(days=7)
         events = [
-            ev for ev in events
+            ev
+            for ev in events
             if ev.start_date >= today and (ev.start_date - today) <= max_delta
         ]
 
@@ -465,24 +434,17 @@ else:
         # centra sempre sulla località gara
         ctx = center_ctx_on_race_location(ctx, selected_event)
 
-        # mappa context specifico per forza-refresh (usa anche codex se c'è)
-        race_key = f"{selected_event.start_date.isoformat()}_{selected_event.place}_{selected_event.codex or ''}"
-        ctx["map_context"] = f"race_{race_key}"
-
-        # scelta layout mappa in modalità gara
-        race_map_style = st.radio(
-            "Stile mappa gara",
-            ["Satellite", "OpenStreetMap"],
-            index=0,
-            horizontal=True,
-            key="race_map_style",
+        # mappa context specifico per forza-refresh
+        ctx["map_context"] = (
+            f"race_{selected_event.start_date.isoformat()}_{selected_event.place}"
         )
-        ctx["map_style"] = "satellite" if race_map_style == "Satellite" else "osm"
 
         st.markdown(
             f'<div class="card">'
-            f'<div class="small"><strong>Gara selezionata:</strong> {race_event_label(selected_event)}</div>'
-            f'<div class="small">Partenza prevista: {race_datetime.strftime("%Y-%m-%d · %H:%M")}</div>'
+            f'<div class="small"><strong>Gara selezionata:</strong> '
+            f'{race_event_label(selected_event)}</div>'
+            f'<div class="small">Partenza prevista: '
+            f'{race_datetime.strftime("%Y-%m-%d · %H:%M")}</div>'
             f'<div class="small"><strong>Località mappa per questa gara:</strong> '
             f'{ctx.get("place_label","")}</div>'
             f"</div>",
