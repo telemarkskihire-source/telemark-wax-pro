@@ -48,7 +48,7 @@ from core.race_tuning import (
 )
 from core.race_integration import get_wc_tuning_for_event, SkierLevel as WCSkierLevel
 from core import meteo as meteo_mod
-from core import wax_logic  # <<< AGGIUNTO
+from core import wax_logic  # pannello scioline
 
 import core.search as search_mod  # debug
 
@@ -132,7 +132,7 @@ def geocode_race_place(query: str) -> Optional[Dict[str, Any]]:
     """
     Geocoding per le località di gara.
 
-    Logica semplice (come prima, ma più robusta):
+    Logica semplice (robusta):
     1. Query = nome località pulito.
     2. Cerca fino a 10 risultati.
     3. Se trova qualcosa sopra MIN_ELEVATION_M → usa il primo.
@@ -232,9 +232,7 @@ def _clean_place_for_geocoder(raw_place: str) -> str:
     - usa solo la parte prima del ' - ' : "Pila - Gressan" -> "Pila"
     """
     txt = raw_place or ""
-    # taglia alle parentesi
     txt = txt.split("(")[0].strip()
-    # se c'è un " - " prendo il primo pezzo (tipico ASIVA)
     if " - " in txt:
         txt = txt.split(" - ")[0].strip()
     if not txt:
@@ -243,9 +241,7 @@ def _clean_place_for_geocoder(raw_place: str) -> str:
 
 
 def center_ctx_on_race_location(ctx: Dict[str, Any], event: RaceEvent) -> Dict[str, Any]:
-    """
-    Centra la mappa sulla località di gara usando il nome pulito.
-    """
+    """Centra la mappa sulla località di gara usando il nome pulito."""
     query_name = _clean_place_for_geocoder(event.place or "")
 
     base = ensure_base_location()
@@ -506,6 +502,7 @@ else:
 
             c1m, c2m, c3m = st.columns(3)
             c1m.metric("Base bevel", f"{params_dict['base_bevel_deg']:.1f}°")
+            # qui lasciamo ancora il bevel perché è un preset WC "di riferimento"
             c2m.metric("Side bevel", f"{params_dict['side_bevel_deg']:.1f}°")
             c3m.metric("Profilo", str(params_dict["risk_level"]).title())
 
@@ -689,6 +686,10 @@ else:
                 format_func=lambda x: x[0],
             )
             chosen_level = level_choice[1]
+            # memorizzo il livello in session_state per il modulo wax
+            st.session_state["dyn_skier_level"] = getattr(
+                chosen_level, "value", str(chosen_level)
+            ).lower()
 
             injected_flag = st.checkbox(
                 "Pista iniettata / ghiacciata",
@@ -708,9 +709,12 @@ else:
             else:
                 rec = get_tuning_recommendation(dyn.input_params)
 
+                # side_bevel → angolo spigolo (90° - bevel)
+                edge_angle = 90.0 - rec.side_bevel_deg
+
                 c1t, c2t, c3t = st.columns(3)
-                c1t.metric("Base bevel (dinamico)", f"{rec.base_bevel_deg:.1f}°")
-                c2t.metric("Side bevel (dinamico)", f"{rec.side_bevel_deg:.1f}°")
+                c1t.metric("Base bevel", f"{rec.base_bevel_deg:.1f}°")
+                c2t.metric("Angolo spigolo", f"{edge_angle:.1f}°")
                 c3t.metric("Profilo", rec.risk_level.capitalize())
 
                 st.markdown(
@@ -727,4 +731,4 @@ else:
 
             # ---------- SCIOLINE & TUNING DETTAGLIATO (WAX PANEL) ----------
             st.markdown("### 🧊 Scioline & tuning dettagliato")
-            wax_logic.render_wax(T, ctx, profile)
+            wax_logic.render_wax(T, ctx)
