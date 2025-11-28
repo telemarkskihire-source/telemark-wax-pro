@@ -122,146 +122,45 @@ _ASIVA_PROVIDER = ASIVACalendarProvider()
 _RACE_SERVICE = RaceCalendarService(_FIS_PROVIDER, _ASIVA_PROVIDER)
 
 # ---------------------- GEOCODER GARE --------------------------
-# Abbasso un po' la quota minima (prima 1000m) perché alcuni punti utili sono più bassi
-MIN_ELEVATION_M = 600.0
-UA = {"User-Agent": "telemark-wax-pro/4.1"}
+MIN_ELEVATION_M = 1000.0
+UA = {"User-Agent": "telemark-wax-pro/2.0"}
 
-# override manuali per le località tipiche delle gare ASIVA/FIS in VdA
-RACE_PLACE_OVERRIDES: Dict[str, Dict[str, Any]] = {
+# Override locali → coordinate precise ski-area (non comune)
+LOCALITY_OVERRIDES: Dict[str, tuple[float, float]] = {
     # Ayas / Champoluc / Frachey / Antagnod
-    "Champoluc - Ayas": {
-        "lat": 45.828,
-        "lon": 7.746,
-        "label": "🇮🇹  Champoluc, Ayas — IT",
-    },
-    "Champoluc": {
-        "lat": 45.828,
-        "lon": 7.746,
-        "label": "🇮🇹  Champoluc, Ayas — IT",
-    },
-    "Frachey - Ayas": {
-        "lat": 45.821,
-        "lon": 7.731,
-        "label": "🇮🇹  Frachey, Ayas — IT",
-    },
-    "Frachey": {
-        "lat": 45.821,
-        "lon": 7.731,
-        "label": "🇮🇹  Frachey, Ayas — IT",
-    },
-    "Antagnod - Ayas": {
-        "lat": 45.81,
-        "lon": 7.72,
-        "label": "🇮🇹  Antagnod, Ayas — IT",
-    },
-    # Pila / Gressan
-    "Pila - Gressan": {
-        "lat": 45.637,
-        "lon": 7.277,
-        "label": "🇮🇹  Pila - Gressan, Valle d’Aosta — IT",
-    },
-    "Pila-Gressan": {
-        "lat": 45.637,
-        "lon": 7.277,
-        "label": "🇮🇹  Pila - Gressan, Valle d’Aosta — IT",
-    },
-    "Pila": {
-        "lat": 45.637,
-        "lon": 7.277,
-        "label": "🇮🇹  Pila, Valle d’Aosta — IT",
-    },
+    "Champoluc - Ayas": (45.828, 7.746),
+    "Frachey - Ayas": (45.820, 7.720),
+    "Antagnod - Ayas": (45.807, 7.686),
+    # Pila
+    "Pila - Gressan": (45.622, 7.316),
+    "Pila-Gressan": (45.622, 7.316),
     # Cervinia / Valtournenche
-    "Breuil Cervinia": {
-        "lat": 45.936,
-        "lon": 7.629,
-        "label": "🇮🇹  Breuil-Cervinia — IT",
-    },
-    "Valtournenche": {
-        "lat": 45.885,
-        "lon": 7.623,
-        "label": "🇮🇹  Valtournenche — IT",
-    },
-    # La Thuile
-    "La Thuile": {
-        "lat": 45.718,
-        "lon": 6.949,
-        "label": "🇮🇹  La Thuile — IT",
-    },
-    # Gressoney
-    "Gressoney - La - Trinité": {
-        "lat": 45.824,
-        "lon": 7.824,
-        "label": "🇮🇹  Gressoney-La-Trinité — IT",
-    },
-    "Gressoney - Saint - Jean": {
-        "lat": 45.776,
-        "lon": 7.828,
-        "label": "🇮🇹  Gressoney-Saint-Jean — IT",
-    },
-    # Valgrisenche
-    "Valgrisenche": {
-        "lat": 45.651,
-        "lon": 7.024,
-        "label": "🇮🇹  Valgrisenche — IT",
-    },
-    # Crevacol
-    "Crevacol": {
-        "lat": 45.83,
-        "lon": 7.183,
-        "label": "🇮🇹  Crevacol — IT",
-    },
-    # Breuil Cervinia già sopra, ma se arriva senza "Breuil"
-    "Cervinia": {
-        "lat": 45.936,
-        "lon": 7.629,
-        "label": "🇮🇹  Breuil-Cervinia — IT",
-    },
-    # Breuil Cervinia / Breuil
-    "Breuil": {
-        "lat": 45.936,
-        "lon": 7.629,
-        "label": "🇮🇹  Breuil-Cervinia — IT",
-    },
+    "Breuil Cervinia": (45.935, 7.629),
+    "Valtournenche": (45.884, 7.623),
+    # Monte Rosa
+    "Gressoney - La - Trinité": (45.824, 7.838),
+    "Gressoney - Saint - Jean": (45.779, 7.828),
+    # Altre VdA
+    "La Thuile": (45.716, 6.948),
+    "Torgnon": (45.809, 7.571),
+    "Champorcher": (45.630, 7.583),
+    "Crevacol": (45.843, 7.187),
+    "Valgrisenche": (45.641, 7.037),
 }
-
-
-def _flag_from_cc(cc: str) -> str:
-    cc = (cc or "").upper()
-    if len(cc) != 2:
-        return "🏳️"
-    return "".join(chr(127397 + ord(c)) for c in cc)
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def geocode_race_place(query: str) -> Optional[Dict[str, Any]]:
-    """
-    Geocoding per le località gara.
-    1) prova override manuali (Pila, Frachey, Champoluc, ecc.)
-    2) se non trovato, usa open-meteo con filtro quota ammorbidito
-    """
     q = (query or "").strip()
     if not q:
         return None
 
-    # override manuali prima di tutto
-    override = RACE_PLACE_OVERRIDES.get(q)
-    if override:
-        return {
-            "lat": float(override["lat"]),
-            "lon": float(override["lon"]),
-            "label": override["label"],
-        }
-
-    # normalizzazione leggera per nomi tipo "Pila - Gressan"
-    norm = q.replace(" - ", " ").replace("-", " ")
     params = {
-        "name": norm,
+        "name": q,
         "language": "it",
         "count": 10,
         "format": "json",
-        "country": "IT",  # ci concentriamo sull'Italia per queste ricerche
     }
-
     try:
         r = requests.get(
             "https://geocoding-api.open-meteo.com/v1/search",
@@ -275,35 +174,29 @@ def geocode_race_place(query: str) -> Optional[Dict[str, Any]]:
         return None
 
     results = js.get("results") or []
-    if not results:
-        return None
-
-    # scegliamo il risultato con quota più alta sopra la soglia
     best = None
-    best_elev = -9999.0
     for it in results:
         elev = it.get("elevation")
         if elev is None:
             continue
         try:
-            elev_f = float(elev)
+            if float(elev) < MIN_ELEVATION_M:
+                continue
         except Exception:
             continue
-        if elev_f < MIN_ELEVATION_M:
-            continue
-        if elev_f > best_elev:
-            best_elev = elev_f
-            best = it
+        best = it
+        break
 
-    # se con il filtro quota non troviamo nulla, ripieghiamo sul primo risultato grezzo
     if not best:
-        best = results[0]
+        return None
 
     cc = (best.get("country_code") or "").upper()
     name = best.get("name") or ""
     admin1 = best.get("admin1") or best.get("admin2") or ""
     base = f"{name}, {admin1}".strip().replace(" ,", ",")
-    flag = _flag_from_cc(cc)
+    flag = "".join(
+        chr(127397 + ord(c)) for c in cc
+    ) if len(cc) == 2 else "🏳️"
     label = f"{flag}  {base} — {cc}"
 
     return {
@@ -335,19 +228,43 @@ def race_event_label(ev: RaceEvent) -> str:
 
 
 def center_ctx_on_race_location(ctx: Dict[str, Any], event: RaceEvent) -> Dict[str, Any]:
-    raw_place = event.place or ""
-    query_name = raw_place.split("(")[0].strip() or raw_place.strip()
+    """
+    Centra la mappa sulla LOCALITÀ di gara (Pila, Frachey, Valtournenche…),
+    non sul comune. Logica:
+      1) se place matcha una chiave in LOCALITY_OVERRIDES -> usa quelle coord
+      2) altrimenti prova geocoding sulla sola località (prima di ' - ')
+      3) fallback: location base (Champoluc)
+    """
+    raw_place = (event.place or "").strip()
 
-    base = ensure_base_location()
-    lat = base["lat"]
-    lon = base["lon"]
-    label = base["label"]
+    lat: Optional[float] = None
+    lon: Optional[float] = None
+    label: Optional[str] = None
 
-    geo = geocode_race_place(query_name)
-    if geo:
-        lat = geo["lat"]
-        lon = geo["lon"]
-        label = geo["label"]
+    # 1) Override ski-area precisi
+    for key, (olat, olon) in LOCALITY_OVERRIDES.items():
+        if raw_place.lower().startswith(key.lower()):
+            lat, lon = olat, olon
+            label = f"🏁 {key} — IT"
+            break
+
+    # 2) Se non ho override, provo geocoding sulla LOCALITÀ pura
+    if lat is None or lon is None:
+        # es. "Frachey - Ayas" -> "Frachey"
+        query_name = raw_place.split("(")[0].strip() or raw_place
+        if " - " in query_name:
+            query_name = query_name.split(" - ")[0].strip()
+
+        base = ensure_base_location()
+        lat = base["lat"]
+        lon = base["lon"]
+        label = base["label"]
+
+        geo = geocode_race_place(query_name)
+        if geo:
+            lat = geo["lat"]
+            lon = geo["lon"]
+            label = geo["label"]
 
     ctx["lat"] = lat
     ctx["lon"] = lon
@@ -487,11 +404,9 @@ else:
         )
         month_filter: Optional[int] = None
         if month_choice != "Tutti i mesi":
-            # indice 1–12
-            month_filter = months_labels.index(month_choice)
+            month_filter = months_labels.index(month_choice)  # 1–12
 
     with c5:
-        # toggle categorie ASIVA solo se ha senso
         if federation == Federation.ASIVA or federation is None:
             cat_label = st.selectbox(
                 "Categoria ASIVA (Partec.)",
