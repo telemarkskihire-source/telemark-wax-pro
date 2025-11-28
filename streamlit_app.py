@@ -323,12 +323,12 @@ else:
     with c2:
         fed_choice = st.selectbox(
             "Federazione",
-            ["Tutte", "FIS", "ASIVA"],
+            ["Tutte", "FIS", "ASIVA (FISI VdA)"],
             index=1,
         )
         if fed_choice == "FIS":
             federation: Optional[Federation] = Federation.FIS
-        elif fed_choice == "ASIVA":
+        elif fed_choice.startswith("ASIVA"):
             federation = Federation.ASIVA
         else:
             federation = None
@@ -343,7 +343,7 @@ else:
     nation_filter: Optional[str] = None
     region_filter: Optional[str] = None
 
-    with st.spinner("Scarico calendario gare (Neveitalia / ASIVA)…"):
+    with st.spinner("Scarico calendari gare…"):
         events = _RACE_SERVICE.list_events(
             season=season,
             federation=federation,
