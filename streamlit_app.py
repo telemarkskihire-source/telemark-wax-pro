@@ -41,8 +41,6 @@ from core.race_events import (
 from core.race_tuning import (
     Discipline,
     SkierLevel as TuneSkierLevel,
-    SnowType,
-    TuningParamsInput,
     get_tuning_recommendation,
 )
 from core.race_integration import get_wc_tuning_for_event, SkierLevel as WCSkierLevel
@@ -245,6 +243,13 @@ page = st.sidebar.radio(
     index=0,
 )
 
+# stile mappa condiviso
+map_style = st.sidebar.selectbox(
+    "Stile mappa",
+    ["OpenStreetMap", "Satellite", "Terrain"],
+    index=0,
+)
+
 search_path = os.path.abspath(search_mod.__file__)
 st.sidebar.markdown("**Debug search.py**")
 st.sidebar.code(search_path, language="bash")
@@ -277,7 +282,8 @@ if page == "Località & Mappa":
 
     # mappa
     st.markdown("## 4) Mappa & piste")
-    ctx["map_context"] = "local"
+    ctx["map_style"] = map_style
+    ctx["map_context"] = f"local_{sel['label']}"
     ctx = render_map(T, ctx) or ctx
 
     # DEM
@@ -340,6 +346,23 @@ else:
         )
         discipline_filter: Optional[str] = None if disc_choice == "Tutte" else disc_choice
 
+    # ---- filtro MESE (soprattutto per ASIVA) ----
+    month_map = {
+        "Tutti i mesi": None,
+        "Novembre": 11,
+        "Dicembre": 12,
+        "Gennaio": 1,
+        "Febbraio": 2,
+        "Marzo": 3,
+        "Aprile": 4,
+    }
+    month_choice = st.selectbox(
+        "Mese (per ASIVA / gare locali)",
+        list(month_map.keys()),
+        index=0,
+    )
+    month_filter = month_map[month_choice]
+
     nation_filter: Optional[str] = None
     region_filter: Optional[str] = None
 
@@ -350,6 +373,7 @@ else:
             discipline=discipline_filter,
             nation=nation_filter,
             region=region_filter,
+            month=month_filter,
         )
 
     # --- filtro: SOLO gare entro i prossimi 7 giorni (disattivabile in dev) ---
@@ -398,8 +422,9 @@ else:
         # centra sempre sulla località gara
         ctx = center_ctx_on_race_location(ctx, selected_event)
 
-        # mappa context specifico per forza-refresh
-        ctx["map_context"] = f"race_{selected_event.start_date.isoformat()}_{selected_event.place}"
+        # mappa context specifico per forza-refresh (usa label, univoca)
+        ctx["map_style"] = map_style
+        ctx["map_context"] = f"race_{selected_label}"
 
         st.markdown(
             f'<div class="card">'
