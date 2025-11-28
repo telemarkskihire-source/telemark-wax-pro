@@ -7,3 +7,6 @@ streamlit-searchbox
 folium
 streamlit-folium
 beautifulsoup4
+lxml
+html5lib
+requests
