@@ -22,7 +22,11 @@ UA = {"User-Agent": "telemark-wax-pro/3.0"}
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
-def _fetch_downhill_pistes(lat: float, lon: float, radius_km: float = 10.0) -> Tuple[int, List[List[Tuple[float, float]]]]:
+def _fetch_downhill_pistes(
+    lat: float,
+    lon: float,
+    radius_km: float = 10.0,
+) -> Tuple[int, List[List[Tuple[float, float]]]]:
     """
     Scarica le piste di discesa (piste:type=downhill) via Overpass attorno
     a (lat, lon) con raggio in km.
@@ -81,7 +85,14 @@ def _fetch_downhill_pistes(lat: float, lon: float, radius_km: float = 10.0) -> T
                 if mem.get("type") != "way":
                     continue
                 wid = mem.get("ref")
-                way = next((e for e in elements if e.get("type") == "way" and e.get("id") == wid), None)
+                way = next(
+                    (
+                        e
+                        for e in elements
+                        if e.get("type") == "way" and e.get("id") == wid
+                    ),
+                    None,
+                )
                 if not way:
                     continue
                 for nid in way.get("nodes", []):
@@ -105,15 +116,19 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
       - ctx["map_context"] → usato solo per key widget, per forzare refresh
     Ritorna ctx aggiornato con eventuale click sulla mappa.
     """
+    # centro di base
     lat = float(ctx.get("lat", 45.83333))
     lon = float(ctx.get("lon", 7.73333))
 
-    marker_lat = float(ctx.get("marker_lat", lat))
-    marker_lon = float(ctx.get("marker_lon", lon))
+    # se esistono marker salvati in session, usali come default
+    marker_lat = float(ctx.get("marker_lat", st.session_state.get("marker_lat", lat)))
+    marker_lon = float(ctx.get("marker_lon", st.session_state.get("marker_lon", lon)))
 
-    # Il puntatore è la "verità" per lat/lon
+    # sincronizza ctx con il marker corrente
     ctx["lat"] = marker_lat
     ctx["lon"] = marker_lon
+    ctx["marker_lat"] = marker_lat
+    ctx["marker_lon"] = marker_lon
 
     map_context = str(ctx.get("map_context", "default"))
 
@@ -140,7 +155,10 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
 
     # Satellite (Esri World Imagery)
     folium.TileLayer(
-        tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+        tiles=(
+            "https://server.arcgisonline.com/ArcGIS/rest/services/"
+            "World_Imagery/MapServer/tile/{z}/{y}/{x}"
+        ),
         attr="Esri World Imagery",
         name="Satellite",
         control=True,
@@ -155,7 +173,11 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
     piste_count = 0
 
     if show_pistes:
-        piste_count, polylines = _fetch_downhill_pistes(marker_lat, marker_lon, radius_km=10.0)
+        piste_count, polylines = _fetch_downhill_pistes(
+            marker_lat,
+            marker_lon,
+            radius_km=10.0,
+        )
         for coords in polylines:
             folium.PolyLine(
                 locations=coords,
@@ -167,34 +189,20 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
 
     # Render mappa in Streamlit
     map_key = f"map_{map_context}"
-    map_data = st_folium(
-        m,
-        height=450,
-        width=None,
-        key=map_key,
-        return_on_click=True,   # <<< FONDAMENTALE PER AVERE last_clicked
-    )
+
+    # ⚠️ niente width=None: alcune versioni di streamlit_folium non lo accettano
+    map_data = st_folium(m, height=450, key=map_key)
 
     # Gestione click: aggiorna puntatore, ctx e sessione
-    click = None
-    if map_data:
-        # click "vuoto" sulla mappa
-        if map_data.get("last_clicked") is not None:
-            click = map_data["last_clicked"]
-        # click su oggetto (es. polyline) - alcune versioni usano last_object_clicked
-        elif map_data.get("last_object_clicked") is not None:
-            obj = map_data["last_object_clicked"]
-            latlng = obj.get("latlng") or {}
-            if "lat" in latlng and "lng" in latlng:
-                click = {"lat": latlng["lat"], "lng": latlng["lng"]}
+    if map_data and map_data.get("last_clicked") is not None:
+        click_lat = float(map_data["last_clicked"]["lat"])
+        click_lon = float(map_data["last_clicked"]["lng"])
 
-    if click is not None:
-        click_lat = float(click["lat"])
-        click_lon = float(click["lng"])
         ctx["marker_lat"] = click_lat
         ctx["marker_lon"] = click_lon
         ctx["lat"] = click_lat
         ctx["lon"] = click_lon
+
         st.session_state["marker_lat"] = click_lat
         st.session_state["marker_lon"] = click_lon
         st.session_state["lat"] = click_lat
