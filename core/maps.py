@@ -111,6 +111,7 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
     marker_lat = float(ctx.get("marker_lat", lat))
     marker_lon = float(ctx.get("marker_lon", lon))
 
+    # Il puntatore è la "verità" per lat/lon
     ctx["lat"] = marker_lat
     ctx["lon"] = marker_lon
 
@@ -166,12 +167,30 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
 
     # Render mappa in Streamlit
     map_key = f"map_{map_context}"
-    map_data = st_folium(m, height=450, width=None, key=map_key)
+    map_data = st_folium(
+        m,
+        height=450,
+        width=None,
+        key=map_key,
+        return_on_click=True,   # <<< FONDAMENTALE PER AVERE last_clicked
+    )
 
     # Gestione click: aggiorna puntatore, ctx e sessione
-    if map_data and map_data.get("last_clicked") is not None:
-        click_lat = float(map_data["last_clicked"]["lat"])
-        click_lon = float(map_data["last_clicked"]["lng"])
+    click = None
+    if map_data:
+        # click "vuoto" sulla mappa
+        if map_data.get("last_clicked") is not None:
+            click = map_data["last_clicked"]
+        # click su oggetto (es. polyline) - alcune versioni usano last_object_clicked
+        elif map_data.get("last_object_clicked") is not None:
+            obj = map_data["last_object_clicked"]
+            latlng = obj.get("latlng") or {}
+            if "lat" in latlng and "lng" in latlng:
+                click = {"lat": latlng["lat"], "lng": latlng["lng"]}
+
+    if click is not None:
+        click_lat = float(click["lat"])
+        click_lon = float(click["lng"])
         ctx["marker_lat"] = click_lat
         ctx["marker_lon"] = click_lon
         ctx["lat"] = click_lat
