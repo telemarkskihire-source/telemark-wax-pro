@@ -1,19 +1,5 @@
 # streamlit_app.py
 # Telemark · Pro Wax & Tune
-#
-# Pagina 1: Località & Mappa
-#   - Mappa & DEM
-#   - Meteo località
-#   - Sci ideale per la giornata (consiglio sci)
-#   - Tuning dinamico (località)
-#   - Scioline & tuning (wax_logic) basato su meteo locale
-#
-# Pagina 2: Racing / Calendari
-#   - Calendari FIS + ASIVA
-#   - Mappa & DEM sulla località gara
-#   - Meteo giornata di gara
-#   - Tuning dinamico gara
-#   - Scioline & tuning (wax_logic) per la gara
 
 from __future__ import annotations
 
@@ -61,7 +47,7 @@ from core.race_tuning import (
 )
 from core.race_integration import get_wc_tuning_for_event, SkierLevel as WCSkierLevel
 from core import meteo as meteo_mod
-from core import wax_logic as wax_mod  # modulo scioline
+from core import wax_logic as wax_mod
 
 import core.search as search_mod  # debug
 
@@ -144,12 +130,6 @@ UA = {"User-Agent": "telemark-wax-pro/2.0"}
 def geocode_race_place(query: str) -> Optional[Dict[str, Any]]:
     """
     Geocoding per le località di gara / comprensori.
-
-    Logica:
-    1. Query = nome località pulito.
-    2. Cerca fino a 10 risultati.
-    3. Se trova qualcosa sopra MIN_ELEVATION_M → usa il primo.
-    4. Altrimenti prende quello con quota più alta disponibile.
     """
     q = (query or "").strip()
     if not q:
@@ -239,8 +219,8 @@ def race_event_label(ev: RaceEvent) -> str:
 def _clean_place_for_geocoder(raw_place: str) -> str:
     """
     Località "bella" per il geocoder:
-    - toglie la parte tra parentesi: "Soelden (AUT)" -> "Soelden"
-    - usa solo la parte prima del ' - ' : "Pila - Gressan" -> "Pila"
+    - "Soelden (AUT)" -> "Soelden"
+    - "Pila - Gressan" -> "Pila"
     """
     txt = raw_place or ""
     txt = txt.split("(")[0].strip()
@@ -292,7 +272,6 @@ class SkiModel:
 
 
 SKI_DATABASE: List[SkiModel] = [
-    # Pista allround
     SkiModel("Atomic", "Redster Q7 Revoshock C", 2, 3, "mixed", "pista", "Allround pista stabile ma facile."),
     SkiModel("Atomic", "Redster G9 RS", 3, 4, "hard", "gs", "GS race-oriented, raggio lungo."),
     SkiModel("Head", "Supershape e-Magnum", 2, 4, "mixed", "pista", "Carving stretto, molto reattivo."),
@@ -301,12 +280,10 @@ SKI_DATABASE: List[SkiModel] = [
     SkiModel("Rossignol", "Hero Elite MT Ti", 2, 3, "mixed", "pista", "Multi-turn, raggio medio."),
     SkiModel("Salomon", "S/Max 10", 2, 3, "mixed", "pista", "Per sciatori in crescita, facile ma preciso."),
     SkiModel("Salomon", "S/Race GS 12", 3, 4, "hard", "gs", "GS solido per agonisti Master/FIS."),
-    # All-mountain / freeride
     SkiModel("Nordica", "Enforcer 88", 2, 4, "soft", "allmountain", "All-mountain solido, tanta stabilità."),
     SkiModel("Blizzard", "Rustler 9", 2, 4, "soft", "freeride", "Per neve fresca e mista."),
     SkiModel("Volkl", "Deacon 84", 2, 4, "mixed", "allmountain", "Pista larga + fuori traccia leggero."),
     SkiModel("Fischer", "Ranger 96", 2, 4, "soft", "freeride", "Freeride versatile."),
-    # Touring
     SkiModel("Dynafit", "Blacklight 88", 3, 4, "mixed", "touring", "Skialp leggero, per salite lunghe."),
     SkiModel("K2", "Wayback 88", 2, 4, "mixed", "touring", "Touring equilibrato, molto usato."),
 ]
@@ -326,7 +303,6 @@ def recommend_skis_for_day(
     usage_pref: str,
     snow_label: str,
 ) -> List[SkiModel]:
-    # livello utente
     level_map = {
         "beginner": 1,
         "intermediate": 2,
@@ -337,7 +313,6 @@ def recommend_skis_for_day(
 
     cond_code = _cond_code_from_snow_label(snow_label)
 
-    # mapping uso preferito → categorie
     usage_map = {
         "Pista allround": {"pista"},
         "SL / raggi stretti": {"sl"},
@@ -358,7 +333,6 @@ def recommend_skis_for_day(
             continue
         out.append(ski)
 
-    # fallback: se vuoto, rilassa il filtro neve
     if not out:
         for ski in SKI_DATABASE:
             if ski.usage in allowed_usages and ski.level_min <= lvl <= ski.level_max:
@@ -644,7 +618,7 @@ if page == "Località & Mappa":
         # ----- condizione neve al momento di riferimento -----
         ts_ref = datetime.combine(ref_date_free, ref_time_free)
         idx = (wax_df["time_local"] - ts_ref).abs().idxmin()
-        row_ref = wax_df.loc[idx]          # <<< QUI: uso wax_df, non df_reset
+        row_ref = wax_df.loc[idx]
         snow_label = wax_mod.classify_snow(row_ref)
 
         st.markdown(
@@ -774,7 +748,7 @@ if page == "Località & Mappa":
         wax_mod.render_wax(T, ctx)
 
 # =====================================================
-# PAGINA 2: RACING / CALENDARI
+# PAGINA 2: RACING / CALENDARI  (versione “buona” ripristinata)
 # =====================================================
 else:
     st.markdown("## 🏁 Racing / Calendari gare")
@@ -798,7 +772,7 @@ else:
         value=True,
     )
 
-    today = today_utc
+    today = datetime.utcnow().date()
     default_season = today.year if today.month >= 7 else today.year - 1
 
     c1, c2, c3 = st.columns(3)
@@ -990,38 +964,7 @@ else:
 
             df_reset = df.reset_index()
 
-            # dati per modulo wax
-            wax_df = df_reset.copy()
-            wax_df["time_local"] = wax_df["time"]
-            wax_df["T_surf"] = wax_df["snow_temp"]
-            wax_df["RH"] = wax_df["rh"]
-            wax_df["wind"] = wax_df["windspeed"]
-            wax_df["cloud"] = wax_df["cloudcover"] / 100.0
-
-            if "snow_moisture_index" in wax_df.columns:
-                wax_df["liq_water_pct"] = wax_df["snow_moisture_index"] * 5.0
-            else:
-                wax_df["liq_water_pct"] = 0.0
-
-            def _ptyp_r(row):
-                pr = float(row.get("precipitation", 0.0))
-                sf = float(row.get("snowfall", 0.0))
-                if sf > 0.1 and pr - sf > 0.1:
-                    return "mixed"
-                if sf > 0.1:
-                    return "snow"
-                if pr > 0.1:
-                    return "rain"
-                return None
-
-            wax_df["ptyp"] = wax_df.apply(_ptyp_r, axis=1)
-
-            st.session_state["_meteo_res"] = wax_df[
-                ["time_local", "T_surf", "RH", "wind", "liq_water_pct", "cloud", "ptyp"]
-            ]
-            st.session_state["ref_day"] = selected_event.start_date
-
-            # grafici
+            # aria vs neve
             temp_long = df_reset.melt(
                 id_vars="time",
                 value_vars=["temp_air", "snow_temp"],
@@ -1198,7 +1141,3 @@ else:
                     f"- **Note edges**: {rec.notes}\n"
                 )
                 st.caption(dyn.summary)
-
-            # ---------- SCIOLINE & TUNING DETTAGLIATO (GARA) ----------
-            st.markdown("### ❄️ Scioline & tuning dettagliato (gara)")
-            wax_mod.render_wax(T, ctx)
