@@ -300,7 +300,7 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
                 locations=coords,
                 weight=3,
                 opacity=0.9,
-                tooltip=tooltip,
+                tooltip=tooltip,  # <-- NOME PISTA COME TOOLTIP
             ).add_to(m)
 
     # marker puntatore
