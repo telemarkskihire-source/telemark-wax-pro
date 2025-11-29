@@ -1,48 +1,88 @@
 # core/meteo.py
-# Meteo avanzata per Telemark · Pro Wax & Tune
+# Modello meteo & profilo neve per Telemark · Pro Wax & Tune
 #
-# - Meteo oraria Open-Meteo (3 giorni: ieri, oggi, giorno gara)
-# - Stima temperatura neve per ora (snow_temp)
-#   · memoria neve sui 2 giorni precedenti
-#   · influenza di:
-#       - temperatura aria
-#       - ombreggiatura (esposizione + orario + nuvolosità)
-#       - vento
-#       - nevicate recenti
-# - Indici:
-#   · shade_index 0–1 (0 pieno sole, 1 piena ombra / luce piatta)
-#   · snow_moisture_index 0–1 (0 secca, 1 molto bagnata)
-#   · glide_index 0–1 (scorrevolezza)
-# - Funzione per derivare parametri di tuning dinamico
-#   (snow_temp_c, snow_type) da passare a core.race_tuning.get_tuning_recommendation
-# - Calcolo Visible Light Transmission consigliato per lenti (VLT)
+# - Fetch da Open-Meteo (hourly) per giorno/località
+# - Costruzione profilo:
+#     · temperatura aria
+#     · temperatura neve (con bias di calibrazione)
+#     · umidità, vento, copertura nuvole
+#     · indici: shade_index, snow_moisture_index, glide_index
+# - Tuning dinamico: costruisce TuningParamsInput per la gara
+# - Output:
+#     · MeteoProfile
+#     · DynamicTuningResult (con vlt_pct e vlt_label)
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
-from typing import Dict, Any, Optional, List
+from datetime import datetime, date as Date, timedelta
+from typing import List, Optional, Dict, Any
 
-import numpy as np
+import math
 import requests
-import streamlit as st
+import pandas as pd
 
-from .race_tuning import SnowType, Discipline, SkierLevel, TuningParamsInput
+from core.race_tuning import (
+    SnowType,
+    TuningParamsInput,
+    SkierLevel,
+    Discipline,
+)
 
 UA = {"User-Agent": "telemark-wax-pro/3.0"}
 
+# ------------------------------------------------------------------
+# Calibrazione temperatura neve (bias globale)
+# Misura reale Champoluc:
+#   modello: ~ -1.5 °C
+#   misura:  ~ -4.7 °C
+#   delta:   ~ -3.2 °C
+# => partiamo da un bias di -3.0 °C (affineremo con altre misure)
+# ------------------------------------------------------------------
+SNOW_TEMP_BIAS_C: float = -3.0
 
-# ---------- chiamata Open-Meteo -------------------------------------------
-@st.cache_data(ttl=900, show_spinner=False)
-def fetch_hourly_meteo(lat: float, lon: float, start: date, end: date) -> Optional[Dict[str, Any]]:
+
+# ------------------------------------------------------------------
+# Dataclass output profilo meteo
+# ------------------------------------------------------------------
+@dataclass
+class MeteoProfile:
+    times: List[datetime]
+    temp_air: List[float]
+    snow_temp: List[float]
+    rh: List[float]
+    cloudcover: List[float]
+    windspeed: List[float]
+    precip: List[float]
+    snowfall: List[float]
+    shade_index: List[float]
+    snow_moisture_index: List[float]
+    glide_index: List[float]
+
+
+@dataclass
+class DynamicTuningResult:
+    input_params: TuningParamsInput
+    snow_type: SnowType
+    vlt_pct: float
+    vlt_label: str
+    summary: str
+
+
+# ------------------------------------------------------------------
+# Fetch da Open-Meteo
+# ------------------------------------------------------------------
+def _fetch_hourly_meteo(
+    lat: float,
+    lon: float,
+    target_day: Date,
+) -> Optional[pd.DataFrame]:
     """
-    Meteo oraria per intervallo [start, end] (inclusi):
-    - temperature_2m (°C)
-    - relativehumidity_2m (%)
-    - cloudcover (%)
-    - windspeed_10m (km/h)
-    - precipitation (mm)
-    - snowfall (cm)
+    Scarica dati orari da Open-Meteo per il giorno target_day su (lat, lon).
+
+    Ritorna DataFrame con colonne:
+      time, temp_air, rh, cloudcover, windspeed, precip, snowfall, sw_rad
+    oppure None in caso di errore.
     """
     params = {
         "latitude": lat,
@@ -50,474 +90,502 @@ def fetch_hourly_meteo(lat: float, lon: float, start: date, end: date) -> Option
         "hourly": ",".join(
             [
                 "temperature_2m",
-                "relativehumidity_2m",
-                "cloudcover",
-                "windspeed_10m",
+                "relative_humidity_2m",
                 "precipitation",
                 "snowfall",
+                "cloudcover",
+                "wind_speed_10m",
+                "shortwave_radiation",
             ]
         ),
-        "start_date": start.isoformat(),
-        "end_date": end.isoformat(),
         "timezone": "auto",
+        "start_date": target_day.isoformat(),
+        "end_date": target_day.isoformat(),
     }
+
     try:
         r = requests.get(
             "https://api.open-meteo.com/v1/forecast",
             params=params,
             headers=UA,
-            timeout=12,
+            timeout=10,
         )
         r.raise_for_status()
         js = r.json() or {}
-        hourly = js.get("hourly")
-        if not hourly:
-            return None
-        return hourly
     except Exception:
         return None
 
+    hourly = js.get("hourly")
+    if not hourly:
+        return None
 
-# ---------- utilità meteo / neve ------------------------------------------
-def _shade_factor(aspect_deg: float, hour_local: float, cloudcover: Optional[float]) -> float:
+    times = hourly.get("time") or []
+    if not times:
+        return None
+
+    df = pd.DataFrame(
+        {
+            "time": pd.to_datetime(times),
+            "temp_air": hourly.get("temperature_2m", []),
+            "rh": hourly.get("relative_humidity_2m", []),
+            "precip": hourly.get("precipitation", []),
+            "snowfall": hourly.get("snowfall", []),
+            "cloudcover": hourly.get("cloudcover", []),
+            "windspeed": hourly.get("wind_speed_10m", []),
+            "sw_rad": hourly.get("shortwave_radiation", []),
+        }
+    )
+
+    # Garantiamo i tipi float
+    for col in [
+        "temp_air",
+        "rh",
+        "precip",
+        "snowfall",
+        "cloudcover",
+        "windspeed",
+        "sw_rad",
+    ]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    df = df.dropna(subset=["temp_air"])
+    if df.empty:
+        return None
+
+    return df
+
+
+# ------------------------------------------------------------------
+# Utility fisiche / indici
+# ------------------------------------------------------------------
+def _local_time_of_day_fraction(ts: datetime) -> float:
     """
-    Restituisce un indice 0–1:
+    Ritorna frazione del giorno locale (0 = mezzanotte, 0.5 = mezzogiorno).
+    """
+    return (ts.hour + ts.minute / 60.0) / 24.0
+
+
+def _compute_shade_index(row: pd.Series) -> float:
+    """
+    Indice ombreggiatura / luce piatta:
       0 = pieno sole
-      1 = piena ombra / luce piatta
-    Usa:
-      - esposizione versante (deg)
-      - orario locale
-      - nuvolosità (%)
+      1 = ombra / luce piatta / cielo coperto
+    Combina radiazione solare e copertura nuvolosa.
     """
-    d = aspect_deg % 360
+    rad = float(row.get("sw_rad", 0.0) or 0.0)
+    cc = float(row.get("cloudcover", 0.0) or 0.0)  # 0–100
 
-    # base da esposizione + orario
-    base = 0.5
+    # Normalizziamo la radiazione in modo robusto
+    # 0 W/m² = notte / ombra totale
+    # ~ 600–800 W/m² = sole pieno
+    rad_norm = max(0.0, min(rad / 700.0, 1.0))
 
-    # mattina
-    if hour_local < 10.0:
-        if 60 <= d <= 150:
-            base = 0.1           # E/SE al sole
-        elif 240 <= d <= 330:
-            base = 0.9           # O/NO in ombra
-        else:
-            base = 0.6
-    # metà giornata
-    elif 10.0 <= hour_local <= 14.0:
-        if (315 <= d <= 360) or (0 <= d <= 45):
-            base = 0.8           # N
-        elif 135 <= d <= 225:
-            base = 0.2           # S
-        else:
-            base = 0.5
-    # pomeriggio
+    # Base: più radiazione -> meno shade
+    shade_from_rad = 1.0 - rad_norm
+
+    # Cloud boost: se nuvoloso, aumentiamo shade
+    cloud_factor = cc / 100.0
+    shade = 0.6 * shade_from_rad + 0.4 * cloud_factor
+
+    return float(max(0.0, min(shade, 1.0)))
+
+
+def _estimate_snow_temp(
+    t_air_c: float,
+    shade_index: float,
+    rh_pct: float,
+    precip_mm: float,
+    snowfall_cm: float,
+    tod_frac: float,
+) -> float:
+    """
+    Stima temperatura neve superficiale (°C) a partire da:
+      - T aria
+      - ombreggiatura
+      - umidità
+      - precipitazione/neve
+      - ora del giorno
+
+    Poi applica il bias globale SNOW_TEMP_BIAS_C.
+    """
+    # 1) base: neve tende ad essere più fredda dell’aria, soprattutto se secca/ombra
+    if t_air_c <= -10:
+        base = t_air_c - 0.5
+    elif t_air_c <= -4:
+        base = t_air_c - 1.0
+    elif t_air_c <= 0:
+        base = t_air_c - 1.5
     else:
-        if 210 <= d <= 300:
-            base = 0.2           # SO/O al sole
-        elif 30 <= d <= 150:
-            base = 0.8           # NE/E in ombra
-        else:
-            base = 0.5
+        # neve intorno allo zero, ma non oltre
+        base = min(t_air_c - 0.5, -0.2)
 
-    # nuvolosità → avvicino verso luce piatta
-    if cloudcover is None:
-        return float(np.clip(base, 0.0, 1.0))
+    # 2) notte vs giorno
+    # notte (0–5 / 19–24) tende a raffreddare neve
+    hour = tod_frac * 24.0
+    if hour < 5 or hour > 19:
+        base -= 0.8  # raffreddamento notturno
 
-    cc = float(cloudcover)
-    if cc >= 85:
-        return float(np.clip(0.8, 0.0, 1.0))
-    if 50 <= cc < 85:
-        return float(np.clip((base + 0.6) / 2.0, 0.0, 1.0))
-    return float(np.clip(base, 0.0, 1.0))
+    # 3) ombra: più shade => più fredda
+    base -= 1.0 * (shade_index - 0.5)  # se shade=1 spinge ~ -0.5, se shade=0 spinge ~ +0.5
+
+    # 4) umidità: aria molto umida vicino allo zero -> neve leggermente più “calda”
+    if t_air_c > -4:
+        if rh_pct > 90:
+            base += 0.5
+        elif rh_pct < 50:
+            base -= 0.5
+
+    # 5) precipitazioni:
+    # - se nevica molto, neve tende verso T aria (ma non oltre 0)
+    if snowfall_cm > 0.5:
+        base = 0.6 * base + 0.4 * min(t_air_c, -0.1)
+
+    # - se piove vicino allo zero, neve si scalda ma resta <= 0
+    if precip_mm > 0.5 and t_air_c > -1.0:
+        base = max(base, -0.3)
+
+    # Applica bias globale di calibrazione (da Champoluc, ~ -3 °C)
+    T_snow_biased = base + SNOW_TEMP_BIAS_C
+
+    # Limiti fisici morbidi (non vogliamo -40 / +2 °C come outlier)
+    T_snow_biased = max(T_snow_biased, -35.0)
+    T_snow_biased = min(T_snow_biased, -0.0)
+
+    return float(T_snow_biased)
 
 
-def _snow_temp_series(
-    times: List[datetime],
-    temp_air: List[float],
-    cloudcover: List[float],
-    windspeed: List[float],
-    precip: List[float],
-    snowfall: List[float],
-    aspect_deg: float,
-) -> np.ndarray:
+def _compute_snow_moisture_index(
+    snow_temp_c: float,
+    rh_pct: float,
+    precip_mm: float,
+    snowfall_cm: float,
+) -> float:
     """
-    Modello temperatura neve:
-    - memoria su più ore/giorni
-    - dipendente da aria, sole/ombra, vento, neve fresca
+    Indice 0–1 di umidità neve.
+
+    0   = neve molto secca / polvere fredda
+    0.5 = compatta / standard
+    1   = bagnata / primaverile
     """
-    n = len(times)
-    if n == 0:
-        return np.array([])
-
-    temp_air = np.array(temp_air, dtype=float)
-    cloudcover = np.array(cloudcover, dtype=float)
-    windspeed = np.array(windspeed, dtype=float)
-    precip = np.array(precip, dtype=float)
-    snowfall = np.array(snowfall, dtype=float)
-
-    # maschera ultime 24h → serve per valutare neve fresca
-    if n == 1:
-        last_24_mask = np.array([True], dtype=bool)
+    # base da temperatura neve
+    if snow_temp_c <= -10:
+        idx = 0.05
+    elif snow_temp_c <= -6:
+        idx = 0.15
+    elif snow_temp_c <= -3:
+        idx = 0.3
+    elif snow_temp_c <= -1:
+        idx = 0.5
     else:
-        ref_time = times[-1] - timedelta(hours=24)
-        last_24_mask = np.array(
-            [t >= ref_time for t in times],
-            dtype=bool,
-        )
+        idx = 0.7
 
-    fresh_snow_mm = float(np.nansum(np.where(last_24_mask, snowfall, 0.0)))
-    # più neve fresca → neve "segue" più l'aria
-    fresh_factor = 1.0 + min(fresh_snow_mm / 10.0, 1.0) * 0.5  # fino a +50%
+    # umidità aria
+    if rh_pct > 90:
+        idx += 0.1
+    elif rh_pct < 50:
+        idx -= 0.1
 
-    # inizializzo neve: media fra minima aria ultimi giorni e 0°C (limitata a 0)
-    if np.isfinite(temp_air).any():
-        min_recent = float(np.nanmin(temp_air))
+    # precipitazioni liquide -> neve più umida
+    if precip_mm > 0.5 and snowfall_cm < 0.1:
+        idx += 0.2
+
+    # neve intensa ma fredda -> può restare relativamente secca
+    if snowfall_cm > 2.0 and snow_temp_c < -3:
+        idx -= 0.1
+
+    return float(max(0.0, min(idx, 1.0)))
+
+
+def _compute_glide_index(
+    snow_temp_c: float,
+    moisture_idx: float,
+    shade_idx: float,
+) -> float:
+    """
+    Indice 0–1 di scorrevolezza teorica.
+    Neve troppo fredda e secca -> poca scorrevolezza
+    Neve leggermente calda e un po’ umida -> massima
+    Neve troppo bagnata -> cala di nuovo
+    """
+    # base da temperatura
+    if snow_temp_c <= -12:
+        base = 0.2
+    elif snow_temp_c <= -6:
+        base = 0.35
+    elif snow_temp_c <= -2:
+        base = 0.55
+    elif snow_temp_c <= -0.5:
+        base = 0.7
     else:
-        min_recent = -5.0
-    snow_t0 = min(0.0, (min_recent * 0.7))
-    snow = np.zeros(n, dtype=float)
-    snow[0] = snow_t0
+        base = 0.6
 
-    for i in range(1, n):
-        Ta = temp_air[i]
-        # orario locale
-        hour_local = times[i].hour + times[i].minute / 60.0
-        cc = cloudcover[i] if np.isfinite(cloudcover[i]) else None
-        w = windspeed[i] if np.isfinite(windspeed[i]) else 0.0
-
-        shade = _shade_factor(aspect_deg, hour_local, cc)
-        sun_gain = 1.0 - shade  # 0 (buio) – 1 (sole pieno)
-
-        # coefficiente di rilassamento neve → aria
-        alpha = 0.08 * fresh_factor + 0.04 * sun_gain
-
-        # raffreddamento vento
-        wind_cool = min(w / 40.0, 1.0) * 0.5  # fino a -0.5 °C/h
-
-        prev = snow[i - 1]
-        target = Ta
-        new = prev + alpha * (target - prev) - wind_cool
-
-        # neve non oltre 0 °C
-        new = min(new, 0.0)
-        snow[i] = new
-
-    return snow
-
-
-def _snow_moisture_index(
-    snow_temp: np.ndarray,
-    rh: np.ndarray,
-    precip: np.ndarray,
-    snowfall: np.ndarray,
-) -> np.ndarray:
-    """
-    Indice 0–1 "bagnato neve":
-    - 0 neve molto fredda + aria secca
-    - 1 neve vicino a 0°C + UR alta + pioggia
-    """
-    n = len(snow_temp)
-    if n == 0:
-        return np.array([])
-
-    # 1) contributo da T neve (0 se <= -12, 1 se >= 0)
-    t = np.clip((snow_temp + 12.0) / 12.0, 0.0, 1.0)
-
-    # 2) umidità relativa
-    rh = np.where(np.isfinite(rh), rh, 60.0)
-    h = np.clip((rh - 40.0) / 55.0, 0.0, 1.0)
-
-    # 3) precipitazioni
-    precip = np.where(np.isfinite(precip), precip, 0.0)
-    snowfall = np.where(np.isfinite(snowfall), snowfall, 0.0)
-
-    rain_effect = np.clip(precip / 2.0, 0.0, 1.0)      # >2 mm/h pieno effetto
-    snow_effect = np.clip(snowfall / 3.0, 0.0, 0.6)    # neve fresca inumidisce un po'
-
-    m = 0.5 * t + 0.3 * h + 0.4 * rain_effect + 0.2 * snow_effect
-    return np.clip(m, 0.0, 1.0)
-
-
-def _glide_index(snow_temp: np.ndarray, moisture: np.ndarray) -> np.ndarray:
-    """
-    Indice 0–1 di "scorrevolezza" teorica:
-    - troppo fredda/secca o troppo bagnata → meno glide
-    - medio (circa -10/-2 e umidità media) → massimo glide
-    """
-    n = len(snow_temp)
-    if n == 0:
-        return np.array([])
-
-    # optimum T: -10 .. -2
-    t = snow_temp
-    t_score = np.clip(1.0 - np.abs((t + 6.0) / 6.0), 0.0, 1.0)
-
-    # optimum moisture ~0.4–0.6
-    m = moisture
-    m_score = 1.0 - np.abs(m - 0.5) * 2.0
-    m_score = np.clip(m_score, 0.0, 1.0)
-
-    g = 0.6 * t_score + 0.4 * m_score
-    return np.clip(g, 0.0, 1.0)
-
-
-@dataclass
-class MeteoProfile:
-    times: List[datetime]
-    temp_air: np.ndarray
-    rh: np.ndarray
-    cloudcover: np.ndarray
-    windspeed: np.ndarray
-    precip: np.ndarray
-    snowfall: np.ndarray
-    snow_temp: np.ndarray
-    shade_index: np.ndarray
-    snow_moisture_index: np.ndarray
-    glide_index: np.ndarray
-
-
-def build_meteo_profile_for_race_day(ctx: Dict[str, Any]) -> Optional[MeteoProfile]:
-    """
-    Profilo meteo completo per la giornata di gara:
-    - se ctx["race_datetime"] esiste → usa quella data,
-      altrimenti usa oggi.
-    - prende meteo da 2 giorni prima fino al giorno gara
-      (memoria neve).
-    - ritorna solo ore del giorno gara (00–24).
-    """
-    lat = float(ctx.get("lat", 45.83333))
-    lon = float(ctx.get("lon", 7.73333))
-    race_dt = ctx.get("race_datetime")
-
-    if isinstance(race_dt, datetime):
-        race_day = race_dt.date()
+    # umidità
+    if moisture_idx < 0.2:
+        base -= 0.1
+    elif 0.2 <= moisture_idx <= 0.6:
+        base += 0.1
     else:
-        race_day = datetime.utcnow().date()
+        base -= 0.05  # troppo bagnata
 
-    start = race_day - timedelta(days=2)
-    end = race_day
+    # ombra: luce piatta / freddo tende a rendere più “appiccicoso”
+    base -= 0.1 * (shade_idx - 0.5)
 
-    hourly = fetch_hourly_meteo(lat, lon, start, end)
-    if hourly is None:
-        return None
-
-    times_str = hourly.get("time") or []
-    if not times_str:
-        return None
-
-    times = [datetime.fromisoformat(t) for t in times_str]
-
-    def arr(name: str, fill: float = np.nan) -> np.ndarray:
-        vals = hourly.get(name) or []
-        if not vals:
-            return np.full(len(times), fill, dtype=float)
-        return np.array(vals, dtype=float)
-
-    temp_air = arr("temperature_2m")
-    rh = arr("relativehumidity_2m")
-    cloud = arr("cloudcover")
-    wind = arr("windspeed_10m")
-    precip = arr("precipitation")
-    snowfall = arr("snowfall")
-
-    # maschera solo giorno gara
-    mask_race = np.array([t.date() == race_day for t in times], dtype=bool)
-    if not mask_race.any():
-        return None
-
-    # esposizione versante: se non esiste → NNO tipico
-    aspect_deg = float(ctx.get("aspect_deg", 330.0))
-
-    # serie completa neve (3 giorni) per memoria
-    snow_full = _snow_temp_series(
-        times=times,
-        temp_air=temp_air,
-        cloudcover=cloud,
-        windspeed=wind,
-        precip=precip,
-        snowfall=snowfall,
-        aspect_deg=aspect_deg,
-    )
-
-    # subset giorno gara
-    times_r = [t for t, m in zip(times, mask_race) if m]
-    Ta_r = temp_air[mask_race]
-    rh_r = rh[mask_race]
-    cc_r = cloud[mask_race]
-    wind_r = wind[mask_race]
-    precip_r = precip[mask_race]
-    snowfall_r = snowfall[mask_race]
-    snow_r = snow_full[mask_race]
-
-    # shade index per ogni ora gara
-    shade_r = []
-    for t, cc_val in zip(times_r, cc_r):
-        h = t.hour + t.minute / 60.0
-        cc_val_f = float(cc_val) if np.isfinite(cc_val) else None
-        shade_r.append(_shade_factor(aspect_deg, h, cc_val_f))
-    shade_r = np.array(shade_r, dtype=float)
-
-    moisture_r = _snow_moisture_index(snow_r, rh_r, precip_r, snowfall_r)
-    glide_r = _glide_index(snow_r, moisture_r)
-
-    return MeteoProfile(
-        times=times_r,
-        temp_air=Ta_r,
-        rh=rh_r,
-        cloudcover=cc_r,
-        windspeed=wind_r,
-        precip=precip_r,
-        snowfall=snowfall_r,
-        snow_temp=snow_r,
-        shade_index=shade_r,
-        snow_moisture_index=moisture_r,
-        glide_index=glide_r,
-    )
+    return float(max(0.0, min(base, 1.0)))
 
 
-# ---------- tuning dinamico basato su meteo -------------------------------
-@dataclass
-class DynamicTuningResult:
-    input_params: TuningParamsInput
-    snow_type: SnowType
-    summary: str  # testo descrittivo per UI
-    vlt_pct: float  # VLT consigliata (0–100 %)
-    vlt_label: str  # descrizione (cat. lente)
-
-
-def _classify_snow_type_from_profile(
+def _classify_snow_type(
     snow_temp_c: float,
     moisture_idx: float,
     injected: bool,
 ) -> SnowType:
     """
-    Traduzione profilo in SnowType logico.
+    Prova a mappare (T neve, umidità, injected) su uno SnowType.
+    Usa nomi "classici" se esistono nella Enum, altrimenti ripiega
+    sul primo elemento disponibile.
     """
-    if injected:
-        return SnowType.ICE
+    # fallback robusto
+    fallback = list(SnowType)[0]
 
-    if snow_temp_c <= -8.0 and moisture_idx < 0.3:
-        return SnowType.DRY
-    if -8.0 < snow_temp_c <= -2.0 and moisture_idx < 0.6:
-        return SnowType.PACKED
-    if snow_temp_c > -2.0 and moisture_idx >= 0.5:
-        return SnowType.WET
+    try:
+        if injected and hasattr(SnowType, "ICE_INJECTED"):
+            return SnowType.ICE_INJECTED  # type: ignore[attr-defined]
 
-    return SnowType.PACKED
+        if snow_temp_c <= -10 and hasattr(SnowType, "VERY_COLD_DRY"):
+            return SnowType.VERY_COLD_DRY  # type: ignore[attr-defined]
+        if snow_temp_c <= -6 and moisture_idx < 0.3 and hasattr(SnowType, "COLD_DRY"):
+            return SnowType.COLD_DRY  # type: ignore[attr-defined]
+        if -6 < snow_temp_c <= -2 and hasattr(SnowType, "COLD_MID"):
+            return SnowType.COLD_MID  # type: ignore[attr-defined]
+        if -2 < snow_temp_c <= -0.5 and moisture_idx <= 0.7 and hasattr(
+            SnowType, "NEAR_ZERO"
+        ):
+            return SnowType.NEAR_ZERO  # type: ignore[attr-defined]
+        if moisture_idx > 0.7 and hasattr(SnowType, "WET"):
+            return SnowType.WET  # type: ignore[attr-defined]
+
+    except Exception:
+        return fallback
+
+    return fallback
 
 
+def _compute_vlt_recommendation(
+    shade_idx: float,
+    cloudcover_pct: float,
+    snowfall_mm: float,
+) -> (float, str):
+    """
+    Stima VLT consigliata (in %) e label descrittivo.
+    Logica semplice ma robusta:
+      - molto sole / poca nuvolosità -> VLT bassa (occhiale scuro)
+      - nuvoloso / flat light / nevicata -> VLT alta (lente chiara)
+    """
+    cc = cloudcover_pct
+    shade = shade_idx
+    snowing = snowfall_mm > 0.2
+
+    # base
+    if snowing or shade > 0.7 or cc > 80:
+        vlt = 55.0  # molto chiaro
+    elif shade > 0.5 or cc > 60:
+        vlt = 45.0
+    elif shade > 0.3 or cc > 40:
+        vlt = 35.0
+    else:
+        vlt = 18.0  # sole pieno
+
+    # clamp
+    vlt = max(8.0, min(vlt, 70.0))
+
+    # label
+    if vlt <= 15:
+        label = "S3 / molto scuro"
+    elif vlt <= 25:
+        label = "S2–S3 / sole forte"
+    elif vlt <= 40:
+        label = "S2 / variabile"
+    elif vlt <= 55:
+        label = "S1–S2 / luce piatta"
+    else:
+        label = "S1 / low light / notte"
+
+    return float(vlt), label
+
+
+# ------------------------------------------------------------------
+# Costruzione profilo giornaliero per località / gara
+# ------------------------------------------------------------------
+def build_meteo_profile_for_race_day(ctx: Dict[str, Any]) -> Optional[MeteoProfile]:
+    """
+    Costruisce un profilo meteo per l'intera giornata di gara/località.
+
+    ctx deve contenere:
+      - "lat", "lon"
+      - "race_datetime": datetime (usato per il giorno)
+    """
+    lat = float(ctx.get("lat", 45.83333))
+    lon = float(ctx.get("lon", 7.73333))
+
+    race_dt: Optional[datetime] = ctx.get("race_datetime")
+    if not isinstance(race_dt, datetime):
+        # se manca, usiamo oggi (UTC) ma è una situazione di fallback
+        race_dt = datetime.utcnow()
+    target_day = race_dt.date()
+
+    df = _fetch_hourly_meteo(lat, lon, target_day)
+    if df is None or df.empty:
+        return None
+
+    # Calcolo degli indici e della T neve
+    snow_temps: List[float] = []
+    shade_idxs: List[float] = []
+    moisture_idxs: List[float] = []
+    glide_idxs: List[float] = []
+
+    for _, row in df.iterrows():
+        ts: datetime = row["time"]
+        tod_frac = _local_time_of_day_fraction(ts)
+
+        shade = _compute_shade_index(row)
+        shade_idxs.append(shade)
+
+        t_air = float(row["temp_air"])
+        rh = float(row.get("rh", 80.0) or 80.0)
+        precip = float(row.get("precip", 0.0) or 0.0)
+        snowfall = float(row.get("snowfall", 0.0) or 0.0)
+
+        # cm approx from mm for neve (non perfetto, ma sufficiente per indice)
+        snowfall_cm = snowfall
+
+        t_snow = _estimate_snow_temp(
+            t_air_c=t_air,
+            shade_index=shade,
+            rh_pct=rh,
+            precip_mm=precip,
+            snowfall_cm=snowfall_cm,
+            tod_frac=tod_frac,
+        )
+        snow_temps.append(t_snow)
+
+        moisture = _compute_snow_moisture_index(
+            snow_temp_c=t_snow,
+            rh_pct=rh,
+            precip_mm=precip,
+            snowfall_cm=snowfall_cm,
+        )
+        moisture_idxs.append(moisture)
+
+        glide = _compute_glide_index(
+            snow_temp_c=t_snow,
+            moisture_idx=moisture,
+            shade_idx=shade,
+        )
+        glide_idxs.append(glide)
+
+    df["snow_temp"] = snow_temps
+    df["shade_index"] = shade_idxs
+    df["snow_moisture_index"] = moisture_idxs
+    df["glide_index"] = glide_idxs
+
+    return MeteoProfile(
+        times=list(df["time"]),
+        temp_air=list(df["temp_air"]),
+        snow_temp=list(df["snow_temp"]),
+        rh=list(df["rh"]),
+        cloudcover=list(df["cloudcover"]),
+        windspeed=list(df["windspeed"]),
+        precip=list(df["precip"]),
+        snowfall=list(df["snowfall"]),
+        shade_index=list(df["shade_index"]),
+        snow_moisture_index=list(df["snow_moisture_index"]),
+        glide_index=list(df["glide_index"]),
+    )
+
+
+# ------------------------------------------------------------------
+# Tuning dinamico basato su profilo meteo
+# ------------------------------------------------------------------
 def build_dynamic_tuning_for_race(
     profile: MeteoProfile,
     ctx: Dict[str, Any],
     discipline: Discipline,
     skier_level: SkierLevel,
-    injected: bool = False,
+    injected: bool,
 ) -> Optional[DynamicTuningResult]:
     """
-    Usa il profilo meteo del giorno gara e il contesto per costruire
-    parametri di tuning dinamico:
-      - snow_temp_c = temperatura neve stimata all'ora di gara
-      - snow_type   = tipologia neve da profilo
-      - vlt_pct     = Visible Light Transmission consigliata per lenti
+    Usa il profilo meteo + info gara per costruire:
+      - TuningParamsInput
+      - classifica SnowType
+      - VLT consigliata
     """
-    race_dt = ctx.get("race_datetime")
+    if profile is None or not profile.times:
+        return None
+
+    race_dt: Optional[datetime] = ctx.get("race_datetime")
     if not isinstance(race_dt, datetime):
-        return None
+        # fallback: mezzogiorno del primo giorno in profilo
+        race_dt = profile.times[0].replace(hour=12, minute=0, second=0, microsecond=0)
 
-    # trova l'indice orario più vicino all'ora di gara
-    best_idx = None
-    best_diff = 9999.0
-    for i, t in enumerate(profile.times):
-        diff = abs((t - race_dt).total_seconds())
-        if diff < best_diff:
-            best_diff = diff
-            best_idx = i
+    # find closest time index
+    times = profile.times
+    deltas = [abs((t - race_dt).total_seconds()) for t in times]
+    idx = int(deltas.index(min(deltas)))
 
-    if best_idx is None:
-        return None
+    snow_temp_c = float(profile.snow_temp[idx])
+    air_temp_c = float(profile.temp_air[idx])
+    rh_pct = float(profile.rh[idx])
+    cloud_pct = float(profile.cloudcover[idx])
+    wind_kmh = float(profile.windspeed[idx])
+    shade_idx = float(profile.shade_index[idx])
+    moist_idx = float(profile.snow_moisture_index[idx])
+    glide_idx = float(profile.glide_index[idx])
+    snowfall_mm = float(profile.snowfall[idx])
+    precip_mm = float(profile.precip[idx])
 
-    snow_temp_c = float(profile.snow_temp[best_idx])
-    temp_air_c = float(profile.temp_air[best_idx])
-    rh = float(profile.rh[best_idx])
-    cloud = float(profile.cloudcover[best_idx])
-    shade_idx = float(profile.shade_index[best_idx])
-    moisture = float(profile.snow_moisture_index[best_idx])
-    glide = float(profile.glide_index[best_idx])
-    wind = float(profile.windspeed[best_idx])
-
-    snow_type = _classify_snow_type_from_profile(
+    snow_type = _classify_snow_type(
         snow_temp_c=snow_temp_c,
-        moisture_idx=moisture,
+        moisture_idx=moist_idx,
         injected=injected,
     )
 
+    vlt_pct, vlt_label = _compute_vlt_recommendation(
+        shade_idx=shade_idx,
+        cloudcover_pct=cloud_pct,
+        snowfall_mm=snowfall_mm,
+    )
+
+    # Costruiamo l'input per il modulo race_tuning
     params = TuningParamsInput(
-        discipline=discipline,
         snow_temp_c=snow_temp_c,
-        air_temp_c=temp_air_c,
+        air_temp_c=air_temp_c,
+        humidity_pct=rh_pct,
         snow_type=snow_type,
-        injected=injected,
+        discipline=discipline,
         skier_level=skier_level,
+        injected=injected,
+        shade_index=shade_idx,
+        moisture_index=moist_idx,
+        glide_index=glide_idx,
+        wind_speed_kmh=wind_kmh,
+        cloudcover_pct=cloud_pct,
+        precip_mm=precip_mm,
+        snowfall_mm=snowfall_mm,
     )
 
-    shade_txt = (
-        "molto in ombra"
-        if shade_idx > 0.7
-        else "parzialmente in ombra"
-        if shade_idx > 0.4
-        else "abbastanza soleggiata"
-    )
-    moisture_txt = (
-        "molto secca"
-        if moisture < 0.25
-        else "leggermente secca"
-        if moisture < 0.4
-        else "compatta / neutra"
-        if moisture < 0.6
-        else "umida"
-        if moisture < 0.8
-        else "molto bagnata"
-    )
-    glide_txt = (
-        "molto scorrevole"
-        if glide > 0.75
-        else "buona scorrevolezza"
-        if glide > 0.55
-        else "scorrevolezza media"
-        if glide > 0.35
-        else "scorrevolezza limitata"
-    )
-
-    # ---------------- VLT consigliata ----------------
-    # brightness sintetico: sole/ombra + nuvole + bagnato/secco neve
-    brightness = (
-        (1.0 - shade_idx) * 0.5
-        + (1.0 - cloud / 100.0) * 0.3
-        + (1.0 - moisture) * 0.2
-    )
-    brightness = float(np.clip(brightness, 0.0, 1.0))
-
-    # mappo brightness (0–1) in VLT 10–70 %
-    vlt_pct = float(np.clip(70.0 - brightness * 50.0, 10.0, 70.0))
-
-    if vlt_pct <= 20:
-        vlt_label = "lente molto scura (cat. 3–4)"
-    elif vlt_pct <= 35:
-        vlt_label = "lente media (cat. 2–3)"
-    else:
-        vlt_label = "lente chiara / flat light (cat. 1–2)"
-
+    # Summary umano
+    dt_str = race_dt.strftime("%Y-%m-%d · %H:%M")
     summary = (
-        f"Alle {race_dt.strftime('%H:%M')} la neve stimata è ~{snow_temp_c:.1f} °C "
-        f"(aria {temp_air_c:.1f} °C), pista {shade_txt}, neve {moisture_txt}, "
-        f"vento ~{wind:.1f} km/h, scorrevolezza {glide_txt} "
-        f"(UR {rh:.0f}%, copertura nuvolosa {cloud:.0f}%)."
+        f"Tuning dinamico per {dt_str} — "
+        f"neve {snow_temp_c:.1f} °C, aria {air_temp_c:.1f} °C, "
+        f"UR {rh_pct:.0f}%, vento {wind_kmh:.0f} km/h, "
+        f"shade {shade_idx:.2f}, moisture {moist_idx:.2f}, "
+        f"glide {glide_idx:.2f}, VLT {vlt_pct:.0f}% ({vlt_label})."
     )
 
     return DynamicTuningResult(
         input_params=params,
         snow_type=snow_type,
-        summary=summary,
         vlt_pct=vlt_pct,
         vlt_label=vlt_label,
+        summary=summary,
     )
