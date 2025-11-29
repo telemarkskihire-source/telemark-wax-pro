@@ -46,8 +46,8 @@ from core.race_integration import get_wc_tuning_for_event, SkierLevel as WCSkier
 from core import meteo as meteo_mod
 from core import wax_logic as wax_mod
 from core.pages.ski_selector import recommend_skis_for_day
-from core import pov as pov_mod  # <-- POV
-from core.pov_3d import render_pov3d_view  # <-- POV 3D
+from core import pov as pov_mod          # POV 2D + estrazione pista
+from core import pov_3d as pov3d_mod     # POV 3D
 
 import core.search as search_mod  # debug
 
@@ -259,7 +259,7 @@ def center_ctx_on_race_location(ctx: Dict[str, Any], event: RaceEvent) -> Dict[s
     return ctx
 
 
-# ---------------------- SIDEBAR (solo lingua + debug) ----------------------
+# ---------------------- SIDEBAR (lingua + debug) ----------------------
 st.sidebar.markdown("### ⚙️")
 
 lang = st.sidebar.selectbox(
@@ -269,10 +269,23 @@ lang = st.sidebar.selectbox(
 )
 T = L["it"] if lang == "IT" else L["en"]
 
+debug_mode = st.sidebar.checkbox("🛠 Debug / Dev info", value=False)
+
 search_path = os.path.abspath(search_mod.__file__)
 st.sidebar.markdown("**Debug search.py**")
 st.sidebar.code(search_path, language="bash")
 st.sidebar.text(f"Search.VERSION: {getattr(search_mod, 'VERSION', SEARCH_VERSION)}")
+
+if debug_mode:
+    st.sidebar.markdown("**Sessione attuale**")
+    st.sidebar.json(
+        {
+            "lat": st.session_state.get("lat"),
+            "lon": st.session_state.get("lon"),
+            "place_label": st.session_state.get("place_label"),
+            "race_selected_label": st.session_state.get("race_selected_label"),
+        }
+    )
 
 # ---------------------- MAIN -------------------------
 st.title("Telemark · Pro Wax & Tune")
@@ -329,21 +342,17 @@ if page == "Località & Mappa":
     st.markdown("## 3) Esposizione & pendenza")
     render_dem(T, ctx)
 
-    # ---------------- POV LOCALITÀ ----------------
+    # ---------------- POV LOCALITÀ (estrazione + 3D) ----------------
+    st.markdown("### 🎥 POV pista (beta)")
     try:
-        ctx = pov_mod.render_pov_view(T, ctx) or ctx
+        # 1) estraggo pista e attivo download POV 2D
+        ctx = pov_mod.render_pov_extract(T, ctx) or ctx
+
+        # 2) se ho una pista, POV 3D integrato
+        if ctx.get("pov_piste_points"):
+            ctx = pov3d_mod.render_pov3d_view(T, ctx) or ctx
     except Exception as e:
         st.info(f"POV non disponibile per questa località: {e}")
-
-    # >>> POV 3D LOCALITÀ
-    piste_points = ctx.get("pov_piste_points")
-    if piste_points:
-        with st.expander("🏔️ POV 3D (beta)", expanded=False):
-            render_pov3d_view(
-                ctx=ctx,
-                piste_points=piste_points,
-                piste_name=ctx.get("pov_piste_name"),
-            )
 
     # ---------------- METEO LOCALITÀ ----------------
     st.markdown("## 4) Meteo località & profilo giornata")
@@ -869,21 +878,14 @@ else:
         st.markdown("### Esposizione & pendenza sulla pista selezionata")
         render_dem(T, ctx)
 
-        # POV GARA
+        # POV GARA (estrazione + 3D)
+        st.markdown("### 🎥 POV gara (beta)")
         try:
-            ctx = pov_mod.render_pov_view(T, ctx) or ctx
+            ctx = pov_mod.render_pov_extract(T, ctx) or ctx
+            if ctx.get("pov_piste_points"):
+                ctx = pov3d_mod.render_pov3d_view(T, ctx) or ctx
         except Exception as e:
             st.info(f"POV non disponibile per questa gara: {e}")
-
-        # >>> POV 3D GARA
-        piste_points_race = ctx.get("pov_piste_points")
-        if piste_points_race:
-            with st.expander("🏔️ POV 3D (beta – gara)", expanded=False):
-                render_pov3d_view(
-                    ctx=ctx,
-                    piste_points=piste_points_race,
-                    piste_name=ctx.get("pov_piste_name"),
-                )
 
         # ---------- Tuning WC di base (preset statico) ----------
         wc = get_wc_tuning_for_event(selected_event, WCSkierLevel.WC)
@@ -894,7 +896,7 @@ else:
             side_wc_angle = 90.0 - params_dict["side_bevel_deg"]
             c1m, c2m, c3m = st.columns(3)
             c1m.metric("Angolo lamina WC (side)", f"{side_wc_angle:.1f}°")
-            c2m.metric("Base bevel", f"{params_dict['base_bevel_deg"]:.1f}°")
+            c2m.metric("Base bevel", f"{params_dict['base_bevel_deg']:.1f}°")
             c3m.metric("Profilo", str(params_dict["risk_level"]).title())
 
             st.markdown(
