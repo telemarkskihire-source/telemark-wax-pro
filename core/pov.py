@@ -1,13 +1,17 @@
 # core/pov.py
 # POV pista · Telemark Pro Wax & Tune
 #
-# Nuova versione:
-# - Filtra piste con coordinate reali (Italia-Alpi)
-# - Mai più fallback (0,0)
-# - DEM integrato tramite get_dem_for_polyline()
-# - POV stabile con slider
-# - Generatore HTML animato (fly-through)
-# - Nessuna interferenza con la mappa principale
+# - Trova la pista downhill OSM più vicina
+# - Filtra coordinate irreali (mai più (0,0) nell'oceano)
+# - Calcola distanza, profilo
+# - Mostra mappa POV 2D con slider
+# - Genera HTML "fly-through"
+# - Espone nel ctx:
+#     · pov_lat / pov_lon
+#     · pov_piste_name
+#     · pov_piste_length_m
+#     · pov_piste_points (per POV 3D)
+#     · pov_distance_profile
 
 from __future__ import annotations
 
@@ -28,11 +32,11 @@ UA = {"User-Agent": "telemark-wax-pro/3.0"}
 
 
 # ---------------------------------------------------------
-# 1) Overpass — fetch piste
+# 1) Overpass — fetch piste downhill
 # ---------------------------------------------------------
 @st.cache_data(ttl=1800, show_spinner=False)
 def _fetch_downhill_pistes(lat: float, lon: float, radius_km: float = 10.0):
-    """Scarica piste downhill via Overpass. Ritorna liste pulite."""
+    """Scarica piste downhill via Overpass. Ritorna (polylines, names)."""
     radius_m = int(radius_km * 1000)
 
     query = f"""
@@ -60,15 +64,16 @@ def _fetch_downhill_pistes(lat: float, lon: float, radius_km: float = 10.0):
     elements = js.get("elements", [])
     nodes = {el["id"]: el for el in elements if el.get("type") == "node"}
 
-    polylines = []
-    names = []
+    polylines: List[List[Tuple[float, float]]] = []
+    names: List[Optional[str]] = []
 
-    def _name(tags):
+    def _name(tags: Dict[str, Any]) -> Optional[str]:
         if not tags:
             return None
         for k in ("piste:name", "name", "ref"):
-            if k in tags and str(tags[k]).strip():
-                return str(tags[k]).strip()
+            val = tags.get(k)
+            if val is not None and str(val).strip():
+                return str(val).strip()
         return None
 
     for el in elements:
@@ -78,7 +83,7 @@ def _fetch_downhill_pistes(lat: float, lon: float, radius_km: float = 10.0):
         if tags.get("piste:type") != "downhill":
             continue
 
-        pts = []
+        pts: List[Tuple[float, float]] = []
 
         if el["type"] == "way":
             for nid in el.get("nodes", []):
@@ -102,7 +107,6 @@ def _fetch_downhill_pistes(lat: float, lon: float, radius_km: float = 10.0):
                     if nd:
                         pts.append((nd["lat"], nd["lon"]))
 
-        # Filtra piste senza coordinate reali (piste mondiali random)
         if len(pts) >= 2 and _valid_polyline(pts):
             polylines.append(pts)
             names.append(_name(tags))
@@ -111,7 +115,7 @@ def _fetch_downhill_pistes(lat: float, lon: float, radius_km: float = 10.0):
 
 
 def _valid_polyline(poly: List[Tuple[float, float]]) -> bool:
-    """Accetta solo piste reali Italia/Alpi (evita coordinate globali)."""
+    """Accetta solo piste in area Italia/Alpi (evita coordinate globali)."""
     for lat, lon in poly:
         if not (35 < lat < 47.7 and 5 < lon < 13.7):
             return False
@@ -121,53 +125,62 @@ def _valid_polyline(poly: List[Tuple[float, float]]) -> bool:
 # ---------------------------------------------------------
 # 2) Utility distanza
 # ---------------------------------------------------------
-def _haversine_m(lat1, lon1, lat2, lon2) -> float:
-    R = 6371000
+def _haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    R = 6371000.0
     dphi = math.radians(lat2 - lat1)
     dlambda = math.radians(lon2 - lon1)
     a = (
-        math.sin(dphi / 2)**2
+        math.sin(dphi / 2.0) ** 2
         + math.cos(math.radians(lat1))
         * math.cos(math.radians(lat2))
-        * math.sin(dlambda / 2)**2
+        * math.sin(dlambda / 2.0) ** 2
     )
-    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+    return R * 2.0 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
 
-def _distance_profile(polyline):
+def _distance_profile(
+    polyline: List[Tuple[float, float]]
+) -> Tuple[List[float], float]:
     dists = [0.0]
-    tot = 0.0
+    total = 0.0
     for i in range(1, len(polyline)):
         lat1, lon1 = polyline[i - 1]
         lat2, lon2 = polyline[i]
         seg = _haversine_m(lat1, lon1, lat2, lon2)
-        tot += seg
-        dists.append(tot)
-    return dists, tot
+        total += seg
+        dists.append(total)
+    return dists, total
 
 
-def _nearest_piste_to_point(lat: float, lon: float, polylines):
-    best_idx = None
+def _nearest_piste_to_point(
+    lat: float,
+    lon: float,
+    polylines: List[List[Tuple[float, float]]],
+) -> Tuple[Optional[int], Optional[float]]:
+    best_idx: Optional[int] = None
     best_d = float("inf")
-    for i, ln in enumerate(polylines):
-        for la, lo in ln:
+    for i, line in enumerate(polylines):
+        for la, lo in line:
             d = _haversine_m(lat, lon, la, lo)
             if d < best_d:
                 best_d = d
                 best_idx = i
-    return best_idx, best_d
+    return best_idx, best_d if best_idx is not None else (None, None)
 
 
 # ---------------------------------------------------------
-# 3) Costruzione HTML POV
+# 3) HTML POV fly-through 2D
 # ---------------------------------------------------------
-def _build_pov_html(piste_points, piste_name, duration_seconds=8):
+def _build_pov_html(
+    piste_points: List[Tuple[float, float]],
+    piste_name: Optional[str],
+    duration_seconds: int = 8,
+) -> str:
     if not piste_points:
         return "<html><body>NO DATA</body></html>"
 
     points_js = json.dumps(piste_points)
     start_lat, start_lon = piste_points[0]
-
     name_label = piste_name or "POV"
 
     N = max(2, len(piste_points))
@@ -198,18 +211,19 @@ map.fitBounds(line.getBounds());
 
 var marker = L.marker(pts[0]).addTo(map);
 
-var i=0;
-var maxI = pts.length-1;
+var i = 0;
+var maxI = pts.length - 1;
 var step = {step_ms};
 
-function animate(){{
-    i++;
-    if(i>maxI) return;
-    marker.setLatLng(pts[i]);
-    map.panTo(pts[i], {{animate:true,duration:step/1000}});
-    if(i<maxI) setTimeout(animate, step);
+function move(){{
+  i++;
+  if(i>maxI) i = maxI;
+  marker.setLatLng(pts[i]);
+  map.panTo(pts[i], {{animate:true, duration:step/1000}});
+  if(i<maxI) requestAnimationFrame(move);
 }}
-setTimeout(animate, 500);
+
+setTimeout(move, 600);
 </script>
 </body>
 </html>
@@ -218,7 +232,7 @@ setTimeout(animate, 500);
 
 
 # ---------------------------------------------------------
-# 4) STREAMLIT POV VIEW
+# 4) Vista Streamlit POV 2D
 # ---------------------------------------------------------
 def render_pov_view(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
     st.markdown("## 🎥 POV pista (beta)")
@@ -238,12 +252,12 @@ def render_pov_view(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
         polylines, names = _fetch_downhill_pistes(base_lat, base_lon)
 
     if not polylines:
-        st.warning("Nessuna pista downhill valida trovata.")
+        st.warning("Nessuna pista downhill valida trovata nei dintorni.")
         return ctx
 
     idx, distm = _nearest_piste_to_point(base_lat, base_lon, polylines)
     if idx is None:
-        st.warning("Impossibile trovare la pista più vicina.")
+        st.warning("Impossibile trovare la pista più vicina per il POV.")
         return ctx
 
     piste = polylines[idx]
@@ -251,69 +265,84 @@ def render_pov_view(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
 
     dists, total_m = _distance_profile(piste)
     if total_m <= 0:
-        st.warning("Pista non valida per POV.")
+        st.warning("Pista non valida per POV (lunghezza nulla).")
         return ctx
 
-    # Slider POV
     col_sl, col_info = st.columns([2, 1])
     with col_sl:
         pct = st.slider(
             "Posizione lungo la pista (POV)",
-            0, 100, 0, 1,
+            min_value=0,
+            max_value=100,
+            value=0,
+            step=1,
             key=f"pov_pct_{ctx.get('map_context','default')}",
         )
     with col_info:
         st.markdown(f"**Lunghezza stimata:** {total_m/1000:.2f} km")
 
-    target = total_m * pct / 100
+    target = total_m * pct / 100.0
     i = 0
     while i < len(dists) - 1 and dists[i] < target:
         i += 1
 
     lat, lon = piste[i]
 
-    # DEM
+    # DEM per info (non blocca se manca)
     dem, bbox = get_dem_for_polyline(piste)
     if dem is None:
         st.info("DEM non disponibile ora (ESRI/SRTM).")
 
-    # Salvo contesto
+    # Salvo contesto anche per POV 3D
     ctx["pov_lat"] = lat
     ctx["pov_lon"] = lon
     ctx["pov_piste_name"] = pname
     ctx["pov_piste_length_m"] = total_m
+    ctx["pov_piste_points"] = piste
+    ctx["pov_distance_profile"] = dists
 
     # Mappa POV
     m = folium.Map(location=[lat, lon], zoom_start=14, control_scale=True)
     folium.TileLayer("OpenStreetMap").add_to(m)
 
-    folium.PolyLine(piste, color="blue", weight=4).add_to(m)
+    folium.PolyLine(piste, color="blue", weight=4, opacity=0.9).add_to(m)
     folium.Marker([lat, lon], icon=folium.Icon(color="red", icon="play")).add_to(m)
 
     if pname:
-        mi = len(piste) // 2
+        mid_idx = len(piste) // 2
         folium.Marker(
-            piste[mi],
-            icon=folium.DivIcon(html=f"<div style='color:white;font-size:11px;text-shadow:0 0 3px black'>{pname}</div>")
+            piste[mid_idx],
+            icon=folium.DivIcon(
+                html=(
+                    "<div style='color:white;font-size:11px;"
+                    "text-shadow:0 0 3px black;'>"
+                    f"{pname}"
+                    "</div>"
+                )
+            ),
         ).add_to(m)
 
     st_folium(m, height=420, key=f"pov_map_{ctx.get('map_context','default')}")
 
-    # Profilo distanza (placeholder per altimetria futura col DEM)
+    # Profilo distanza (proxy altimetria)
     df = pd.DataFrame({"dist_m": dists})
-    df["dist_km"] = df["dist_m"] / 1000
+    df["dist_km"] = df["dist_m"] / 1000.0
     df["idx"] = df.index
 
-    chart = alt.Chart(df).mark_line().encode(
-        x=alt.X("dist_km", title="Distanza (km)"),
-        y=alt.Y("idx", title="Indice punto"),
-    ).properties(height=150)
+    chart = (
+        alt.Chart(df)
+        .mark_line()
+        .encode(
+            x=alt.X("dist_km:Q", title="Distanza lungo pista (km)"),
+            y=alt.Y("idx:Q", title="Indice punto (proxy quota)"),
+        )
+        .properties(height=150)
+    )
     st.altair_chart(chart, use_container_width=True)
 
-    # Download POV HTML
     html = _build_pov_html(piste, pname)
     st.download_button(
-        "⬇️ Scarica POV (HTML animato)",
+        "⬇️ Scarica POV 2D (HTML animato)",
         data=html,
         file_name="telemark_pov.html",
         mime="text/html",
