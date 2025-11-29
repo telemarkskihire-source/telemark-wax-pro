@@ -1,175 +1,222 @@
 # core/pov_3d.py
-# Telemark · Pro Wax & Tune — POV 3D V7
+# POV 3D (viewer HTML) per Telemark · Pro Wax & Tune
 #
-# Genera:
-#   - HTML 3D con camera che segue la pista
-#   - iframe viewer integrato in Streamlit
+# Assunzioni:
+# - ctx["pov_piste_points"] contiene una lista di punti della pista
+#   in uno di questi formati:
+#       [(lat, lon), (lat, lon), ...]
+#       [{"lat": ..., "lon": ...}, ...]
+# - ctx["pov_piste_name"] opzionale (nome pista)
 #
-# La pista deve essere in ctx["pov_piste_points"]:
-#   [{"lat":..., "lon":..., "ele":...}, ...]
+# La funzione principale è:
+#     render_pov3d_view(T, ctx) -> ctx
+#
+# Mostra un viewer "tipo 3D" (animazione in mappa) dentro Streamlit
+# usando un componente HTML standalone.
 
 from __future__ import annotations
 
+from typing import Dict, Any, List, Sequence
 import json
-import uuid
-from typing import List, Dict, Any
 
 import streamlit as st
+from streamlit.components.v1 import html as st_html
 
 
-# -----------------------------------------------------------
-# UTILITY: convert lat/lon/ele → x,y,z con proiezione semplice
-# -----------------------------------------------------------
-def _to_xyz(points: List[Dict[str, float]]) -> List[List[float]]:
+def _normalize_points(raw_points: Sequence[Any]) -> List[List[float]]:
     """
-    Trasforma lat/lon in coordinate locali (metri)
-    mantenendo ele come z.
+    Converte la lista generica di punti in [[lat, lon], ...] float.
+    Accetta:
+      - (lat, lon)
+      - (lat, lon, ele)
+      - {"lat": .., "lon": ..} o chiavi simili
+    """
+    norm: List[List[float]] = []
+
+    for p in raw_points:
+        lat = None
+        lon = None
+
+        # dizionario
+        if isinstance(p, dict):
+            for k in ("lat", "latitude", "y"):
+                if k in p:
+                    lat = p[k]
+                    break
+            for k in ("lon", "lng", "longitude", "x"):
+                if k in p:
+                    lon = p[k]
+                    break
+
+        # tupla / lista
+        elif isinstance(p, (tuple, list)) and len(p) >= 2:
+            lat, lon = p[0], p[1]
+
+        if lat is None or lon is None:
+            continue
+
+        try:
+            lat_f = float(lat)
+            lon_f = float(lon)
+        except Exception:
+            continue
+
+        norm.append([lat_f, lon_f])
+
+    return norm
+
+
+def _build_pov3d_html(points: List[List[float]], name: str) -> str:
+    """
+    Costruisce una pagina HTML standalone con Leaflet:
+    - polyline della pista
+    - marker che scorre automaticamente lungo la pista (animazione)
+    - la mappa segue il marker (panTo)
     """
     if not points:
-        return []
+        points = [[0.0, 0.0]]
 
-    lat0 = points[0]["lat"]
-    lon0 = points[0]["lon"]
+    start_lat, start_lon = points[0]
+    points_js = json.dumps(points)
 
-    out = []
-    for p in points:
-        lat = p["lat"]
-        lon = p["lon"]
-        ele = p.get("ele", 0.0)
+    # durata animazione ~8s
+    n_points = max(2, len(points))
+    total_ms = 8000
+    step_ms = max(30, int(total_ms / n_points))
 
-        x = (lon - lon0) * 40075000 * (3.1415926535 / 180) * (
-            abs(lat0) / 90 if abs(lat0) < 89 else 1
-        ) / 360
-        y = (lat - lat0) * (40075000 / 360)
-        z = ele
+    safe_name = name.replace('"', "'")
 
-        out.append([x, y, z])
-
-    return out
-
-
-# -----------------------------------------------------------
-# GENERA HTML 3D STANDALONE
-# -----------------------------------------------------------
-def build_pov3d_html(xyz: List[List[float]], track_name: str) -> str:
-    if not xyz:
-        return "<html><body><h3>No POV 3D data</h3></body></html>"
-
-    pts_js = json.dumps(xyz)
-    name = track_name or "Pista"
-
-    return f"""<!DOCTYPE html>
-<html>
+    html = f"""<!DOCTYPE html>
+<html lang="it">
 <head>
-<meta charset="utf-8" />
-<title>POV 3D – {name}</title>
-<style>
-html,body {{ margin:0; padding:0; background:#000; overflow:hidden; }}
-#c {{ width:100vw; height:100vh; display:block; }}
-</style>
+  <meta charset="utf-8" />
+  <title>{safe_name} – POV 3D</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link
+    rel="stylesheet"
+    href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+    integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY="
+    crossorigin=""
+  />
+  <style>
+    html, body, #map {{
+      height: 100%;
+      margin: 0;
+      padding: 0;
+      background: #000;
+    }}
+    .pov-label {{
+      color: #f9fafb;
+      font-size: 11px;
+      text-shadow: 0 0 3px #000, 0 0 5px #000;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont,
+                   "Segoe UI", sans-serif;
+    }}
+  </style>
 </head>
 <body>
-<canvas id="c"></canvas>
+  <div id="map"></div>
+  <script
+    src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+    integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="
+    crossorigin="">
+  </script>
+  <script>
+    var points = {points_js};
 
-<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    var map = L.map('map', {{
+      zoomControl: true
+    }}).setView([{start_lat}, {start_lon}], 15);
 
-<script>
-const pts = {pts_js};
+    // Satellite + strade per effetto "3D"
+    L.tileLayer(
+      "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{{z}}/{{y}}/{{x}}",
+      {{
+        maxZoom: 19,
+        attribution: "Esri World Imagery"
+      }}
+    ).addTo(map);
 
-let scene = new THREE.Scene();
-scene.background = new THREE.Color(0x000000);
+    // Polyline pista
+    var line = L.polyline(points, {{
+      color: "#38bdf8",
+      weight: 4,
+      opacity: 0.95
+    }}).addTo(map);
 
-let camera = new THREE.PerspectiveCamera(70, window.innerWidth/window.innerHeight, 0.1, 50000);
-camera.position.set(0, -50, 20);
+    map.fitBounds(line.getBounds());
 
-let renderer = new THREE.WebGLRenderer({{canvas: document.getElementById("c"), antialias:true}});
-renderer.setSize(window.innerWidth, window.innerHeight);
-
-const light = new THREE.DirectionalLight(0xffffff, 1.2);
-light.position.set(50, -50, 200);
-scene.add(light);
-
-const amb = new THREE.AmbientLight(0x888888);
-scene.add(amb);
-
-// Convert piste → curve
-const geom = new THREE.BufferGeometry();
-const flat = pts.flat();
-geom.setAttribute('position', new THREE.Float32BufferAttribute(flat, 3));
-
-const mat = new THREE.LineBasicMaterial({{color:0x66ccff, linewidth:4}});
-const line = new THREE.Line(geom, mat);
-scene.add(line);
-
-// Camera animation
-let i = 0;
-function animate() {{
-    requestAnimationFrame(animate);
-
-    if(i < pts.length) {{
-        let p = pts[i];
-        camera.position.set(p[0], p[1]-20, p[2]+8);
-        camera.lookAt(p[0], p[1], p[2]);
-        i++;
+    // Label centrale
+    var midIdx = Math.floor(points.length / 2);
+    var midLatLng = L.latLng(points[midIdx][0], points[midIdx][1]);
+    var name = "{safe_name}";
+    if (name.length > 0) {{
+      L.marker(midLatLng, {{
+        icon: L.divIcon({{
+          className: "pov-label",
+          html: name
+        }})
+      }}).addTo(map);
     }}
 
-    renderer.render(scene, camera);
-}}
+    // Marker POV (play)
+    var marker = L.marker(points[0], {{
+      icon: L.icon({{
+        iconUrl: "https://unpkg.com/leaflet@1.9.4/dist/images/marker-icon.png",
+        iconAnchor: [12, 41],
+        popupAnchor: [0, -28]
+      }})
+    }}).addTo(map);
 
-animate();
+    var idx = 0;
+    var maxIdx = points.length - 1;
+    var stepMs = {step_ms};
 
-window.addEventListener('resize', ()=>{
-    camera.aspect = window.innerWidth/window.innerHeight;
-    camera.updateProjectionMatrix();
-    renderer.setSize(window.innerWidth, window.innerHeight);
-});
-</script>
+    function step() {{
+      idx += 1;
+      if (idx > maxIdx) {{
+        return;
+      }}
+      var latlng = L.latLng(points[idx][0], points[idx][1]);
+      marker.setLatLng(latlng);
+      map.panTo(latlng, {{ animate: true, duration: stepMs / 1000 }});
+      if (idx < maxIdx) {{
+        setTimeout(step, stepMs);
+      }}
+    }}
 
+    // piccola pausa iniziale, poi parte il "volo"
+    setTimeout(step, 600);
+  </script>
 </body>
 </html>
 """
+    return html
 
 
-# -----------------------------------------------------------
-# STREAMLIT RENDERER (iframe + download)
-# -----------------------------------------------------------
-def render_pov3d_view(T: Dict[str, Any], ctx: Dict[str, Any]) -> Dict[str, Any]:
+def render_pov3d_view(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Richiede:
-        ctx["pov_piste_points"] = [{"lat":..., "lon":..., "ele":...}, ...]
-        ctx["pov_piste_name"]
+    Viewer POV 3D:
+      - usa ctx["pov_piste_points"] come lista di punti
+      - opzionalmente ctx["pov_piste_name"]
+      - embeddizza un HTML con animazione del marker lungo la pista
     """
-    st.markdown("### 🎥 POV 3D (beta)")
-
-    pts = ctx.get("pov_piste_points")
-    name = ctx.get("pov_piste_name", "Pista")
-
-    if not pts:
-        st.info("Nessuna pista disponibile per il POV 3D.")
+    raw_points = ctx.get("pov_piste_points")
+    if not raw_points:
+        # niente pista → niente POV 3D
+        st.info("Nessuna pista disponibile per il POV 3D in questa località.")
         return ctx
 
-    # Convert lat/lon/ele → XYZ
-    xyz = _to_xyz(pts)
+    points = _normalize_points(raw_points)
+    if not points:
+        st.info("Formato punti pista non valido per il POV 3D.")
+        return ctx
 
-    # Generate HTML
-    html = build_pov3d_html(xyz, name)
+    piste_name = ctx.get("pov_piste_name") or "Pista POV"
 
-    # Unique iframe id
-    frame_id = f"pov3d_{uuid.uuid4().hex}"
+    html_data = _build_pov3d_html(points, piste_name)
 
-    # Iframe viewer
-    st.components.v1.html(
-        html,
-        height=450,
-        scrolling=False,
-    )
-
-    # Download button
-    st.download_button(
-        "⬇️ Scarica POV 3D (HTML)",
-        data=html,
-        file_name="pov3d_telemark.html",
-        mime="text/html",
-    )
+    # Mostra il viewer dentro la pagina
+    st_html(html_data, height=420, scrolling=False)
 
     return ctx
