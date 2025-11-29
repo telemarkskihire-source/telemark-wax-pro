@@ -1,187 +1,175 @@
 # core/pov_3d.py
-# POV 3D WebGL generator (V7)
-# Telemark · Pro Wax & Tune
+# Telemark · Pro Wax & Tune — POV 3D V7
+#
+# Genera:
+#   - HTML 3D con camera che segue la pista
+#   - iframe viewer integrato in Streamlit
+#
+# La pista deve essere in ctx["pov_piste_points"]:
+#   [{"lat":..., "lon":..., "ele":...}, ...]
 
 from __future__ import annotations
+
 import json
-import base64
-from typing import List, Dict, Any, Optional
+import uuid
+from typing import List, Dict, Any
+
+import streamlit as st
 
 
-# ---------------------------------------------------------------------
-# Small helper: convert (lat,lon,ele) list → JSON for JS
-# ---------------------------------------------------------------------
-def _encode_points(points: List[Dict[str, float]]) -> str:
+# -----------------------------------------------------------
+# UTILITY: convert lat/lon/ele → x,y,z con proiezione semplice
+# -----------------------------------------------------------
+def _to_xyz(points: List[Dict[str, float]]) -> List[List[float]]:
     """
-    Converte una lista:
-    [{"lat":..., "lon":..., "ele":...}, ...]
-    in una stringa JSON sicura per essere inserita nel JS.
+    Trasforma lat/lon in coordinate locali (metri)
+    mantenendo ele come z.
     """
-    return json.dumps(points, separators=(",", ":"))
+    if not points:
+        return []
+
+    lat0 = points[0]["lat"]
+    lon0 = points[0]["lon"]
+
+    out = []
+    for p in points:
+        lat = p["lat"]
+        lon = p["lon"]
+        ele = p.get("ele", 0.0)
+
+        x = (lon - lon0) * 40075000 * (3.1415926535 / 180) * (
+            abs(lat0) / 90 if abs(lat0) < 89 else 1
+        ) / 360
+        y = (lat - lat0) * (40075000 / 360)
+        z = ele
+
+        out.append([x, y, z])
+
+    return out
 
 
-# ---------------------------------------------------------------------
-# Generate pure HTML (download) for POV 3D
-# ---------------------------------------------------------------------
-def generate_pov3d_html(points: List[Dict[str, float]]) -> str:
-    """
-    Ritorna una pagina HTML completa, autosufficiente,
-    che mostra il POV 3D animato con MapLibre + deck.gl.
+# -----------------------------------------------------------
+# GENERA HTML 3D STANDALONE
+# -----------------------------------------------------------
+def build_pov3d_html(xyz: List[List[float]], track_name: str) -> str:
+    if not xyz:
+        return "<html><body><h3>No POV 3D data</h3></body></html>"
 
-    points deve essere una lista di:
-    {"lat": float, "lon": float, "ele": float}
-    """
-    if not points or len(points) < 2:
-        return "<html><body><h3>Nessun punto per POV 3D</h3></body></html>"
+    pts_js = json.dumps(xyz)
+    name = track_name or "Pista"
 
-    pts_json = _encode_points(points)
-
-    # HTML completo, con MapLibre GL + deck.gl + animazione camera
-    html = f"""<!DOCTYPE html>
+    return f"""<!DOCTYPE html>
 <html>
 <head>
 <meta charset="utf-8" />
-<title>POV 3D – Telemark</title>
+<title>POV 3D – {name}</title>
 <style>
-  html, body {{
-    margin:0; padding:0; overflow:hidden;
-    background:#000;
-    width:100%; height:100%;
-  }}
-  #map {{
-    position:absolute;
-    top:0; left:0; width:100%; height:100%;
-  }}
+html,body {{ margin:0; padding:0; background:#000; overflow:hidden; }}
+#c {{ width:100vw; height:100vh; display:block; }}
 </style>
-
-<!-- MapLibre GL -->
-<link
-  href="https://cdn.jsdelivr.net/npm/maplibre-gl@3.3.1/dist/maplibre-gl.css"
-  rel="stylesheet"
-/>
-<script src="https://cdn.jsdelivr.net/npm/maplibre-gl@3.3.1/dist/maplibre-gl.js"></script>
-
-<!-- deck.gl -->
-<script src="https://cdn.jsdelivr.net/npm/deck.gl@latest/dist.min.js"></script>
-
 </head>
 <body>
+<canvas id="c"></canvas>
 
-<div id="map"></div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
 
 <script>
-const points = {pts_json};
+const pts = {pts_js};
 
-// Center map on first point
-const center = [points[0].lon, points[0].lat];
+let scene = new THREE.Scene();
+scene.background = new THREE.Color(0x000000);
 
-const map = new maplibregl.Map({{
-    container: 'map',
-    style: 'https://basemaps.cartocdn.com/gl/positron-gl-style/style.json',
-    center: center,
-    zoom: 13,
-    pitch: 75,
-    bearing: 0,
-    antialias: true
-}});
+let camera = new THREE.PerspectiveCamera(70, window.innerWidth/window.innerHeight, 0.1, 50000);
+camera.position.set(0, -50, 20);
 
-// Create deck.gl layer for the path
-const lineCoords = points.map(p => [p.lon, p.lat, p.ele || 0]);
+let renderer = new THREE.WebGLRenderer({{canvas: document.getElementById("c"), antialias:true}});
+renderer.setSize(window.innerWidth, window.innerHeight);
 
-const deckLayer = new deck.LineLayer({{
-    id: 'pov-path',
-    data: lineCoords,
-    getSourcePosition: d => d,
-    getTargetPosition: (d,i) => lineCoords[i+1] || d,
-    getColor: [0, 150, 255, 255],
-    getWidth: 6,
-}});
+const light = new THREE.DirectionalLight(0xffffff, 1.2);
+light.position.set(50, -50, 200);
+scene.add(light);
 
-const deckgl = new deck.DeckGL({{
-    map: map,
-    layers: [deckLayer]
-}});
+const amb = new THREE.AmbientLight(0x888888);
+scene.add(amb);
 
-// Simple camera animation along the path
-let idx = 0;
+// Convert piste → curve
+const geom = new THREE.BufferGeometry();
+const flat = pts.flat();
+geom.setAttribute('position', new THREE.Float32BufferAttribute(flat, 3));
+
+const mat = new THREE.LineBasicMaterial({{color:0x66ccff, linewidth:4}});
+const line = new THREE.Line(geom, mat);
+scene.add(line);
+
+// Camera animation
+let i = 0;
 function animate() {{
-    idx = (idx + 1) % lineCoords.length;
-    const p = points[idx];
-    const next = points[(idx+1)%points.length];
-
-    const bearing = turf.bearing(
-        [p.lon, p.lat],
-        [next.lon, next.lat]
-    );
-
-    map.easeTo({{
-        center: [p.lon, p.lat],
-        bearing: bearing,
-        zoom: 14.5,
-        pitch: 75,
-        duration: 500
-    }});
-
     requestAnimationFrame(animate);
+
+    if(i < pts.length) {{
+        let p = pts[i];
+        camera.position.set(p[0], p[1]-20, p[2]+8);
+        camera.lookAt(p[0], p[1], p[2]);
+        i++;
+    }}
+
+    renderer.render(scene, camera);
 }}
 
-// Include Turf.js just before animate()
+animate();
+
+window.addEventListener('resize', ()=>{
+    camera.aspect = window.innerWidth/window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+});
 </script>
-<script src="https://cdn.jsdelivr.net/npm/@turf/turf@6/turf.min.js"
- onload="animate()"></script>
 
 </body>
 </html>
 """
-    return html
 
 
-# ---------------------------------------------------------------------
-# Create an iframe snippet to embed POV 3D inside Streamlit
-# ---------------------------------------------------------------------
-def generate_pov3d_iframe_html(points: List[Dict[str, float]], height: int = 420) -> str:
+# -----------------------------------------------------------
+# STREAMLIT RENDERER (iframe + download)
+# -----------------------------------------------------------
+def render_pov3d_view(T: Dict[str, Any], ctx: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Genera un iframe HTML che Streamlit può mostrare con st.components.v1.html(...)
+    Richiede:
+        ctx["pov_piste_points"] = [{"lat":..., "lon":..., "ele":...}, ...]
+        ctx["pov_piste_name"]
     """
-    html = generate_pov3d_html(points)
-    # Base64 → data URL
-    b64 = base64.b64encode(html.encode("utf-8")).decode("ascii")
-    return f"""
-<iframe src="data:text/html;base64,{b64}"
-        width="100%" height="{height}px"
-        style="border:0; border-radius:12px; overflow:hidden;">
-</iframe>
-"""
+    st.markdown("### 🎥 POV 3D (beta)")
 
+    pts = ctx.get("pov_piste_points")
+    name = ctx.get("pov_piste_name", "Pista")
 
-# ---------------------------------------------------------------------
-# Public API used by streamlit_app.py
-# ---------------------------------------------------------------------
-def render_pov3d_block(T: Dict[str, Any], ctx: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Blocca UI POV 3D. Dipende da ctx["pov_piste_points"],
-    che deve essere popolato dal modulo core.pov (estrazione pista).
-    """
-    import streamlit as st
-    from streamlit.components.v1 import html as st_html
-
-    st.markdown("### 🎥 POV 3D – Anteprima")
-
-    points = ctx.get("pov_piste_points")
-    if not points:
-        st.info("Nessun tracciato sufficiente per POV 3D.")
+    if not pts:
+        st.info("Nessuna pista disponibile per il POV 3D.")
         return ctx
 
-    iframe = generate_pov3d_iframe_html(points, height=420)
-    st_html(iframe, height=440)
+    # Convert lat/lon/ele → XYZ
+    xyz = _to_xyz(pts)
 
-    # Download button (POV 3D)
-    html3d = generate_pov3d_html(points)
+    # Generate HTML
+    html = build_pov3d_html(xyz, name)
+
+    # Unique iframe id
+    frame_id = f"pov3d_{uuid.uuid4().hex}"
+
+    # Iframe viewer
+    st.components.v1.html(
+        html,
+        height=450,
+        scrolling=False,
+    )
+
+    # Download button
     st.download_button(
         "⬇️ Scarica POV 3D (HTML)",
-        data=html3d,
+        data=html,
         file_name="pov3d_telemark.html",
-        mime="text/html"
+        mime="text/html",
     )
 
     return ctx
