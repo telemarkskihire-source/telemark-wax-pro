@@ -9,6 +9,8 @@
 #     · si aggiorna SUBITO al click (usando session_state del folium key)
 #     · viene "agganciato" al punto più vicino di una pista downhill
 # - Evidenzia la pista selezionata (colore diverso / più spessa)
+# - Nomi piste SEMPRE visibili in mappa (testo piccolo al centro)
+#   e nome della pista selezionata evidenziato
 # - Mostra il nome della pista selezionata sotto la mappa
 # - Marker separato per ogni contesto (ctx["map_context"])
 # - Ritorna ctx aggiornato (lat/lon + marker_lat/lon + selected_piste_name)
@@ -319,26 +321,49 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
         control=True,
     ).add_to(m)
 
-    # piste con tooltip nome (se disponibile) e highlight della pista selezionata
+    # piste con tooltip nome + LABEL SEMPRE VISIBILE + highlight pista selezionata
     if show_pistes and polylines:
         for i, (coords, name) in enumerate(zip(polylines, piste_names)):
             tooltip = name if name else None
+            is_selected = selected_idx is not None and i == selected_idx
 
-            # se è la pista selezionata, evidenziala
-            if selected_idx is not None and i == selected_idx:
-                folium.PolyLine(
-                    locations=coords,
-                    weight=5,
-                    opacity=1.0,
-                    color="yellow",
-                    tooltip=tooltip,
-                ).add_to(m)
-            else:
-                folium.PolyLine(
-                    locations=coords,
-                    weight=3,
-                    opacity=0.9,
-                    tooltip=tooltip,
+            # stile linea
+            line_kwargs = {
+                "locations": coords,
+                "weight": 5 if is_selected else 3,
+                "opacity": 1.0 if is_selected else 0.9,
+            }
+            if is_selected:
+                line_kwargs["color"] = "yellow"
+
+            folium.PolyLine(
+                tooltip=tooltip,
+                **line_kwargs,
+            ).add_to(m)
+
+            # LABEL fissa al centro pista
+            if name:
+                mid_idx = len(coords) // 2
+                label_lat, label_lon = coords[mid_idx]
+
+                # colore e stile diverso se è la pista selezionata
+                text_color = "#fde047" if is_selected else "#e5e7eb"  # giallo vs grigio chiaro
+                font_weight = "bold" if is_selected else "normal"
+
+                html = (
+                    f'<div style="'
+                    f'font-size:10px; '
+                    f'color:{text_color}; '
+                    f'font-weight:{font_weight}; '
+                    f'text-shadow:0 0 3px #000, 0 0 5px #000;'
+                    f'">'
+                    f"{name}"
+                    f"</div>"
+                )
+
+                folium.Marker(
+                    location=[label_lat, label_lon],
+                    icon=folium.DivIcon(html=html),
                 ).add_to(m)
 
     # marker puntatore
