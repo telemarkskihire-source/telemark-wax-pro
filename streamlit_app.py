@@ -1061,4 +1061,3 @@ else:
                     f"- **Note edges**: {rec.notes}\n"
                 )
                 st.caption(dyn.summary)
-```0
