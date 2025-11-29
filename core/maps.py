@@ -69,15 +69,11 @@ def _fetch_downhill_pistes(
     elements = js.get("elements", [])
     nodes = {el["id"]: el for el in elements if el.get("type") == "node"}
 
-    # indicizza le way per id (serve per le relation)
-    ways_by_id: Dict[int, Dict[str, Any]] = {
-        el["id"]: el for el in elements if el.get("type") == "way"
-    }
-
     polylines: List[List[Tuple[float, float]]] = []
     names: List[Optional[str]] = []
     piste_count = 0
 
+    # helper per estrarre nome sensato
     def _name_from_tags(tags: Dict[str, Any]) -> Optional[str]:
         if not tags:
             return None
@@ -88,55 +84,44 @@ def _fetch_downhill_pistes(
                     return val
         return None
 
-    # --- gestiamo separatamente way e relation per avere nomi più affidabili ---
     for el in elements:
-        if el.get("type") == "way":
-            tags = el.get("tags") or {}
-            if tags.get("piste:type") != "downhill":
-                continue
+        if el.get("type") not in ("way", "relation"):
+            continue
+        tags = el.get("tags") or {}
+        if tags.get("piste:type") != "downhill":
+            continue
 
-            coords: List[Tuple[float, float]] = []
+        coords: List[Tuple[float, float]] = []
+
+        if el["type"] == "way":
             for nid in el.get("nodes", []):
                 nd = nodes.get(nid)
                 if not nd:
                     continue
                 coords.append((nd["lat"], nd["lon"]))
 
-            if len(coords) >= 2:
-                polylines.append(coords)
-                names.append(_name_from_tags(tags))
-                piste_count += 1
-
-    for el in elements:
-        if el.get("type") == "relation":
-            tags_rel = el.get("tags") or {}
-            if tags_rel.get("piste:type") != "downhill":
-                continue
-
-            # ogni relation può contenere più way -> possiamo usare il nome dei way,
-            # se c'è, altrimenti quello della relation come fallback
-            rel_name = _name_from_tags(tags_rel)
-
+        elif el["type"] == "relation":
+            # seguiamo tutte le way membri
             for mem in el.get("members", []):
                 if mem.get("type") != "way":
                     continue
                 wid = mem.get("ref")
-                way = ways_by_id.get(wid)
+                way = next(
+                    (e for e in elements if e.get("type") == "way" and e.get("id") == wid),
+                    None,
+                )
                 if not way:
                     continue
-                tags_way = way.get("tags") or {}
-                coords: List[Tuple[float, float]] = []
                 for nid in way.get("nodes", []):
                     nd = nodes.get(nid)
                     if not nd:
                         continue
                     coords.append((nd["lat"], nd["lon"]))
 
-                if len(coords) >= 2:
-                    polylines.append(coords)
-                    # priorità al nome del way, poi al nome della relation
-                    names.append(_name_from_tags(tags_way) or rel_name)
-                    piste_count += 1
+        if len(coords) >= 2:
+            polylines.append(coords)
+            names.append(_name_from_tags(tags))
+            piste_count += 1
 
     return piste_count, polylines, names
 
@@ -310,15 +295,15 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
         control=True,
     ).add_to(m)
 
-    # piste con tooltip nome (se disponibile)
+    # piste con tooltip nome (se disponibile) — LOGICA VECCHIA REINTEGRATA
     if show_pistes and polylines:
         for coords, name in zip(polylines, piste_names):
-            tt = folium.Tooltip(name) if name else None
+            tooltip = name if name else None
             folium.PolyLine(
                 locations=coords,
                 weight=3,
                 opacity=0.9,
-                tooltip=tt,
+                tooltip=tooltip,
             ).add_to(m)
 
     # marker puntatore
@@ -329,6 +314,7 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
 
     # ------------------------------------------------------------------
     # 4) Render Folium -> aggiorna st.session_state[map_key] con eventuale nuovo click
+    #    Il nuovo click verrà letto all'inizio del prossimo rerun.
     # ------------------------------------------------------------------
     _ = st_folium(
         m,
