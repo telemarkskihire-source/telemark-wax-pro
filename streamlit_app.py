@@ -45,7 +45,7 @@ from core.race_tuning import (
 from core.race_integration import get_wc_tuning_for_event, SkierLevel as WCSkierLevel
 from core import meteo as meteo_mod
 from core import wax_logic as wax_mod
-from core.pages.ski_selector import recommend_skis_for_day  # ski consigliati multi-marca
+from core.pages.ski_selector import recommend_skis_for_day
 
 import core.search as search_mod  # debug
 
@@ -296,12 +296,17 @@ if page == "Località & Mappa":
     iso2 = country_selectbox(T)
     location_searchbox(T, iso2)
 
-    # Località base (dal searchbox o Champoluc di default)
-    sel = ensure_base_location()
-    ctx.update(sel)
+    base_sel = ensure_base_location()
 
-    # label visuale (se in passato abbiamo messo una place_label più “bella”)
-    display_label = st.session_state.get("place_label", sel["label"])
+    # Se ho già cliccato sulla mappa, uso quel lat/lon
+    lat = st.session_state.get("lat", base_sel["lat"])
+    lon = st.session_state.get("lon", base_sel["lon"])
+
+    ctx.update(base_sel)
+    ctx["lat"] = lat
+    ctx["lon"] = lon
+
+    display_label = st.session_state.get("place_label", base_sel["label"])
     ctx["place_label"] = display_label
     st.session_state["place_label"] = display_label
 
@@ -312,12 +317,12 @@ if page == "Località & Mappa":
 
     # ---------------- Mappa & DEM ----------------
     st.markdown("## 2) Mappa & piste")
-    ctx["map_context"] = "local"  # puntatore indipendente dalla pagina gara
+    ctx["map_context"] = "local"
     ctx = render_map(T, ctx) or ctx
 
-    # aggiorno lat/lon globali per eventuali moduli che usano sessione
-    st.session_state["lat"] = ctx.get("lat", sel["lat"])
-    st.session_state["lon"] = ctx.get("lon", sel["lon"])
+    # aggiorno in sessione questo centro (incluso click)
+    st.session_state["lat"] = ctx.get("lat", lat)
+    st.session_state["lon"] = ctx.get("lon", lon)
 
     st.markdown("## 3) Esposizione & pendenza")
     render_dem(T, ctx)
@@ -668,20 +673,18 @@ if page == "Località & Mappa":
         wax_mod.render_wax(T, ctx)
 
 # =====================================================
-# PAGINA 2: RACING / CALENDARI  (versione “buona”)
+# PAGINA 2: RACING / CALENDARI
 # =====================================================
 else:
     st.markdown("## 🏁 Racing / Calendari gare")
 
     base_loc = ensure_base_location()
     ctx.update(base_loc)
-    st.session_state["lat"] = base_loc["lat"]
-    st.session_state["lon"] = base_loc["lon"]
     st.session_state["place_label"] = base_loc["label"]
 
     st.markdown(
         f'<div class="card">'
-        f'<span class="small"><strong>Località di partenza (attuale):</strong> '
+        f'<span class="small"><strong>Località di partenza (default):</strong> '
         f'{base_loc["label"]}</span>'
         f"</div>",
         unsafe_allow_html=True,
@@ -785,10 +788,8 @@ else:
         labels = [race_event_label(ev) for ev in events]
         label_to_event = {lbl: ev for lbl, ev in zip(labels, events)}
 
-        default_idx = 0
         prev_label = st.session_state.get("race_selected_label")
-        if prev_label in label_to_event:
-            default_idx = labels.index(prev_label)
+        default_idx = labels.index(prev_label) if prev_label in label_to_event else 0
 
         selected_label = st.selectbox(
             "Seleziona gara",
@@ -811,7 +812,18 @@ else:
         ctx["race_event"] = selected_event
         ctx["race_datetime"] = race_datetime
 
-        ctx = center_ctx_on_race_location(ctx, selected_event)
+        # --- LOGICA NUOVA: centro SOLO se la gara è cambiata ---
+        last_centered = st.session_state.get("race_last_centered_label")
+        if last_centered != selected_label:
+            ctx = center_ctx_on_race_location(ctx, selected_event)
+            st.session_state["race_last_centered_label"] = selected_label
+        else:
+            # usa eventuale click precedente (puntatore sulla pista)
+            lat = st.session_state.get("lat", base_loc["lat"])
+            lon = st.session_state.get("lon", base_loc["lon"])
+            ctx["lat"] = lat
+            ctx["lon"] = lon
+
         ctx["map_context"] = (
             f"race_{selected_event.start_date.isoformat()}_{selected_event.place}"
         )
@@ -831,6 +843,10 @@ else:
         # Mappa & DEM gara
         st.markdown("### Mappa & piste per la gara")
         ctx = render_map(T, ctx) or ctx
+
+        # aggiorno lat/lon con eventuale click su pista
+        st.session_state["lat"] = ctx.get("lat", st.session_state.get("lat", base_loc["lat"]))
+        st.session_state["lon"] = ctx.get("lon", st.session_state.get("lon", base_loc["lon"]))
 
         st.markdown("### Esposizione & pendenza sulla pista selezionata")
         render_dem(T, ctx)
@@ -884,7 +900,6 @@ else:
 
             df_reset = df.reset_index()
 
-            # aria vs neve
             temp_long = df_reset.melt(
                 id_vars="time",
                 value_vars=["temp_air", "snow_temp"],
@@ -971,7 +986,6 @@ else:
             st.markdown("**Vento (km/h) e copertura nuvolosa (%)**")
             st.altair_chart(chart_wind_cloud, use_container_width=True)
 
-            # icone meteo
             icon_df = df_reset.copy()
             icons = []
             for _, row in icon_df.iterrows():
