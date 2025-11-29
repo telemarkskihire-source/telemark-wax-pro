@@ -558,7 +558,7 @@ def build_dynamic_tuning_for_race(
     params = TuningParamsInput(
         snow_temp_c=snow_temp_c,
         air_temp_c=air_temp_c,
-        humidity_pct=rh_pct,
+        rh_pct=rh_pct,
         snow_type=snow_type,
         discipline=discipline,
         skier_level=skier_level,
