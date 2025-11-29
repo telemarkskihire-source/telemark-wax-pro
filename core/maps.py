@@ -69,6 +69,11 @@ def _fetch_downhill_pistes(
     elements = js.get("elements", [])
     nodes = {el["id"]: el for el in elements if el.get("type") == "node"}
 
+    # indicizza le way per id (serve per le relation)
+    ways_by_id: Dict[int, Dict[str, Any]] = {
+        el["id"]: el for el in elements if el.get("type") == "way"
+    }
+
     polylines: List[List[Tuple[float, float]]] = []
     names: List[Optional[str]] = []
     piste_count = 0
@@ -83,43 +88,55 @@ def _fetch_downhill_pistes(
                     return val
         return None
 
+    # --- gestiamo separatamente way e relation per avere nomi più affidabili ---
     for el in elements:
-        if el.get("type") not in ("way", "relation"):
-            continue
-        tags = el.get("tags") or {}
-        if tags.get("piste:type") != "downhill":
-            continue
+        if el.get("type") == "way":
+            tags = el.get("tags") or {}
+            if tags.get("piste:type") != "downhill":
+                continue
 
-        coords: List[Tuple[float, float]] = []
-
-        if el["type"] == "way":
+            coords: List[Tuple[float, float]] = []
             for nid in el.get("nodes", []):
                 nd = nodes.get(nid)
                 if not nd:
                     continue
                 coords.append((nd["lat"], nd["lon"]))
 
-        elif el["type"] == "relation":
+            if len(coords) >= 2:
+                polylines.append(coords)
+                names.append(_name_from_tags(tags))
+                piste_count += 1
+
+    for el in elements:
+        if el.get("type") == "relation":
+            tags_rel = el.get("tags") or {}
+            if tags_rel.get("piste:type") != "downhill":
+                continue
+
+            # ogni relation può contenere più way -> possiamo usare il nome dei way,
+            # se c'è, altrimenti quello della relation come fallback
+            rel_name = _name_from_tags(tags_rel)
+
             for mem in el.get("members", []):
                 if mem.get("type") != "way":
                     continue
                 wid = mem.get("ref")
-                way = next(
-                    (e for e in elements if e.get("type") == "way" and e.get("id") == wid),
-                    None,
-                )
+                way = ways_by_id.get(wid)
                 if not way:
                     continue
+                tags_way = way.get("tags") or {}
+                coords: List[Tuple[float, float]] = []
                 for nid in way.get("nodes", []):
                     nd = nodes.get(nid)
                     if not nd:
                         continue
                     coords.append((nd["lat"], nd["lon"]))
 
-        if len(coords) >= 2:
-            polylines.append(coords)
-            names.append(_name_from_tags(tags))
-            piste_count += 1
+                if len(coords) >= 2:
+                    polylines.append(coords)
+                    # priorità al nome del way, poi al nome della relation
+                    names.append(_name_from_tags(tags_way) or rel_name)
+                    piste_count += 1
 
     return piste_count, polylines, names
 
@@ -195,8 +212,12 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
     default_lat = float(ctx.get("lat", 45.83333))
     default_lon = float(ctx.get("lon", 7.73333))
 
-    marker_lat = float(st.session_state.get(marker_lat_key, ctx.get("marker_lat", default_lat)))
-    marker_lon = float(st.session_state.get(marker_lon_key, ctx.get("marker_lon", default_lon)))
+    marker_lat = float(
+        st.session_state.get(marker_lat_key, ctx.get("marker_lat", default_lat))
+    )
+    marker_lon = float(
+        st.session_state.get(marker_lon_key, ctx.get("marker_lon", default_lon))
+    )
 
     # ------------------------------------------------------------------
     # 1) PRIMA di costruire la mappa: leggo l'ultimo click da session_state
@@ -209,11 +230,9 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
             try:
                 click_lat = float(last_clicked.get("lat"))
                 click_lon = float(last_clicked.get("lng"))
-                # sposta subito il marker (snapping alla pista lo faremo tra poco)
                 marker_lat = click_lat
                 marker_lon = click_lon
             except Exception:
-                # se qualcosa va storto con i dati del click, ignoriamo
                 pass
 
     # aggiorna ctx + session con questa posizione "grezza"
@@ -226,7 +245,6 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
 
     # ------------------------------------------------------------------
     # 2) Scarico le piste downhill intorno al marker corrente
-    #    (che può già essere il punto cliccato).
     # ------------------------------------------------------------------
     show_pistes = st.checkbox(
         T.get("show_pistes_label", "Mostra piste sci alpino sulla mappa"),
@@ -295,12 +313,12 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
     # piste con tooltip nome (se disponibile)
     if show_pistes and polylines:
         for coords, name in zip(polylines, piste_names):
-            tooltip = name if name else None
+            tt = folium.Tooltip(name) if name else None
             folium.PolyLine(
                 locations=coords,
                 weight=3,
                 opacity=0.9,
-                tooltip=tooltip,  # <-- NOME PISTA COME TOOLTIP
+                tooltip=tt,
             ).add_to(m)
 
     # marker puntatore
@@ -311,7 +329,6 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
 
     # ------------------------------------------------------------------
     # 4) Render Folium -> aggiorna st.session_state[map_key] con eventuale nuovo click
-    #    Il nuovo click verrà letto all'inizio del prossimo rerun.
     # ------------------------------------------------------------------
     _ = st_folium(
         m,
