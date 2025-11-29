@@ -6,7 +6,7 @@
 # - Piste da Overpass: piste:type=downhill
 # - Puntatore visibile che segue:
 #     · selezione gara/località (ctx["lat"]/["lon"])
-#     · click sulla mappa (SUBITO al primo click, grazie a experimental_rerun)
+#     · click sulla mappa (SUBITO al primo click)
 # - Ritorna ctx aggiornato (lat/lon + marker_lat/lon)
 
 from __future__ import annotations
@@ -19,6 +19,23 @@ from streamlit_folium import st_folium
 import folium
 
 UA = {"User-Agent": "telemark-wax-pro/3.0"}
+
+
+def _safe_rerun() -> None:
+    """Forza un rerun senza generare errori se il metodo non esiste."""
+    try:
+        # Streamlit nuovo
+        st.rerun()
+        return
+    except Exception:
+        pass
+
+    try:
+        # Streamlit più vecchio
+        st.experimental_rerun()  # type: ignore[attr-defined]
+    except Exception:
+        # Se proprio non esiste, lasciamo perdere
+        pass
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
@@ -211,7 +228,6 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
             st.session_state["lon"] = click_lon
             st.session_state[click_state_key] = new_click
 
-            # Trucco per vedere il puntatore spostarsi SUBITO al primo click
-            st.experimental_rerun()
+            _safe_rerun()
 
     return ctx
