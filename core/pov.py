@@ -1,26 +1,31 @@
 # core/pov.py
 # POV pista per Telemark · Pro Wax & Tune
 #
-# - Usa Overpass per trovare la pista downhill più vicina al marker attuale
-# - Calcola un profilo distanza lungo la pista
-# - Mostra una mappa Folium separata con:
-#     · tutta la pista in evidenza
-#     · un marker che si muove lungo la pista in base a uno slider 0–100%
-# - Mostra lunghezza totale stimata e posizione attuale
+# Obiettivi:
+# - Partire dal marker attuale (ctx["marker_lat"]/["marker_lon"] o ctx["lat"]/["lon"])
+# - Trovare la pista downhill più vicina (Overpass, piste:type=downhill)
+# - Calcolare lunghezza e profilo distanza
+# - Mostrare:
+#     · una mappa POV in Streamlit con slider 0–100% (posizione lungo la pista)
+#     · un pulsante che genera un file HTML con un "volo" automatico (fly-through)
+#       tipo video (marker che si muove lungo la pista e mappa che lo segue)
 #
-# NOTE:
-# - Non tocca core/maps.py
-# - Si appoggia solo a ctx["lat"]/["lon"] o ctx["marker_lat"]/["marker_lon"]
+# Non tocca core/maps.py. È un modulo separato che la app può chiamare:
+#     from core import pov
+#     ctx = pov.render_pov_view(T, ctx)
 
 from __future__ import annotations
 
 from typing import Dict, Any, List, Tuple, Optional
 
 import math
+import json
 import requests
 import streamlit as st
 from streamlit_folium import st_folium
 import folium
+import altair as alt
+import pandas as pd
 
 UA = {"User-Agent": "telemark-wax-pro/3.0"}
 
@@ -127,7 +132,7 @@ def _fetch_downhill_pistes(
 
 
 # ----------------------------------------------------------------------
-# Utility: distanza lungo pista
+# Utility: distanza, profilo lunghezza e pista più vicina
 # ----------------------------------------------------------------------
 def _haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     """
@@ -196,7 +201,142 @@ def _nearest_piste_to_point(
 
 
 # ----------------------------------------------------------------------
-# POV VIEW
+# Generazione HTML POV animato (tipo video)
+# ----------------------------------------------------------------------
+def _build_pov_html(
+    piste_points: List[Tuple[float, float]],
+    piste_name: Optional[str],
+    duration_seconds: int = 8,
+) -> str:
+    """
+    Genera una pagina HTML standalone con Leaflet:
+    - mostra la pista
+    - muove un marker lungo la pista in "duration_seconds"
+    - la mappa segue il marker (panTo)
+    """
+    if not piste_points:
+        piste_points = [(0.0, 0.0)]
+
+    # posizione iniziale e centro
+    start_lat, start_lon = piste_points[0]
+    points_js = json.dumps(piste_points)  # lista [[lat, lon], ...]
+
+    # intervallo animazione (ms)
+    # se ho N punti, faccio avanzare 1 punto ogni dt = duration / N
+    # con minimo 20 ms per evitare troppi update
+    n_points = max(2, len(piste_points))
+    total_ms = max(1000, duration_seconds * 1000)
+    step_ms = max(20, int(total_ms / n_points))
+
+    name_label = piste_name or "Telemark POV"
+
+    html = f"""<!DOCTYPE html>
+<html lang="it">
+<head>
+  <meta charset="utf-8" />
+  <title>{name_label} – POV Telemark</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link
+    rel="stylesheet"
+    href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+    integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY="
+    crossorigin=""
+  />
+  <style>
+    html, body, #map {{
+      height: 100%;
+      margin: 0;
+      padding: 0;
+      background: #000;
+    }}
+    .piste-label {{
+      color: #f9fafb;
+      font-size: 11px;
+      text-shadow: 0 0 3px #000, 0 0 5px #000;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }}
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+  <script
+    src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+    integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="
+    crossorigin="">
+  </script>
+  <script>
+    var points = {points_js};
+    var map = L.map('map', {{
+      zoomControl: false
+    }}).setView([{start_lat}, {start_lon}], 15);
+
+    // Base map
+    L.tileLayer('https://tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
+      maxZoom: 19,
+      attribution: '&copy; OpenStreetMap'
+    }}).addTo(map);
+
+    // Pista intera
+    var pisteLine = L.polyline(points, {{
+      color: '#38bdf8',
+      weight: 4,
+      opacity: 0.9
+    }}).addTo(map);
+
+    // bounding box per adattare lo zoom iniziale
+    map.fitBounds(pisteLine.getBounds());
+
+    // Label centrale pista
+    var midIdx = Math.floor(points.length / 2);
+    var midLatLng = L.latLng(points[midIdx][0], points[midIdx][1]);
+    var name = "{name_label}".trim();
+    if (name.length > 0) {{
+      L.marker(midLatLng, {{
+        icon: L.divIcon({{
+          className: 'piste-label',
+          html: name
+        }})
+      }}).addTo(map);
+    }}
+
+    // Marker POV
+    var marker = L.marker(points[0], {{
+      icon: L.icon({{
+        iconUrl: 'https://unpkg.com/leaflet@1.9.4/dist/images/marker-icon.png',
+        iconAnchor: [12, 41],
+        popupAnchor: [0, -28]
+      }})
+    }}).addTo(map);
+
+    // Animazione
+    var idx = 0;
+    var maxIdx = points.length - 1;
+    var stepMs = {step_ms};
+
+    function step() {{
+      idx += 1;
+      if (idx > maxIdx) {{
+        return;  // fine animazione
+      }}
+      var latlng = L.latLng(points[idx][0], points[idx][1]);
+      marker.setLatLng(latlng);
+      map.panTo(latlng, {{ animate: true, duration: stepMs / 1000 }});
+      if (idx < maxIdx) {{
+        setTimeout(step, stepMs);
+      }}
+    }}
+
+    // piccola pausa iniziale, poi parte il "volo"
+    setTimeout(step, 500);
+  </script>
+</body>
+</html>
+"""
+    return html
+
+
+# ----------------------------------------------------------------------
+# VIEW Streamlit POV
 # ----------------------------------------------------------------------
 def render_pov_view(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
     """
@@ -204,9 +344,10 @@ def render_pov_view(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
       - prende ctx["marker_lat"] / ctx["marker_lon"] (o ctx["lat"]/["lon"])
       - trova la pista downhill più vicina
       - mostra slider 0–100% per muovere un marker lungo la pista
-      - mostra lunghezza totale stimata
+      - mostra lunghezza totale stimata + profilo distanza
+      - permette di scaricare un HTML con animazione automatica (fly-through)
     """
-    st.markdown("### 🎥 POV pista (beta)")
+    st.markdown("## 🎥 POV pista (beta)")
 
     # posizione di riferimento (marker, altrimenti centro)
     base_lat = float(ctx.get("marker_lat", ctx.get("lat", 45.83333)))
@@ -215,7 +356,7 @@ def render_pov_view(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
     enable_pov = st.checkbox(
         "Attiva POV sulla pista più vicina",
         value=True,
-        key="pov_enable",
+        key=f"pov_enable_{ctx.get('map_context','default')}",
     )
     if not enable_pov:
         return ctx
@@ -249,12 +390,12 @@ def render_pov_view(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
     col_slider, col_info = st.columns([2, 1])
     with col_slider:
         progress_pct = st.slider(
-            "Posizione lungo la pista",
+            "Posizione lungo la pista (simulazione POV)",
             min_value=0,
             max_value=100,
             value=0,
             step=1,
-            key="pov_progress_pct",
+            key=f"pov_progress_pct_{ctx.get('map_context','default')}",
         )
     with col_info:
         st.write(" ")
@@ -270,6 +411,7 @@ def render_pov_view(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
         idx += 1
     idx = max(0, min(idx, len(piste_points) - 1))
     cur_lat, cur_lon = piste_points[idx]
+    pos_m = dists[idx]
 
     # salva contesto POV
     ctx["pov_piste_name"] = piste_name
@@ -278,7 +420,7 @@ def render_pov_view(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
     ctx["pov_lat"] = cur_lat
     ctx["pov_lon"] = cur_lon
 
-    # costruisci mappa dedicata POV
+    # mappa POV dedicata (non tocca la mappa principale)
     pov_map_key = f"pov_map_{ctx.get('map_context', 'default')}"
 
     m = folium.Map(
@@ -297,14 +439,14 @@ def render_pov_view(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
     folium.TileLayer(
         tiles=(
             "https://server.arcgisonline.com/ArcGIS/rest/services/"
-            "World_Imagery/MapServer/tile/{z}/{y}/{x}"
+            "World_Imagery/MapServer/tile/{{z}}/{{y}}/{{x}}"
         ),
         attr="Esri World Imagery",
         name="Satellite",
         control=True,
     ).add_to(m)
 
-    # tutta la pista (linea blu)
+    # pista intera
     folium.PolyLine(
         locations=piste_points,
         weight=4,
@@ -312,17 +454,17 @@ def render_pov_view(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
         color="blue",
     ).add_to(m)
 
-    # marker POV (pallino + icona play)
+    # marker POV
     folium.Marker(
         location=[cur_lat, cur_lon],
         icon=folium.Icon(color="red", icon="play"),
     ).add_to(m)
 
-    # piccolo label con nome pista al centro
+    # label centrale pista
     mid_idx = len(piste_points) // 2
     mid_lat, mid_lon = piste_points[mid_idx]
     if piste_name:
-        html = (
+        html_label = (
             '<div style="font-size:10px; color:#e5e7eb; '
             'text-shadow:0 0 3px #000,0 0 5px #000;">'
             f"{piste_name}"
@@ -330,7 +472,7 @@ def render_pov_view(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
         )
         folium.Marker(
             location=[mid_lat, mid_lon],
-            icon=folium.DivIcon(html=html),
+            icon=folium.DivIcon(html=html_label),
         ).add_to(m)
 
     st_folium(
@@ -340,12 +482,47 @@ def render_pov_view(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
         key=pov_map_key,
     )
 
-    # info sintetica sotto la mappa
-    pos_m = dists[idx]
+    # profilo distanza (tipo altimetria ma solo 2D, senza quota per ora)
+    df = pd.DataFrame(
+        {
+            "distanza_m": dists,
+        }
+    )
+    df["distanza_km"] = df["distanza_m"] / 1000.0
+    df["idx"] = range(len(df))
+
+    chart = (
+        alt.Chart(df)
+        .mark_line()
+        .encode(
+            x=alt.X("distanza_km:Q", title="Distanza lungo pista (km)"),
+            y=alt.Y("idx:Q", title="Indice punto (proxy quota)"),
+        )
+        .properties(height=160)
+    )
+    st.markdown("**Profilo lungo la pista (solo distanza, proxy quota in futuro)**")
+    st.altair_chart(chart, use_container_width=True)
+
     st.markdown(
         f"**Pista POV:** {piste_name or 'pista senza nome'}  ·  "
         f"Posizione attuale ~{pos_m:.0f} m / {total_len_m:.0f} m "
         f"({progress_pct}%)"
+    )
+
+    # ---- export HTML animato tipo video ----
+    html_data = _build_pov_html(
+        piste_points=piste_points,
+        piste_name=piste_name,
+        duration_seconds=8,
+    )
+
+    st.download_button(
+        "⬇️ Scarica anteprima POV (HTML animato)",
+        data=html_data,
+        file_name="telemark_pov_flythrough.html",
+        mime="text/html",
+        help="Apri il file nel browser e fai una registrazione schermo per ottenere il video.",
+        key=f"pov_download_{ctx.get('map_context','default')}",
     )
 
     return ctx
