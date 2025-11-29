@@ -7,8 +7,8 @@
 # - Puntatore che:
 #     · segue selezione gara/località (ctx["lat"]/["lon"])
 #     · al click viene “agganciato” alla pista downhill più vicina
-# - Piccole etichette con il nome della pista (se disponibile)
-# - Ritorna ctx aggiornato (lat/lon + marker_lat/lon)
+# - Etichette con il nome della pista (se disponibile)
+# - Stato puntatore separato per ogni map_context (pagina)
 
 from __future__ import annotations
 
@@ -23,19 +23,15 @@ UA = {"User-Agent": "telemark-wax-pro/3.0"}
 
 
 def _safe_rerun() -> None:
-    """Forza un rerun senza generare errori se il metodo non esiste."""
+    """Forza un rerun senza crashare se il metodo non esiste."""
     try:
-        # Streamlit nuovo
         st.rerun()
         return
     except Exception:
         pass
-
     try:
-        # Streamlit più vecchio
         st.experimental_rerun()  # type: ignore[attr-defined]
     except Exception:
-        # Se proprio non esiste, lasciamo perdere
         pass
 
 
@@ -92,7 +88,6 @@ def _fetch_downhill_pistes(
     pistes: List[Dict[str, Any]] = []
     piste_count = 0
 
-    # helper per estrarre un "nome carino"
     def _extract_name(tags: Dict[str, str]) -> Optional[str]:
         for key in ("piste:name", "name", "ref"):
             val = tags.get(key)
@@ -117,7 +112,6 @@ def _fetch_downhill_pistes(
                 coords.append((nd["lat"], nd["lon"]))
 
         elif el["type"] == "relation":
-            # relazione composta da più way: concateno tutto
             for mem in el.get("members", []):
                 if mem.get("type") != "way":
                     continue
@@ -176,7 +170,6 @@ def _closest_point_on_pistes(
         coords = piste.get("coords") or []
         pname = piste.get("name")
         for (lat, lon) in coords:
-            # distanza euclidea grezza in gradi: sufficiente su scala locale
             dlat = lat - click_lat
             dlon = lon - click_lon
             d2 = dlat * dlat + dlon * dlon
@@ -198,8 +191,8 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
     """
     Disegna la mappa basata su ctx:
       - ctx["lat"], ctx["lon"]  → centro iniziale
-      - ctx["marker_lat"], ["marker_lon"] → puntatore (fallback = lat/lon)
-      - ctx["map_context"] → usato per key widget + stato click per pagina
+      - puntatore per pagina (map_context) in session_state:
+          marker_lat_{map_context}, marker_lon_{map_context}
 
     Gestione click:
       - al click su mappa, il puntatore viene snappato alla pista downhill
@@ -208,16 +201,23 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
     """
     map_context = str(ctx.get("map_context", "default"))
 
-    # Centro di base
+    # centro di base
     base_lat = float(ctx.get("lat", 45.83333))
     base_lon = float(ctx.get("lon", 7.73333))
 
-    # Puntatore iniziale: se esiste marker_* li uso, altrimenti lat/lon
-    marker_lat = float(ctx.get("marker_lat", base_lat))
-    marker_lon = float(ctx.get("marker_lon", base_lon))
+    # puntatore per questa pagina
+    marker_lat = float(
+        st.session_state.get(f"marker_lat_{map_context}", ctx.get("marker_lat", base_lat))
+    )
+    marker_lon = float(
+        st.session_state.get(f"marker_lon_{map_context}", ctx.get("marker_lon", base_lon))
+    )
 
+    # aggiorno ctx con il puntatore effettivo
     ctx["lat"] = marker_lat
     ctx["lon"] = marker_lon
+    ctx["marker_lat"] = marker_lat
+    ctx["marker_lon"] = marker_lon
 
     # Checkbox piste
     show_pistes = st.checkbox(
@@ -252,13 +252,13 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
         control=True,
     ).add_to(m)
 
-    # Puntatore gara/località attuale
+    # Puntatore attuale
     folium.Marker(
         location=[marker_lat, marker_lon],
         icon=folium.Icon(color="red", icon="flag"),
     ).add_to(m)
 
-    # Piste (Overpass) + etichette con nome
+    # Piste + nomi
     piste_count = 0
     pistes: List[Dict[str, Any]] = []
     if show_pistes:
@@ -269,14 +269,12 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
             coords = piste["coords"]
             name = piste.get("name")
 
-            # linea
             folium.PolyLine(
                 locations=coords,
                 weight=3,
                 opacity=0.9,
             ).add_to(m)
 
-            # etichetta al centro della pista (se abbiamo un nome)
             if name and len(coords) >= 2:
                 mid_idx = len(coords) // 2
                 lat_mid, lon_mid = coords[mid_idx]
@@ -298,35 +296,28 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
     map_data = st_folium(m, height=450, width=None, key=map_key)
 
     # ---------------- GESTIONE CLICK ----------------
-    click_state_key = f"last_click_{map_context}"
-    prev_click = st.session_state.get(click_state_key)
-
     if map_data and map_data.get("last_clicked") is not None:
         click_lat = float(map_data["last_clicked"]["lat"])
         click_lon = float(map_data["last_clicked"]["lng"])
 
-        # snap del click alla pista più vicina (se presente)
+        # snap alla pista più vicina (se presente)
         snap_lat, snap_lon, snap_name = _closest_point_on_pistes(
             click_lat, click_lon, pistes
         )
-        new_click = (snap_lat, snap_lon)
 
-        # aggiorno solo se è un click "nuovo" rispetto a quello già applicato
-        if new_click != prev_click:
-            ctx["marker_lat"] = snap_lat
-            ctx["marker_lon"] = snap_lon
-            ctx["lat"] = snap_lat
-            ctx["lon"] = snap_lon
-            if snap_name:
-                ctx["piste_name"] = snap_name
-                st.session_state["piste_name"] = snap_name
+        # aggiorna ctx
+        ctx["marker_lat"] = snap_lat
+        ctx["marker_lon"] = snap_lon
+        ctx["lat"] = snap_lat
+        ctx["lon"] = snap_lon
+        if snap_name:
+            ctx["piste_name"] = snap_name
+            st.session_state["piste_name"] = snap_name
 
-            st.session_state["marker_lat"] = snap_lat
-            st.session_state["marker_lon"] = snap_lon
-            st.session_state["lat"] = snap_lat
-            st.session_state["lon"] = snap_lon
-            st.session_state[click_state_key] = new_click
+        # salva stato per questa pagina
+        st.session_state[f"marker_lat_{map_context}"] = snap_lat
+        st.session_state[f"marker_lon_{map_context}"] = snap_lon
 
-            _safe_rerun()
+        _safe_rerun()
 
     return ctx
