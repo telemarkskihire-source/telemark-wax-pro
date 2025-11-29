@@ -5,9 +5,9 @@
 # - Checkbox "Mostra piste sci alpino sulla mappa"
 # - Piste da Overpass: piste:type=downhill
 # - Puntatore visibile che segue:
-#     · selezione gara (via ctx["lat"]/["lon"])
-#     · click sulla mappa
-# - Puntatore indipendente per contesto (local vs race) usando map_context
+#     · selezione gara/località (ctx["lat"]/["lon"])
+#     · click sulla mappa (SUBITO al primo click, grazie a experimental_rerun)
+# - Ritorna ctx aggiornato (lat/lon + marker_lat/lon)
 
 from __future__ import annotations
 
@@ -22,7 +22,11 @@ UA = {"User-Agent": "telemark-wax-pro/3.0"}
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
-def _fetch_downhill_pistes(lat: float, lon: float, radius_km: float = 10.0) -> Tuple[int, List[List[Tuple[float, float]]]]:
+def _fetch_downhill_pistes(
+    lat: float,
+    lon: float,
+    radius_km: float = 10.0,
+) -> Tuple[int, List[List[Tuple[float, float]]]]:
     """
     Scarica le piste di discesa (piste:type=downhill) via Overpass attorno
     a (lat, lon) con raggio in km.
@@ -81,7 +85,14 @@ def _fetch_downhill_pistes(lat: float, lon: float, radius_km: float = 10.0) -> T
                 if mem.get("type") != "way":
                     continue
                 wid = mem.get("ref")
-                way = next((e for e in elements if e.get("type") == "way" and e.get("id") == wid), None)
+                way = next(
+                    (
+                        e
+                        for e in elements
+                        if e.get("type") == "way" and e.get("id") == wid
+                    ),
+                    None,
+                )
                 if not way:
                     continue
                 for nid in way.get("nodes", []):
@@ -100,32 +111,23 @@ def _fetch_downhill_pistes(lat: float, lon: float, radius_km: float = 10.0) -> T
 def render_map(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
     """
     Disegna la mappa basata su ctx:
-      - ctx["lat"], ctx["lon"]  → centro di default
-      - ctx["map_context"]      → nome contesto (es. "local", "race_2025-01-10_Pila")
-      - puntatore per-contesto, salvato in sessione con chiavi diverse
-
-    Ritorna ctx aggiornato con eventuale click sulla mappa:
-      - ctx["marker_lat"], ctx["marker_lon"], ctx["lat"], ctx["lon"]
+      - ctx["lat"], ctx["lon"]  → centro iniziale
+      - ctx["marker_lat"], ["marker_lon"] → puntatore (fallback = lat/lon)
+      - ctx["map_context"] → usato per key widget + stato click per pagina
+    Gestisce il click dell'utente:
+      - aggiorna ctx + st.session_state
+      - forza un rerun immediato per vedere il puntatore MUOVERSI al primo click.
     """
-    # --- contesto mappa ---
     map_context = str(ctx.get("map_context", "default"))
-    session_lat_key = f"marker_lat_{map_context}"
-    session_lon_key = f"marker_lon_{map_context}"
 
-    base_lat = float(ctx.get("lat", 45.83333))
-    base_lon = float(ctx.get("lon", 7.73333))
+    # Centro di base
+    lat = float(ctx.get("lat", 45.83333))
+    lon = float(ctx.get("lon", 7.73333))
 
-    # Se ho già un puntatore salvato per questo contesto, lo riuso
-    if session_lat_key in st.session_state and session_lon_key in st.session_state:
-        marker_lat = float(st.session_state[session_lat_key])
-        marker_lon = float(st.session_state[session_lon_key])
-    else:
-        marker_lat = float(ctx.get("marker_lat", base_lat))
-        marker_lon = float(ctx.get("marker_lon", base_lon))
+    # Puntatore: se esiste marker_* li uso, altrimenti lat/lon
+    marker_lat = float(ctx.get("marker_lat", lat))
+    marker_lon = float(ctx.get("marker_lon", lon))
 
-    # Aggiorno ctx con il puntatore effettivo per questo contesto
-    ctx["marker_lat"] = marker_lat
-    ctx["marker_lon"] = marker_lon
     ctx["lat"] = marker_lat
     ctx["lon"] = marker_lon
 
@@ -135,7 +137,7 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
         key=f"show_pistes_{map_context}",
     )
 
-    # --- crea mappa Folium ---
+    # ---------------- CREA MAPPA FOLIUM ----------------
     m = folium.Map(
         location=[marker_lat, marker_lon],
         zoom_start=13,
@@ -152,21 +154,27 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
 
     # Satellite (Esri World Imagery)
     folium.TileLayer(
-        tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+        tiles=(
+            "https://server.arcgisonline.com/ArcGIS/rest/services/"
+            "World_Imagery/MapServer/tile/{z}/{y}/{x}"
+        ),
         attr="Esri World Imagery",
         name="Satellite",
         control=True,
     ).add_to(m)
 
-    # Puntatore visibile
+    # Puntatore gara/località attuale
     folium.Marker(
         location=[marker_lat, marker_lon],
         icon=folium.Icon(color="red", icon="flag"),
     ).add_to(m)
 
+    # Piste (Overpass)
     piste_count = 0
     if show_pistes:
-        piste_count, polylines = _fetch_downhill_pistes(marker_lat, marker_lon, radius_km=10.0)
+        piste_count, polylines = _fetch_downhill_pistes(
+            marker_lat, marker_lon, radius_km=10.0
+        )
         for coords in polylines:
             folium.PolyLine(
                 locations=coords,
@@ -176,21 +184,34 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
 
     st.caption(f"Piste downhill trovate: {piste_count}")
 
-    # Render mappa in Streamlit
+    # ---------------- RENDER IN STREAMLIT ----------------
     map_key = f"map_{map_context}"
     map_data = st_folium(m, height=450, width=None, key=map_key)
 
-    # --- Gestione click: aggiorna SOLO le chiavi per questo contesto ---
+    # ---------------- GESTIONE CLICK ----------------
+    # Salviamo ultimo click per questo contesto
+    click_state_key = f"last_click_{map_context}"
+    prev_click = st.session_state.get(click_state_key)
+
     if map_data and map_data.get("last_clicked") is not None:
         click_lat = float(map_data["last_clicked"]["lat"])
         click_lon = float(map_data["last_clicked"]["lng"])
+        new_click = (click_lat, click_lon)
 
-        ctx["marker_lat"] = click_lat
-        ctx["marker_lon"] = click_lon
-        ctx["lat"] = click_lat
-        ctx["lon"] = click_lon
+        # Solo se il click è NUOVO aggiorniamo e forziamo il rerun
+        if new_click != prev_click:
+            ctx["marker_lat"] = click_lat
+            ctx["marker_lon"] = click_lon
+            ctx["lat"] = click_lat
+            ctx["lon"] = click_lon
 
-        st.session_state[session_lat_key] = click_lat
-        st.session_state[session_lon_key] = click_lon
+            st.session_state["marker_lat"] = click_lat
+            st.session_state["marker_lon"] = click_lon
+            st.session_state["lat"] = click_lat
+            st.session_state["lon"] = click_lon
+            st.session_state[click_state_key] = new_click
+
+            # Trucco per vedere il puntatore spostarsi SUBITO al primo click
+            st.experimental_rerun()
 
     return ctx
