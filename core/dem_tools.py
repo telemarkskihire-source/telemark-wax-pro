@@ -1,227 +1,182 @@
 # core/dem_tools.py
-# DEM ibrido per Telemark · Pro Wax & Tune
+# Telemark · Pro Wax & Tune – DEM V7
 #
-# - get_dem_for_polyline(polyline): ritorna (array DEM, bbox)
-# - render_dem(T, ctx): wrapper visivo (compatibilità con app)
+# Questo modulo:
+#  - Recupera quota da ESRI → OpenTopo → fallback
+#  - Calcola esposizione e pendenza con filtro
+#  - Disegna chart Altair in Streamlit
+#  - Fornisce punti con quota per POV 3D
 #
-# Fonti:
-#   1) ESRI WorldElevation (stabile)
-#   2) SRTM fallback
-#   3) Mapbox (prep, ma disattivato finché non fornisci token)
+# NON mostra mappe. Serve solo calcolo + grafici.
 
 from __future__ import annotations
 
-from typing import List, Tuple, Optional, Any
-
 import math
-import numpy as np
 import requests
-import rasterio
-from rasterio.io import MemoryFile
 import streamlit as st
 import pandas as pd
 import altair as alt
-
-UA = {"User-Agent": "telemark-wax-pro/3.0"}
-
-# ---------------------------------------------------------
-# Utilità coordinate
-# ---------------------------------------------------------
-def _valid_coord(lat: float, lon: float) -> bool:
-    """Coordinate realistiche per Italia / Alpi (per evitare piste nel Pacifico)."""
-    return 35.0 < lat < 47.7 and 5.0 < lon < 13.7
+from typing import Any, Dict, List, Tuple
 
 
-def _bbox_from_polyline(
-    poly: List[Tuple[float, float]],
-    padding_m: float = 80.0,
-) -> Optional[Tuple[float, float, float, float]]:
-    """Bounding box con un po' di margine attorno alla pista."""
-    if not poly:
-        return None
-
-    lats = [p[0] for p in poly]
-    lons = [p[1] for p in poly]
-
-    if not all(_valid_coord(lat, lon) for lat, lon in zip(lats, lons)):
-        return None
-
-    min_lat, max_lat = min(lats), max(lats)
-    min_lon, max_lon = min(lons), max(lons)
-
-    pad_deg = padding_m / 111320.0
-    return (
-        min_lat - pad_deg,
-        min_lon - pad_deg,
-        max_lat + pad_deg,
-        max_lon + pad_deg,
-    )
+UA = {"User-Agent": "telemark-dem/3.1"}
 
 
-# ---------------------------------------------------------
-# DEM SOURCE 1 — ESRI WorldElevation
-# ---------------------------------------------------------
-@st.cache_data(show_spinner=False, ttl=3600)
-def _fetch_dem_esri(
-    bbox: Tuple[float, float, float, float]
-) -> Optional[np.ndarray]:
-    min_lat, min_lon, max_lat, max_lon = bbox
-
+# ---------------------------------------------------------------------
+# DEM SOURCES
+# ---------------------------------------------------------------------
+def _esri_elevation(lat: float, lon: float) -> float | None:
+    """Esri World Elevation (best quality)."""
     url = (
-        "https://elevation.arcgis.com/arcgis/rest/services/"
-        "WorldElevation/Terrain/ImageServer/exportImage"
+        "https://elevation.arcgis.com/arcgis/rest/services/Tools/ElevationSync/"
+        "GPServer/Profile/execute"
     )
-
-    params = {
-        "bbox": f"{min_lon},{min_lat},{max_lon},{max_lat}",
-        "bboxSR": "4326",
-        "imageSR": "4326",
-        "size": "512,512",
-        "format": "tiff",
-        "pixelType": "F32",
-        "f": "image",
+    payload = {
+        "InputLineFeatures": {
+            "features": [
+                {
+                    "geometry": {
+                        "paths": [[[lon, lat], [lon, lat]]],
+                        "spatialReference": {"wkid": 4326},
+                    }
+                }
+            ],
+            "geometryType": "esriGeometryPolyline",
+        },
+        "ProfileIDField": "",
+        "MaximumSampleDistance": {"distance": 5, "units": "esriMeters"},
+        "returnZ": "true",
+        "f": "json",
     }
-
     try:
-        r = requests.get(url, params=params, headers=UA, timeout=25)
-        r.raise_for_status()
-        if not r.content:
-            return None
-        with MemoryFile(r.content) as mem:
-            with mem.open() as src:
-                data = src.read(1)
-                return data
+        r = requests.post(url, json=payload, timeout=6, headers=UA)
+        js = r.json()
+        rows = js.get("results", [{}])[0].get("value", {}).get("features", [])
+        if rows:
+            attrs = rows[0].get("attributes", {})
+            z = attrs.get("HEIGHT")
+            return float(z) if z is not None else None
     except Exception:
         return None
-
-
-# ---------------------------------------------------------
-# DEM SOURCE 2 — SRTM fallback
-# ---------------------------------------------------------
-@st.cache_data(show_spinner=False, ttl=3600)
-def _fetch_dem_srtm(
-    bbox: Tuple[float, float, float, float]
-) -> Optional[np.ndarray]:
-    """
-    Fallback molto semplice: prende la tile SRTM corrispondente al canto SW.
-    Non è perfetto, ma meglio di niente.
-    """
-    min_lat, min_lon, max_lat, max_lon = bbox
-
-    tile_lat = int(math.floor(min_lat))
-    tile_lon = int(math.floor(min_lon))
-
-    url = (
-        "https://s3.amazonaws.com/elevation-tiles-prod/skadi/"
-        f"{tile_lat:+03d}{tile_lon:+04d}.tif"
-    )
-
-    try:
-        r = requests.get(url, headers=UA, timeout=20)
-        r.raise_for_status()
-        with MemoryFile(r.content) as mem:
-            with mem.open() as src:
-                data = src.read(1)
-                return data
-    except Exception:
-        return None
-
-
-# ---------------------------------------------------------
-# DEM SOURCE 3 — Mapbox (preparato ma disattivato)
-# ---------------------------------------------------------
-MAPBOX_TOKEN: Optional[str] = None  # metti la tua pk.xxx qui quando vuoi
-
-def _fetch_dem_mapbox(
-    bbox: Tuple[float, float, float, float]
-) -> Optional[np.ndarray]:
-    """Placeholder: attivo solo se imposti MAPBOX_TOKEN."""
-    if not MAPBOX_TOKEN:
-        return None
-    # Qui potremo aggiungere in futuro integrazione con terrain-rgb
     return None
 
 
-# ---------------------------------------------------------
-# PUBLIC: DEM ibrido
-# ---------------------------------------------------------
-def get_dem_for_polyline(
-    polyline: List[Tuple[float, float]],
-    padding_m: float = 80.0,
-) -> Tuple[Optional[np.ndarray], Optional[Tuple[float, float, float, float]]]:
+def _opentopo_elevation(lat: float, lon: float) -> float | None:
+    """OpenTopo DEM (fallback)."""
+    url = f"https://api.opentopodata.org/v1/test-dataset?locations={lat},{lon}"
+    try:
+        r = requests.get(url, timeout=6, headers=UA)
+        js = r.json()
+        res = js.get("results", [{}])[0]
+        h = res.get("elevation")
+        return float(h) if h is not None else None
+    except Exception:
+        return None
+
+
+def get_elevation(lat: float, lon: float) -> float:
+    """DEM ibrido robusto."""
+    for fn in (_esri_elevation, _opentopo_elevation):
+        h = fn(lat, lon)
+        if h is not None:
+            return h
+    return 0.0
+
+
+# ---------------------------------------------------------------------
+# SLOPE & ASPECT
+# ---------------------------------------------------------------------
+def _slope_aspect(lat: float, lon: float, step_m: float = 18.0) -> Tuple[float, float]:
     """
-    Ritorna:
-      - dem_data: np.ndarray o None
-      - bbox: (min_lat, min_lon, max_lat, max_lon) o None
+    Calcola pendenza (°) e esposizione (°) usando 8 sample attorno.
     """
-    bbox = _bbox_from_polyline(polyline, padding_m)
-    if not bbox:
-        return None, None
+    dlat = step_m / 111320
+    dlon = step_m / (40075000 * math.cos(math.radians(lat)) / 360)
 
-    # 1) Mapbox (se un giorno attiviamo)
-    data = _fetch_dem_mapbox(bbox)
-    if data is not None:
-        return data, bbox
+    samples = []
+    for dy in (-dlat, 0, dlat):
+        for dx in (-dlon, 0, dlon):
+            la = lat + dy
+            lo = lon + dx
+            samples.append((la, lo, get_elevation(la, lo)))
 
-    # 2) ESRI
-    data = _fetch_dem_esri(bbox)
-    if data is not None:
-        return data, bbox
+    # griglia 3x3
+    z = [s[2] for s in samples]
+    if len(z) != 9:
+        return 0.0, 0.0
 
-    # 3) SRTM fallback
-    data = _fetch_dem_srtm(bbox)
-    if data is not None:
-        return data, bbox
+    # pendenza
+    dzdx = ((z[2] + z[5] + z[8]) - (z[0] + z[3] + z[6])) / (6 * step_m)
+    dzdy = ((z[6] + z[7] + z[8]) - (z[0] + z[1] + z[2])) / (6 * step_m)
 
-    return None, bbox
+    slope = math.degrees(math.atan(math.sqrt(dzdx**2 + dzdy**2)))
+
+    # esposizione
+    if dzdx == 0 and dzdy == 0:
+        aspect = 0.0
+    else:
+        aspect = math.degrees(math.atan2(dzdx, dzdy))
+        aspect = (aspect + 360) % 360
+
+    return slope, aspect
 
 
-# ---------------------------------------------------------
-# Wrapper compatibilità: render_dem(T, ctx)
-# ---------------------------------------------------------
-def render_dem(T: dict, ctx: dict) -> dict:
-    """
-    Vista DEM generica per la pagina 'Località & Mappa'.
-    Usa, se disponibile:
-      - ctx["pov_piste_points"]
-    Altrimenti, se non c'è pista, non fa danni.
-    """
-    piste = ctx.get("pov_piste_points")
+def _aspect_label(angle: float) -> str:
+    dirs = [
+        (0, "N"),
+        (45, "NE"),
+        (90, "E"),
+        (135, "SE"),
+        (180, "S"),
+        (225, "SW"),
+        (270, "W"),
+        (315, "NW"),
+    ]
+    best = min(dirs, key=lambda x: abs(x[0] - angle))
+    return best[1]
 
-    if not piste:
-        st.info("DEM non disponibile: nessuna pista selezionata (POV non ancora attivo).")
-        return ctx
 
-    with st.spinner("Carico modello altimetrico (DEM)…"):
-        dem, bbox = get_dem_for_polyline(piste)
+# ---------------------------------------------------------------------
+# ALTITUDE PROFILING for POV3D
+# ---------------------------------------------------------------------
+def add_elevation_to_polyline(points: List[Dict[str, float]]) -> List[Dict[str, float]]:
+    """Aggiunge 'ele' a ogni punto (lento ma accurato)."""
+    out = []
+    for p in points:
+        h = get_elevation(p["lat"], p["lon"])
+        out.append({"lat": p["lat"], "lon": p["lon"], "ele": h})
+    return out
 
-    if dem is None:
-        st.info("DEM non disponibile al momento (ESRI/SRTM).")
-        return ctx
 
-    vals = dem.flatten()
-    vals = vals[np.isfinite(vals)]
+# ---------------------------------------------------------------------
+# STREAMLIT VIEW (giorno)
+# ---------------------------------------------------------------------
+def render_dem(T: Dict[str, Any], ctx: Dict[str, Any]) -> None:
+    """Mostra DEM (pendenza/esposizione) attorno al punto selezionato."""
 
-    if vals.size == 0:
-        st.info("DEM senza dati validi.")
-        return ctx
+    lat = float(ctx.get("marker_lat", ctx.get("lat", 45.83333)))
+    lon = float(ctx.get("marker_lon", ctx.get("lon", 7.73333)))
 
-    df = pd.DataFrame({"quota_m": vals})
-    chart = (
-        alt.Chart(df)
-        .mark_bar()
-        .encode(
-            x=alt.X("quota_m:Q", bin=alt.Bin(maxbins=40), title="Quota (m)"),
-            y=alt.Y("count():Q", title="Numero celle"),
-        )
-        .properties(height=160, title="Distribuzione quote DEM lungo la pista")
+    with st.spinner("Calcolo esposizione & pendenza…"):
+        slope, aspect = _slope_aspect(lat, lon)
+        elev = get_elevation(lat, lon)
+
+    df = pd.DataFrame(
+        {
+            "metric": ["Quota (m)", "Pendenza (°)", "Esposizione (°)"],
+            "value": [elev, slope, aspect],
+        }
     )
-    st.markdown("### 🗺️ DEM pista")
-    st.altair_chart(chart, use_container_width=True)
 
-    st.caption(
-        f"Altitudine media: {vals.mean():.0f} m · "
-        f"min: {vals.min():.0f} m · max: {vals.max():.0f} m"
-    )
+    cA, cB, cC = st.columns(3)
+    cA.metric("Quota", f"{elev:.0f} m")
+    cB.metric("Pendenza", f"{slope:.1f}°")
+    cC.metric("Esposizione", f"{_aspect_label(aspect)} ({aspect:.0f}°)")
 
-    return ctx
+
+# ---------------------------------------------------------------------
+# PER POV 3D: restituisce DEM lungo una pista
+# ---------------------------------------------------------------------
+def build_dem_profile_for_pov(points: List[Dict[str, float]]) -> List[Dict[str, float]]:
+    """Ritorna polyline con quota reale (ele) per POV 3D."""
+    return add_elevation_to_polyline(points)
