@@ -47,6 +47,7 @@ from core import meteo as meteo_mod
 from core import wax_logic as wax_mod
 from core.pages.ski_selector import recommend_skis_for_day
 from core import pov as pov_mod  # <-- POV
+from core.pov_3d import render_pov3d_view  # <-- POV 3D
 
 import core.search as search_mod  # debug
 
@@ -333,6 +334,16 @@ if page == "Località & Mappa":
         ctx = pov_mod.render_pov_view(T, ctx) or ctx
     except Exception as e:
         st.info(f"POV non disponibile per questa località: {e}")
+
+    # >>> POV 3D LOCALITÀ
+    piste_points = ctx.get("pov_piste_points")
+    if piste_points:
+        with st.expander("🏔️ POV 3D (beta)", expanded=False):
+            render_pov3d_view(
+                ctx=ctx,
+                piste_points=piste_points,
+                piste_name=ctx.get("pov_piste_name"),
+            )
 
     # ---------------- METEO LOCALITÀ ----------------
     st.markdown("## 4) Meteo località & profilo giornata")
@@ -864,6 +875,16 @@ else:
         except Exception as e:
             st.info(f"POV non disponibile per questa gara: {e}")
 
+        # >>> POV 3D GARA
+        piste_points_race = ctx.get("pov_piste_points")
+        if piste_points_race:
+            with st.expander("🏔️ POV 3D (beta – gara)", expanded=False):
+                render_pov3d_view(
+                    ctx=ctx,
+                    piste_points=piste_points_race,
+                    piste_name=ctx.get("pov_piste_name"),
+                )
+
         # ---------- Tuning WC di base (preset statico) ----------
         wc = get_wc_tuning_for_event(selected_event, WCSkierLevel.WC)
         if wc is not None:
@@ -873,7 +894,7 @@ else:
             side_wc_angle = 90.0 - params_dict["side_bevel_deg"]
             c1m, c2m, c3m = st.columns(3)
             c1m.metric("Angolo lamina WC (side)", f"{side_wc_angle:.1f}°")
-            c2m.metric("Base bevel", f"{params_dict['base_bevel_deg']:.1f}°")
+            c2m.metric("Base bevel", f"{params_dict['base_bevel_deg"]:.1f}°")
             c3m.metric("Profilo", str(params_dict["risk_level"]).title())
 
             st.markdown(
