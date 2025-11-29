@@ -9,6 +9,7 @@
 #     · si aggiorna SUBITO al click (usando session_state del folium key)
 #     · viene "agganciato" al punto più vicino di una pista downhill
 # - Marker separato per ogni contesto (ctx["map_context"])
+# - Etichetta con nome pista (sempre visibile) al centro della linea
 # - Ritorna ctx aggiornato (lat/lon + marker_lat/lon)
 
 from __future__ import annotations
@@ -295,16 +296,42 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
         control=True,
     ).add_to(m)
 
-    # piste con tooltip nome (se disponibile) — LOGICA VECCHIA REINTEGRATA
+    # piste con nome:
+    # - PolyLine con tooltip (per desktop / hover)
+    # - Label sempre visibile al centro pista (DivIcon) per mobile
     if show_pistes and polylines:
         for coords, name in zip(polylines, piste_names):
             tooltip = name if name else None
+
+            # linea pista
             folium.PolyLine(
                 locations=coords,
                 weight=3,
                 opacity=0.9,
                 tooltip=tooltip,
             ).add_to(m)
+
+            # etichetta sempre visibile se abbiamo un nome
+            if name and coords:
+                mid_idx = len(coords) // 2
+                label_lat, label_lon = coords[mid_idx]
+
+                folium.Marker(
+                    location=[label_lat, label_lon],
+                    icon=folium.DivIcon(
+                        html=(
+                            f"<div style='"
+                            "font-size:10px;"
+                            "color:white;"
+                            "text-shadow:0 0 3px black;"
+                            "white-space:nowrap;"
+                            "background:rgba(0,0,0,0.3);"
+                            "padding:1px 3px;"
+                            "border-radius:3px;"
+                            f"'>{name}</div>"
+                        )
+                    ),
+                ).add_to(m)
 
     # marker puntatore
     folium.Marker(
