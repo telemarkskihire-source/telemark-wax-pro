@@ -46,6 +46,7 @@ from core.race_integration import get_wc_tuning_for_event, SkierLevel as WCSkier
 from core import meteo as meteo_mod
 from core import wax_logic as wax_mod
 from core.pages.ski_selector import recommend_skis_for_day
+from core import pov as pov_mod  # <-- POV
 
 import core.search as search_mod  # debug
 
@@ -326,6 +327,12 @@ if page == "Località & Mappa":
 
     st.markdown("## 3) Esposizione & pendenza")
     render_dem(T, ctx)
+
+    # ---------------- POV LOCALITÀ ----------------
+    try:
+        ctx = pov_mod.render_pov_view(T, ctx) or ctx
+    except Exception as e:
+        st.info(f"POV non disponibile per questa località: {e}")
 
     # ---------------- METEO LOCALITÀ ----------------
     st.markdown("## 4) Meteo località & profilo giornata")
@@ -850,6 +857,12 @@ else:
 
         st.markdown("### Esposizione & pendenza sulla pista selezionata")
         render_dem(T, ctx)
+
+        # POV GARA
+        try:
+            ctx = pov_mod.render_pov_view(T, ctx) or ctx
+        except Exception as e:
+            st.info(f"POV non disponibile per questa gara: {e}")
 
         # ---------- Tuning WC di base (preset statico) ----------
         wc = get_wc_tuning_for_event(selected_event, WCSkierLevel.WC)
