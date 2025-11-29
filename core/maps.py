@@ -8,14 +8,10 @@
 #     · parte dalla località selezionata (ctx["lat"], ctx["lon"])
 #     · si aggiorna SUBITO al click (usando session_state del folium key)
 #     · viene "agganciato" al punto più vicino di una pista downhill
-# - Evidenzia la pista selezionata (colore giallo + più spessa)
+# - Evidenzia la pista selezionata (colore diverso / più spessa)
 # - Nomi piste SEMPRE visibili in mappa (testo piccolo al centro)
 #   e nome della pista selezionata evidenziato
-# - Colori piste in base alla difficoltà:
-#     · verde / easy / novice
-#     · blu / intermediate
-#     · rosso / advanced
-#     · nero / expert
+# - Mostra il nome della pista selezionata sotto la mappa
 # - Marker separato per ogni contesto (ctx["map_context"])
 # - Ritorna ctx aggiornato (lat/lon + marker_lat/lon + selected_piste_name)
 
@@ -40,7 +36,7 @@ def _fetch_downhill_pistes(
     lat: float,
     lon: float,
     radius_km: float = 10.0,
-) -> Tuple[int, List[List[Tuple[float, float]]], List[Optional[str]], List[Optional[str]]]:
+) -> Tuple[int, List[List[Tuple[float, float]]], List[Optional[str]]]:
     """
     Scarica le piste di discesa (piste:type=downhill) via Overpass attorno
     a (lat, lon) con raggio in km.
@@ -49,7 +45,6 @@ def _fetch_downhill_pistes(
       - numero di piste
       - lista di polilinee, ciascuna come lista di (lat, lon)
       - lista nomi (stessa lunghezza delle polilinee, può contenere None)
-      - lista difficoltà (easy/intermediate/advanced/expert/..., può essere None)
     """
     radius_m = int(radius_km * 1000)
 
@@ -73,14 +68,13 @@ def _fetch_downhill_pistes(
         r.raise_for_status()
         js = r.json()
     except Exception:
-        return 0, [], [], []
+        return 0, [], []
 
     elements = js.get("elements", [])
     nodes = {el["id"]: el for el in elements if el.get("type") == "node"}
 
     polylines: List[List[Tuple[float, float]]] = []
     names: List[Optional[str]] = []
-    diffs: List[Optional[str]] = []
     piste_count = 0
 
     # helper per estrarre nome sensato
@@ -92,21 +86,6 @@ def _fetch_downhill_pistes(
                 val = str(tags[key]).strip()
                 if val:
                     return val
-        return None
-
-    # helper per estrarre difficoltà
-    def _difficulty_from_tags(tags: Dict[str, Any]) -> Optional[str]:
-        if not tags:
-            return None
-        # standard OSM per piste
-        val = tags.get("piste:difficulty")
-        if val:
-            return str(val).strip().lower()
-        # fallback: alcuni usano "difficulty" o "color"
-        if "difficulty" in tags:
-            return str(tags["difficulty"]).strip().lower()
-        if "color" in tags:
-            return str(tags["color"]).strip().lower()
         return None
 
     for el in elements:
@@ -146,10 +125,9 @@ def _fetch_downhill_pistes(
         if len(coords) >= 2:
             polylines.append(coords)
             names.append(_name_from_tags(tags))
-            diffs.append(_difficulty_from_tags(tags))
             piste_count += 1
 
-    return piste_count, polylines, names, diffs
+    return piste_count, polylines, names
 
 
 # ----------------------------------------------------------------------
@@ -204,32 +182,6 @@ def _snap_to_nearest_piste_point(
         return best_lat, best_lon, best_idx, best_dist
 
     return click_lat, click_lon, None, None
-
-
-def _color_for_difficulty(diff: Optional[str]) -> str:
-    """
-    Mappa la difficoltà OSM in un colore "pista" classico.
-    """
-    if not diff:
-        return "#e5e7eb"  # grigio chiaro fallback
-
-    d = diff.lower()
-
-    # mapping generico
-    if any(k in d for k in ["novice", "easy", "green"]):
-        return "#22c55e"  # verde
-    if any(k in d for k in ["intermediate", "blue"]):
-        return "#3b82f6"  # blu
-    if any(k in d for k in ["advanced", "red"]):
-        return "#ef4444"  # rosso
-    if any(k in d for k in ["expert", "black"]):
-        return "#000000"  # nero
-
-    # freeride, vari, ecc -> viola-ish
-    if "freeride" in d:
-        return "#a855f7"
-
-    return "#e5e7eb"
 
 
 # ----------------------------------------------------------------------
@@ -299,12 +251,11 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
     piste_count = 0
     polylines: List[List[Tuple[float, float]]] = []
     piste_names: List[Optional[str]] = []
-    piste_diffs: List[Optional[str]] = []
     selected_idx: Optional[int] = st.session_state.get(selected_piste_idx_key, None)
     selected_dist_m: Optional[float] = ctx.get("selected_piste_distance_m")
 
     if show_pistes:
-        piste_count, polylines, piste_names, piste_diffs = _fetch_downhill_pistes(
+        piste_count, polylines, piste_names = _fetch_downhill_pistes(
             marker_lat,
             marker_lon,
             radius_km=10.0,
@@ -372,15 +323,9 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
 
     # piste con tooltip nome + LABEL SEMPRE VISIBILE + highlight pista selezionata
     if show_pistes and polylines:
-        for i, coords in enumerate(polylines):
-            name = piste_names[i] if i < len(piste_names) else None
-            diff = piste_diffs[i] if i < len(piste_diffs) else None
-
+        for i, (coords, name) in enumerate(zip(polylines, piste_names)):
             tooltip = name if name else None
             is_selected = selected_idx is not None and i == selected_idx
-
-            # colore in base alla difficoltà
-            base_color = _color_for_difficulty(diff)
 
             # stile linea
             line_kwargs = {
@@ -389,9 +334,7 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
                 "opacity": 1.0 if is_selected else 0.9,
             }
             if is_selected:
-                line_kwargs["color"] = "yellow"  # highlight pista selezionata
-            else:
-                line_kwargs["color"] = base_color
+                line_kwargs["color"] = "yellow"
 
             folium.PolyLine(
                 tooltip=tooltip,
@@ -452,9 +395,6 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
     ):
         selected_name = piste_names[selected_idx] or "pista senza nome"
         ctx["selected_piste_name"] = selected_name
-        ctx["selected_piste_difficulty"] = (
-            piste_diffs[selected_idx] if selected_idx < len(piste_diffs) else None
-        )
 
         if selected_dist_m is not None:
             st.markdown(
