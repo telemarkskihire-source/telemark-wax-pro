@@ -42,52 +42,17 @@ from core.race_tuning import (
     SkierLevel as TuneSkierLevel,
     get_tuning_recommendation,
 )
-from core.race_integration import get_wc_tuning_for_event
-from core import meteo as meteo_mod
-from core import wax_logic as wax_mod
-from core.pages.ski_selector import recommend_skis_for_day
-from core import pov as pov_mod           # POV 2D + estrazione pista
-from core import pov_3d as pov3d_mod      # POV 3D
-
-import core.search as search_mod  # debug / uso interno
-
-
-# --- hard-reload moduli core.* ---
-importlib.invalidate_caches()
-for name in list(sys.modules.keys()):
-    if name == "core" or name.startswith("core."):
-        del sys.modules[name]
-
-from core.i18n import L
-from core.search import (
-    country_selectbox,
-    location_searchbox,
-    get_current_selection,
-    VERSION as SEARCH_VERSION,
+from core.race_integration import (
+    get_wc_tuning_for_event,
+    SkierLevel as WCSkierLevel,
 )
-from core.maps import render_map
-from core.dem_tools import render_dem
-from core.race_events import (
-    RaceCalendarService,
-    FISCalendarProvider,
-    ASIVACalendarProvider,
-    Federation,
-    RaceEvent,
-    ASIVA_PARTEC_CODES,
-)
-from core.race_tuning import (
-    Discipline,
-    SkierLevel as TuneSkierLevel,
-    get_tuning_recommendation,
-)
-from core.race_integration import get_wc_tuning_for_event, SkierLevel as WCSkierLevel
 from core import meteo as meteo_mod
 from core import wax_logic as wax_mod
 from core.pages.ski_selector import recommend_skis_for_day
 from core import pov as pov_mod          # POV 2D + estrazione pista
 from core import pov_3d as pov3d_mod     # POV 3D
 
-import core.search as search_mod  # debug
+import core.search as search_mod  # debug / uso interno
 
 # ---------------------- THEME ----------------------
 PRIMARY = "#06b6d4"
@@ -910,8 +875,14 @@ else:
         ctx = render_map(T, ctx) or ctx
 
         # aggiorno lat/lon con eventuale click su pista
-        st.session_state["lat"] = ctx.get("lat", st.session_state.get("lat", base_loc["lat"]))
-        st.session_state["lon"] = ctx.get("lon", st.session_state.get("lon", base_loc["lon"]))
+        st.session_state["lat"] = ctx.get(
+            "lat",
+            st.session_state.get("lat", base_loc["lat"]),
+        )
+        st.session_state["lon"] = ctx.get(
+            "lon",
+            st.session_state.get("lon", base_loc["lon"]),
+        )
 
         st.markdown("### Esposizione & pendenza sulla pista selezionata")
         render_dem(T, ctx)
