@@ -1,182 +1,222 @@
 # core/dem_tools.py
-# Telemark · Pro Wax & Tune – DEM V7
+# DEM & pendenza per Telemark · Pro Wax & Tune
 #
-# Questo modulo:
-#  - Recupera quota da ESRI → OpenTopo → fallback
-#  - Calcola esposizione e pendenza con filtro
-#  - Disegna chart Altair in Streamlit
-#  - Fornisce punti con quota per POV 3D
-#
-# NON mostra mappe. Serve solo calcolo + grafici.
+# - Usa API Open-Meteo /elevation per un piccolo grid attorno al punto
+# - Calcola:
+#     · quota media nel intorno
+#     · pendenza (gradi) dal gradiente centrale
+#     · esposizione (aspet) in gradi e come stringa N/NE/.../W
+# - Rende in Streamlit tre valori:
+#     · Quota
+#     · Pendenza
+#     · Esposizione
+# - Usa ctx["marker_lat"/"marker_lon"] se presenti, altrimenti ctx["lat"/"lon"]
 
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
+from typing import Dict, Any, Optional, Tuple, List
+
 import requests
+import numpy as np
 import streamlit as st
-import pandas as pd
-import altair as alt
-from typing import Any, Dict, List, Tuple
+
+UA = {"User-Agent": "telemark-wax-pro/2.2"}
 
 
-UA = {"User-Agent": "telemark-dem/3.1"}
+@dataclass
+class DEMSample:
+    lat: float
+    lon: float
+    elevation_m: float
 
 
-# ---------------------------------------------------------------------
-# DEM SOURCES
-# ---------------------------------------------------------------------
-def _esri_elevation(lat: float, lon: float) -> float | None:
-    """Esri World Elevation (best quality)."""
-    url = (
-        "https://elevation.arcgis.com/arcgis/rest/services/Tools/ElevationSync/"
-        "GPServer/Profile/execute"
+# ----------------------------------------------------------------------
+# Helper geografici
+# ----------------------------------------------------------------------
+def _haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    R = 6371000.0
+    phi1 = math.radians(lat1)
+    phi2 = math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlambda = math.radians(lon2 - lon1)
+    a = (
+        math.sin(dphi / 2.0) ** 2
+        + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2.0) ** 2
     )
-    payload = {
-        "InputLineFeatures": {
-            "features": [
-                {
-                    "geometry": {
-                        "paths": [[[lon, lat], [lon, lat]]],
-                        "spatialReference": {"wkid": 4326},
-                    }
-                }
-            ],
-            "geometryType": "esriGeometryPolyline",
-        },
-        "ProfileIDField": "",
-        "MaximumSampleDistance": {"distance": 5, "units": "esriMeters"},
-        "returnZ": "true",
-        "f": "json",
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+    return R * c
+
+
+def _bearing_deg(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """
+    Ritorna bearing geodetico (0 = Nord, 90 = Est) in gradi.
+    """
+    phi1 = math.radians(lat1)
+    phi2 = math.radians(lat2)
+    dlambda = math.radians(lon2 - lon1)
+    x = math.sin(dlambda) * math.cos(phi2)
+    y = math.cos(phi1) * math.sin(phi2) - math.sin(phi1) * math.cos(phi2) * math.cos(
+        dlambda
+    )
+    brng = math.degrees(math.atan2(x, y))
+    return (brng + 360.0) % 360.0
+
+
+def _aspect_to_label(aspect_deg: float) -> str:
+    """
+    Converte esposizione (0 = N, 90 = E) in label N/NE/E/...
+    """
+    dirs = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]
+    idx = int(((aspect_deg + 22.5) % 360) / 45.0)
+    return dirs[idx]
+
+
+# ----------------------------------------------------------------------
+# DEM sampling con Open-Meteo
+# ----------------------------------------------------------------------
+@st.cache_data(ttl=3600, show_spinner=False)
+def _sample_dem_grid(
+    lat: float,
+    lon: float,
+    size: int = 5,
+    spacing_m: float = 30.0,
+) -> Tuple[np.ndarray, float]:
+    """
+    Sample DEM su una griglia size×size attorno a (lat, lon).
+
+    Ritorna:
+      - elev_grid (size×size) in metri
+      - spacing effettivo in metri fra i punti adiacenti
+    """
+    if size % 2 == 0:
+        size += 1  # vogliamo size dispari (per avere centro esatto)
+
+    half = size // 2
+
+    # conversione metri -> gradi (approx)
+    dlat = spacing_m / 111320.0
+    dlon = spacing_m / (111320.0 * max(0.1, math.cos(math.radians(lat))))
+
+    lats: List[float] = []
+    lons: List[float] = []
+    for j in range(size):
+        for i in range(size):
+            lats.append(lat + (j - half) * dlat)
+            lons.append(lon + (i - half) * dlon)
+
+    params = {
+        "latitude": ",".join(f"{x:.6f}" for x in lats),
+        "longitude": ",".join(f"{x:.6f}" for x in lons),
     }
+
     try:
-        r = requests.post(url, json=payload, timeout=6, headers=UA)
-        js = r.json()
-        rows = js.get("results", [{}])[0].get("value", {}).get("features", [])
-        if rows:
-            attrs = rows[0].get("attributes", {})
-            z = attrs.get("HEIGHT")
-            return float(z) if z is not None else None
+        r = requests.get(
+            "https://api.open-meteo.com/v1/elevation",
+            params=params,
+            headers=UA,
+            timeout=10,
+        )
+        r.raise_for_status()
+        js = r.json() or {}
+        elev = js.get("elevation", [])
+        if not elev or len(elev) != len(lats):
+            raise RuntimeError("elevation data mismatch")
     except Exception:
-        return None
-    return None
+        # fallback: griglia piatta a quota 0
+        elev = [0.0] * (size * size)
+
+    elev_arr = np.array(elev, dtype=float).reshape((size, size))
+
+    # distanza effettiva fra centro e cella centrale a Est (per sicurezza)
+    center_lat = lat
+    center_lon = lon
+    east_lat = lat
+    east_lon = lon + dlon
+    spacing_eff = _haversine_m(center_lat, center_lon, east_lat, east_lon)
+
+    return elev_arr, float(spacing_eff)
 
 
-def _opentopo_elevation(lat: float, lon: float) -> float | None:
-    """OpenTopo DEM (fallback)."""
-    url = f"https://api.opentopodata.org/v1/test-dataset?locations={lat},{lon}"
-    try:
-        r = requests.get(url, timeout=6, headers=UA)
-        js = r.json()
-        res = js.get("results", [{}])[0]
-        h = res.get("elevation")
-        return float(h) if h is not None else None
-    except Exception:
-        return None
-
-
-def get_elevation(lat: float, lon: float) -> float:
-    """DEM ibrido robusto."""
-    for fn in (_esri_elevation, _opentopo_elevation):
-        h = fn(lat, lon)
-        if h is not None:
-            return h
-    return 0.0
-
-
-# ---------------------------------------------------------------------
-# SLOPE & ASPECT
-# ---------------------------------------------------------------------
-def _slope_aspect(lat: float, lon: float, step_m: float = 18.0) -> Tuple[float, float]:
+def _compute_slope_aspect(
+    elev: np.ndarray,
+    spacing_m: float,
+) -> Tuple[float, float]:
     """
-    Calcola pendenza (°) e esposizione (°) usando 8 sample attorno.
+    Calcola pendenza (gradi) ed esposizione (gradi da Nord) dal grid elev.
+    Usa differenze finite centrali sul centro della griglia.
     """
-    dlat = step_m / 111320
-    dlon = step_m / (40075000 * math.cos(math.radians(lat)) / 360)
+    h, w = elev.shape
+    cy = h // 2
+    cx = w // 2
 
-    samples = []
-    for dy in (-dlat, 0, dlat):
-        for dx in (-dlon, 0, dlon):
-            la = lat + dy
-            lo = lon + dx
-            samples.append((la, lo, get_elevation(la, lo)))
+    # gradienti centrali (N-S, E-W)
+    dz_dy = (elev[cy + 1, cx] - elev[cy - 1, cx]) / (2.0 * spacing_m)
+    dz_dx = (elev[cy, cx + 1] - elev[cy, cx - 1]) / (2.0 * spacing_m)
 
-    # griglia 3x3
-    z = [s[2] for s in samples]
-    if len(z) != 9:
-        return 0.0, 0.0
+    # pendenza: arctan(sqrt(dx^2 + dy^2))
+    grad_mag = math.sqrt(dz_dx ** 2 + dz_dy ** 2)
+    slope_rad = math.atan(grad_mag)
+    slope_deg = math.degrees(slope_rad)
 
-    # pendenza
-    dzdx = ((z[2] + z[5] + z[8]) - (z[0] + z[3] + z[6])) / (6 * step_m)
-    dzdy = ((z[6] + z[7] + z[8]) - (z[0] + z[1] + z[2])) / (6 * step_m)
+    # clamp a valori sensati (0–75°)
+    slope_deg = max(0.0, min(slope_deg, 75.0))
 
-    slope = math.degrees(math.atan(math.sqrt(dzdx**2 + dzdy**2)))
-
-    # esposizione
-    if dzdx == 0 and dzdy == 0:
-        aspect = 0.0
+    # esposizione: direzione di massima discesa
+    # attenzione ai segni: y cresce verso Sud nel grid
+    # usiamo convenzione 0 = N, 90 = E
+    if dz_dx == 0 and dz_dy == 0:
+        aspect_deg = 0.0
     else:
-        aspect = math.degrees(math.atan2(dzdx, dzdy))
-        aspect = (aspect + 360) % 360
+        # gradient vector = (dz/dx East, dz/dy South)
+        # direzione di massima pendenza in gradi da Nord:
+        aspect_rad = math.atan2(dz_dx, dz_dy)  # x = Est, y = Sud
+        aspect_deg = (math.degrees(aspect_rad) + 360.0) % 360.0
 
-    return slope, aspect
-
-
-def _aspect_label(angle: float) -> str:
-    dirs = [
-        (0, "N"),
-        (45, "NE"),
-        (90, "E"),
-        (135, "SE"),
-        (180, "S"),
-        (225, "SW"),
-        (270, "W"),
-        (315, "NW"),
-    ]
-    best = min(dirs, key=lambda x: abs(x[0] - angle))
-    return best[1]
+    return float(slope_deg), float(aspect_deg)
 
 
-# ---------------------------------------------------------------------
-# ALTITUDE PROFILING for POV3D
-# ---------------------------------------------------------------------
-def add_elevation_to_polyline(points: List[Dict[str, float]]) -> List[Dict[str, float]]:
-    """Aggiunge 'ele' a ogni punto (lento ma accurato)."""
-    out = []
-    for p in points:
-        h = get_elevation(p["lat"], p["lon"])
-        out.append({"lat": p["lat"], "lon": p["lon"], "ele": h})
-    return out
+# ----------------------------------------------------------------------
+# Render Streamlit
+# ----------------------------------------------------------------------
+def render_dem(T: Dict[str, str], ctx: Dict[str, Any]) -> None:
+    """
+    Calcola quota, pendenza ed esposizione per il punto selezionato
+    e li mostra nella UI.
 
-
-# ---------------------------------------------------------------------
-# STREAMLIT VIEW (giorno)
-# ---------------------------------------------------------------------
-def render_dem(T: Dict[str, Any], ctx: Dict[str, Any]) -> None:
-    """Mostra DEM (pendenza/esposizione) attorno al punto selezionato."""
-
+    Usa prima ctx["marker_lat"/"marker_lon"]; se mancanti,
+    fallback su ctx["lat"/"lon"].
+    """
     lat = float(ctx.get("marker_lat", ctx.get("lat", 45.83333)))
     lon = float(ctx.get("marker_lon", ctx.get("lon", 7.73333)))
 
-    with st.spinner("Calcolo esposizione & pendenza…"):
-        slope, aspect = _slope_aspect(lat, lon)
-        elev = get_elevation(lat, lon)
+    elev_grid, spacing_m = _sample_dem_grid(lat, lon, size=5, spacing_m=30.0)
 
-    df = pd.DataFrame(
-        {
-            "metric": ["Quota (m)", "Pendenza (°)", "Esposizione (°)"],
-            "value": [elev, slope, aspect],
-        }
-    )
+    # quota: media nel riquadro 3×3 centrale
+    h, w = elev_grid.shape
+    cy = h // 2
+    cx = w // 2
+    center_patch = elev_grid[cy - 1 : cy + 2, cx - 1 : cx + 2]
+    elev_center = float(np.nanmean(center_patch))
 
-    cA, cB, cC = st.columns(3)
-    cA.metric("Quota", f"{elev:.0f} m")
-    cB.metric("Pendenza", f"{slope:.1f}°")
-    cC.metric("Esposizione", f"{_aspect_label(aspect)} ({aspect:.0f}°)")
+    slope_deg, aspect_deg = _compute_slope_aspect(elev_grid, spacing_m)
+    aspect_label = _aspect_to_label(aspect_deg)
 
+    # ---- UI ----
+    col_q, col_s, col_a = st.columns(3)
 
-# ---------------------------------------------------------------------
-# PER POV 3D: restituisce DEM lungo una pista
-# ---------------------------------------------------------------------
-def build_dem_profile_for_pov(points: List[Dict[str, float]]) -> List[Dict[str, float]]:
-    """Ritorna polyline con quota reale (ele) per POV 3D."""
-    return add_elevation_to_polyline(points)
+    with col_q:
+        st.metric("Quota", f"{elev_center:.0f} m")
+
+    with col_s:
+        st.metric("Pendenza", f"{slope_deg:.1f}°")
+
+    with col_a:
+        st.metric("Esposizione", f"{aspect_label} ({aspect_deg:.0f}°)")
+
+    # Salviamo qualcosa nel contesto per possibili usi futuri
+    ctx["dem_elevation_m"] = elev_center
+    ctx["dem_slope_deg"] = slope_deg
+    ctx["dem_aspect_deg"] = aspect_deg
+    ctx["dem_aspect_label"] = aspect_label
