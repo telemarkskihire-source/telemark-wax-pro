@@ -28,7 +28,7 @@ UA = {"User-Agent": "telemark-wax-pro/3.0"}
 
 
 # ----------------------------------------------------------------------
-# Overpass: fetch piste downhill (cache generica)
+# Overpass: fetch piste downhill (cache)
 # ----------------------------------------------------------------------
 @st.cache_data(ttl=1800, show_spinner=False)
 def _fetch_downhill_pistes(
@@ -199,11 +199,11 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
     map_key = f"map_{map_context}"
     selected_piste_idx_key = f"selected_piste_idx_{map_context}"
 
-    # posizione base (centro comprensorio): usata per caricare le piste una volta sola
+    # centro base per caricare le piste (comprensorio)
     base_lat = float(ctx.get("lat", 45.83333))
     base_lon = float(ctx.get("lon", 7.73333))
 
-    # posizione marker
+    # posizione marker (parte dal centro, poi da session_state)
     marker_lat = float(st.session_state.get(marker_lat_key, base_lat))
     marker_lon = float(st.session_state.get(marker_lon_key, base_lon))
 
@@ -264,7 +264,7 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
         control=True,
     ).add_to(m)
 
-    # piste con tooltip nome + LABEL SEMPRE VISIBILE + highlight pista selezionata
+    # piste con nome sempre visibile + highlight pista selezionata
     if show_pistes and polylines:
         for i, (coords, name) in enumerate(zip(polylines, piste_names)):
             is_selected = selected_idx is not None and i == selected_idx
@@ -278,7 +278,6 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
 
             folium.PolyLine(**line_kwargs).add_to(m)
 
-            # LABEL fissa al centro pista
             if name:
                 mid_idx = len(coords) // 2
                 label_lat, label_lon = coords[mid_idx]
@@ -309,7 +308,7 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
     ).add_to(m)
 
     # ------------------------------------------------------------------
-    # Render Folium e leggo il click QUI (direttamente dal valore di ritorno)
+    # Render Folium e leggo il click
     # ------------------------------------------------------------------
     map_data = st_folium(
         m,
@@ -328,29 +327,17 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
             click_lat = marker_lat
             click_lon = marker_lon
 
-        # Per lo SNAP usiamo un fetch locale (raggio 5 km) centrato sul click
-        snap_polylines: List[List[Tuple[float, float]]] = []
-        snap_names: List[Optional[str]] = []
-        snap_count = 0
-
-        if show_pistes:
-            snap_count, snap_polylines, snap_names = _fetch_downhill_pistes(
-                click_lat,
-                click_lon,
-                radius_km=5.0,
-            )
-
-        if show_pistes and snap_polylines:
+        # provo ad agganciare alla pista più vicina (entro 200 m)
+        if show_pistes and polylines:
             snapped_lat, snapped_lon, idx, dist_m = _snap_to_nearest_piste_point(
                 click_lat,
                 click_lon,
-                snap_polylines,
+                polylines,
                 max_snap_m=200.0,
             )
         else:
             snapped_lat, snapped_lon, idx, dist_m = click_lat, click_lon, None, None
 
-        # aggiorna ctx + session con posizione (snappata o no)
         marker_lat = snapped_lat
         marker_lon = snapped_lon
 
@@ -361,16 +348,16 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
         st.session_state[marker_lat_key] = marker_lat
         st.session_state[marker_lon_key] = marker_lon
 
-        # salva la pista selezionata (se c'è)
-        if idx is not None and snap_names:
-            selected_idx = idx
+        if idx is not None and 0 <= idx < len(piste_names):
             st.session_state[selected_piste_idx_key] = idx
+            selected_idx = idx
             selected_dist_m = dist_m
             ctx["selected_piste_distance_m"] = dist_m
-            ctx["selected_piste_name"] = snap_names[idx] or "pista senza nome"
+            ctx["selected_piste_name"] = piste_names[idx] or "pista senza nome"
         else:
-            selected_idx = None
             st.session_state[selected_piste_idx_key] = None
+            selected_idx = None
+            selected_dist_m = None
             ctx["selected_piste_distance_m"] = None
             ctx["selected_piste_name"] = None
 
