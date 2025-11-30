@@ -10,6 +10,7 @@
 #     · viene "agganciato" al punto più vicino di una pista downhill
 # - Marker separato per ogni contesto (ctx["map_context"])
 # - Etichetta con nome pista (sempre visibile) al centro della linea
+# - Evidenzia la pista più vicina al marker
 # - Ritorna ctx aggiornato (lat/lon + marker_lat/lon)
 
 from __future__ import annotations
@@ -176,6 +177,31 @@ def _snap_to_nearest_piste_point(
     return click_lat, click_lon
 
 
+def _find_nearest_piste_index(
+    lat: float,
+    lon: float,
+    polylines: List[List[Tuple[float, float]]],
+    max_dist_m: float = 400.0,
+) -> Optional[int]:
+    """
+    Restituisce l'indice della pista (polyline) più vicina al punto dato.
+    Se distanza minima > max_dist_m → None.
+    """
+    best_idx: Optional[int] = None
+    best_dist = float("inf")
+
+    for idx, line in enumerate(polylines):
+        for pt_lat, pt_lon in line:
+            d = _haversine_m(lat, lon, pt_lat, pt_lon)
+            if d < best_dist:
+                best_dist = d
+                best_idx = idx
+
+    if best_idx is not None and best_dist <= max_dist_m:
+        return best_idx
+    return None
+
+
 # ----------------------------------------------------------------------
 # Funzione principale chiamata dalla app
 # ----------------------------------------------------------------------
@@ -241,6 +267,7 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
     piste_count = 0
     polylines: List[List[Tuple[float, float]]] = []
     piste_names: List[Optional[str]] = []
+    selected_piste_idx: Optional[int] = None
 
     if show_pistes:
         piste_count, polylines, piste_names = _fetch_downhill_pistes(
@@ -265,6 +292,18 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
             ctx["marker_lon"] = marker_lon
             st.session_state[marker_lat_key] = marker_lat
             st.session_state[marker_lon_key] = marker_lon
+
+        # individua la pista più vicina al marker (pista "attuale")
+        if polylines:
+            selected_piste_idx = _find_nearest_piste_index(
+                marker_lat,
+                marker_lon,
+                polylines,
+                max_dist_m=400.0,
+            )
+
+    # salviamo nel contesto quale pista è selezionata (se esiste)
+    ctx["selected_piste_index"] = selected_piste_idx
 
     st.caption(f"Piste downhill trovate: {piste_count}")
 
@@ -300,14 +339,21 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
     # - PolyLine con tooltip (per desktop / hover)
     # - Label sempre visibile al centro pista (DivIcon) per mobile
     if show_pistes and polylines:
-        for coords, name in zip(polylines, piste_names):
+        for idx, (coords, name) in enumerate(zip(polylines, piste_names)):
             tooltip = name if name else None
+
+            # evidenzia la pista selezionata (quella più vicina al marker)
+            is_selected = selected_piste_idx is not None and idx == selected_piste_idx
+            line_weight = 6 if is_selected else 3
+            line_opacity = 1.0 if is_selected else 0.6
+            line_color = "red" if is_selected else "blue"
 
             # linea pista
             folium.PolyLine(
                 locations=coords,
-                weight=3,
-                opacity=0.9,
+                weight=line_weight,
+                opacity=line_opacity,
+                color=line_color,
                 tooltip=tooltip,
             ).add_to(m)
 
