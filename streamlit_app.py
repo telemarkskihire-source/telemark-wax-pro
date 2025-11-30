@@ -14,6 +14,41 @@ import pandas as pd
 import streamlit as st
 import altair as alt
 
+# --- assicura che la root del progetto sia davanti a tutto in sys.path ---
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
+# --- hard-reload moduli core.* ---
+importlib.invalidate_caches()
+for name in list(sys.modules.keys()):
+    if name == "core" or name.startswith("core."):
+        del sys.modules[name]
+
+from core.i18n import L
+from core.search import (
+    country_selectbox,
+    location_searchbox,
+    get_current_selection,
+    VERSION as SEARCH_VERSION,
+)
+from core.maps import render_map
+from core.dem_tools import render_dem
+from core.race_events import (
+    RaceCalendarService,
+    FISCalendarProvider,
+    ASIVACalendarProvider,
+    Federation,
+    RaceEvent,
+    ASIVA_PARTEC_CODES,
+)
+from core.race_tuning import (
+    Discipline,
+    SkierLevel as TuneSkierLevel,
+    get_tuning_recommendation,
+)
+
+
 # --- hard-reload moduli core.* ---
 importlib.invalidate_caches()
 for name in list(sys.modules.keys()):
