@@ -1,7 +1,12 @@
 # core/__init__.py
-# Pacchetto Telemark · Pro Wax & Tune
-#
-# Non importiamo nulla qui per evitare dipendenze circolari
-# o errori silenziosi sugli import.
+# Package marker per il core della app Telemark · Pro Wax & Tune
 
-__all__ = []
+__all__ = [
+    "i18n",
+    "maps",
+    "dem_tools",
+    "meteo",
+    "race_tuning",
+    "race_events",
+    "search",
+]
