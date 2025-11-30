@@ -6,9 +6,9 @@
 # - Piste da Overpass: piste:type=downhill
 # - Puntatore che:
 #     · parte dalla località selezionata (ctx["lat"], ctx["lon"])
-#     · si aggiorna SUBITO al click (1 solo click)
+#     · si aggiorna SUBITO al click (usando stato del widget folium)
 #     · viene "agganciato" al punto più vicino di una pista downhill
-#       entro un raggio ridotto (SNAP_MAX_M)
+#       entro raggio SNAP_MAX_M
 # - Evidenzia la pista selezionata (colore diverso / più spessa)
 # - Nomi piste SEMPRE visibili in mappa (DivIcon al centro)
 # - Mostra il nome della pista selezionata sotto la mappa
@@ -27,7 +27,7 @@ import folium
 
 UA = {"User-Agent": "telemark-wax-pro/3.0"}
 
-# raggio massimo per lo snap alla pista (più stretto di prima)
+# raggio massimo per lo snap alla pista (più stretto)
 SNAP_MAX_M = 120.0
 
 
@@ -202,7 +202,8 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
     marker_lat_key = f"marker_lat_{map_context}"
     marker_lon_key = f"marker_lon_{map_context}"
     selected_piste_idx_key = f"selected_piste_idx_{map_context}"
-    map_key = f"map_{map_context}"  # key per st_folium
+    selected_piste_dist_key = f"selected_piste_dist_{map_context}"
+    map_key = f"map_{map_context}"  # key del widget folium
 
     # --- posizione base ---
     default_lat = float(ctx.get("lat", 45.83333))
@@ -212,15 +213,46 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
     marker_lat = float(st.session_state.get(marker_lat_key, ctx.get("marker_lat", default_lat)))
     marker_lon = float(st.session_state.get(marker_lon_key, ctx.get("marker_lon", default_lon)))
 
-    # aggiorna ctx con posizione corrente del marker (prima di eventuale click)
+    # eventuale pista selezionata da run precedente
+    selected_idx: Optional[int] = st.session_state.get(selected_piste_idx_key, None)
+    selected_dist_m: Optional[float] = st.session_state.get(selected_piste_dist_key, None)
+
+    # ------------------------------------------------------------------
+    # 1) GESTIONE CLICK PRIMA DI DISEGNARE LA MAPPA
+    #    Leggiamo lo stato del widget folium dalla sessione
+    # ------------------------------------------------------------------
+    prev_state = st.session_state.get(map_key)
+    if isinstance(prev_state, dict):
+        last_clicked = prev_state.get("last_clicked")
+        if last_clicked:
+            try:
+                click_lat = float(last_clicked.get("lat"))
+                click_lon = float(last_clicked.get("lng"))
+            except Exception:
+                click_lat = marker_lat
+                click_lon = marker_lon
+
+            # aggiorno subito il marker grezzo (anche se poi snapperemo)
+            marker_lat = click_lat
+            marker_lon = click_lon
+
+            # aggiorno ctx provvisorio (verrà raffinato dopo lo snap/piste)
+            ctx["lat"] = marker_lat
+            ctx["lon"] = marker_lon
+            ctx["marker_lat"] = marker_lat
+            ctx["marker_lon"] = marker_lon
+
+            st.session_state[marker_lat_key] = marker_lat
+            st.session_state[marker_lon_key] = marker_lon
+
+            # NON resetto qui last_clicked: streamlit gestisce il valore,
+            # e ad ogni nuovo click verrà aggiornato.
+
+    # se nessun click, assicuro ctx coerente con marker corrente
     ctx["lat"] = marker_lat
     ctx["lon"] = marker_lon
     ctx["marker_lat"] = marker_lat
     ctx["marker_lon"] = marker_lon
-
-    # eventuale pista selezionata da run precedente
-    selected_idx: Optional[int] = st.session_state.get(selected_piste_idx_key, None)
-    selected_dist_m: Optional[float] = ctx.get("selected_piste_distance_m")
 
     # ------------------------------------------------------------------
     # Checkbox per piste & fetch piste
@@ -236,16 +268,55 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
     piste_names: List[Optional[str]] = []
 
     if show_pistes:
+        # usiamo il marker corrente come centro
         piste_count, polylines, piste_names = _fetch_downhill_pistes(
             marker_lat,
             marker_lon,
             radius_km=10.0,
         )
 
+        # se c'è stato un click in questo run e abbiamo piste, facciamo lo snap
+        if isinstance(prev_state, dict) and prev_state.get("last_clicked") and polylines:
+            try:
+                click_lat = float(prev_state["last_clicked"].get("lat"))
+                click_lon = float(prev_state["last_clicked"].get("lng"))
+            except Exception:
+                click_lat = marker_lat
+                click_lon = marker_lon
+
+            snapped_lat, snapped_lon, idx, dist_m = _snap_to_nearest_piste_point(
+                click_lat,
+                click_lon,
+                polylines,
+                max_snap_m=SNAP_MAX_M,
+            )
+
+            marker_lat = snapped_lat
+            marker_lon = snapped_lon
+
+            ctx["lat"] = marker_lat
+            ctx["lon"] = marker_lon
+            ctx["marker_lat"] = marker_lat
+            ctx["marker_lon"] = marker_lat
+
+            st.session_state[marker_lat_key] = marker_lat
+            st.session_state[marker_lon_key] = marker_lon
+
+            if idx is not None:
+                selected_idx = idx
+                selected_dist_m = dist_m
+                st.session_state[selected_piste_idx_key] = idx
+                st.session_state[selected_piste_dist_key] = dist_m
+            else:
+                selected_idx = None
+                selected_dist_m = None
+                st.session_state[selected_piste_idx_key] = None
+                st.session_state[selected_piste_dist_key] = None
+
     st.caption(f"Piste downhill trovate: {piste_count}")
 
     # ------------------------------------------------------------------
-    # Costruisco la mappa Folium con il marker attuale
+    # Costruisco la mappa Folium con il marker aggiornato
     # ------------------------------------------------------------------
     m = folium.Map(
         location=[marker_lat, marker_lon],
@@ -268,7 +339,7 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
         control=True,
     ).add_to(m)
 
-    # PISTE: polilinee + label centro + highlight pista selezionata
+    # piste con tooltip nome + LABEL SEMPRE VISIBILE + highlight pista selezionata
     if show_pistes and polylines:
         for i, (coords, name) in enumerate(zip(polylines, piste_names)):
             tooltip = name if name else None
@@ -311,16 +382,16 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
                     icon=folium.DivIcon(html=html),
                 ).add_to(m)
 
-    # marker puntatore (usa SEMPRE marker_lat/marker_lon correnti)
+    # marker puntatore
     folium.Marker(
         location=[marker_lat, marker_lon],
         icon=folium.Icon(color="red", icon="flag"),
     ).add_to(m)
 
     # ------------------------------------------------------------------
-    # Render Folium e leggo il click dal valore di ritorno (NO hack su session_state[map_key])
+    # Render Folium (solo per visualizzare; lo stato click lo leggiamo al prossimo run)
     # ------------------------------------------------------------------
-    map_data = st_folium(
+    _ = st_folium(
         m,
         height=450,
         width=None,
@@ -328,52 +399,7 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
     )
 
     # ------------------------------------------------------------------
-    # Gestione click: 1 click = 1 spostamento marker + eventuale snap
-    # ------------------------------------------------------------------
-    if isinstance(map_data, dict) and map_data.get("last_clicked"):
-        click = map_data["last_clicked"]
-        try:
-            click_lat = float(click.get("lat"))
-            click_lon = float(click.get("lng"))
-        except Exception:
-            click_lat = marker_lat
-            click_lon = marker_lon
-
-        # se ho piste, provo ad agganciare alla più vicina
-        if show_pistes and polylines:
-            snapped_lat, snapped_lon, idx, dist_m = _snap_to_nearest_piste_point(
-                click_lat,
-                click_lon,
-                polylines,
-                max_snap_m=SNAP_MAX_M,
-            )
-        else:
-            snapped_lat, snapped_lon, idx, dist_m = click_lat, click_lon, None, None
-
-        # aggiorna marker
-        marker_lat = snapped_lat
-        marker_lon = snapped_lon
-
-        ctx["lat"] = marker_lat
-        ctx["lon"] = marker_lon
-        ctx["marker_lat"] = marker_lat
-        ctx["marker_lon"] = marker_lon
-        st.session_state[marker_lat_key] = marker_lat
-        st.session_state[marker_lon_key] = marker_lon
-
-        # pista selezionata
-        if idx is not None:
-            selected_idx = idx
-            st.session_state[selected_piste_idx_key] = idx
-            selected_dist_m = dist_m
-            ctx["selected_piste_distance_m"] = dist_m
-        else:
-            selected_idx = None
-            st.session_state[selected_piste_idx_key] = None
-            ctx["selected_piste_distance_m"] = None
-
-    # ------------------------------------------------------------------
-    # Info pista selezionata sotto la mappa (usa selected_idx aggiornato)
+    # Info pista selezionata sotto la mappa
     # ------------------------------------------------------------------
     if (
         show_pistes
