@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import os
 import sys
-import importlib
 from datetime import datetime, date as Date, time as dtime, timedelta
 from typing import Optional, Dict, Any
 
@@ -14,16 +13,12 @@ import pandas as pd
 import streamlit as st
 import altair as alt
 
-# --- assicura che la root del progetto sia davanti a tutto in sys.path ---
+# --- assicura che la root del progetto sia in testa al sys.path ---
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-# --- hard-reload moduli core.* ---
-importlib.invalidate_caches()
-for name in list(sys.modules.keys()):
-    if name == "core" or name.startswith("core."):
-        del sys.modules[name]
+# -------------------- IMPORT DAL CORE --------------------
 
 from core.i18n import L
 from core.search import (
@@ -47,6 +42,14 @@ from core.race_tuning import (
     SkierLevel as TuneSkierLevel,
     get_tuning_recommendation,
 )
+from core.race_integration import get_wc_tuning_for_event
+from core import meteo as meteo_mod
+from core import wax_logic as wax_mod
+from core.pages.ski_selector import recommend_skis_for_day
+from core import pov as pov_mod           # POV 2D + estrazione pista
+from core import pov_3d as pov3d_mod      # POV 3D
+
+import core.search as search_mod  # debug / uso interno
 
 
 # --- hard-reload moduli core.* ---
