@@ -1,15 +1,5 @@
 # core/maps.py
-# Mappa & piste per Telemark · Pro Wax & Tune
-#
-# - Base OSM + satellite (Esri World Imagery)
-# - Checkbox "Mostra piste sci alpino sulla mappa"
-# - Piste da Overpass: piste:type=downhill
-# - Puntatore:
-#     · parte da ctx["lat"], ctx["lon"]
-#     · si aggiorna al click (con snap alla pista più vicina)
-#     · il click viene gestito UNA volta sola (niente “casino” ai rerun)
-# - Evidenzia pista selezionata (linea gialla + label evidenziata)
-# - Stato separato per ogni contesto (ctx["map_context"])
+# Mappa + piste da Overpass per Telemark · Pro Wax & Tune
 
 from __future__ import annotations
 
@@ -23,23 +13,93 @@ import folium
 
 UA = {"User-Agent": "telemark-wax-pro/3.0"}
 
+# ---------------------------------------------------------
+# Geometria di base
+# ---------------------------------------------------------
 
-# ----------------------------------------------------------------------
-# Overpass: fetch piste downhill
-# ----------------------------------------------------------------------
-@st.cache_data(ttl=1800, show_spinner=False)
+
+def _haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Distanza approssimata in metri tra due (lat, lon)."""
+    R = 6371000.0
+    phi1 = math.radians(lat1)
+    phi2 = math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlmb = math.radians(lon2 - lon1)
+    a = (
+        math.sin(dphi / 2) ** 2
+        + math.cos(phi1) * math.cos(phi2) * math.sin(dlmb / 2) ** 2
+    )
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+    return R * c
+
+
+def _nearest_point_on_polyline(
+    click_lat: float,
+    click_lon: float,
+    line: List[Tuple[float, float]],
+) -> Tuple[float, Tuple[float, float]]:
+    """
+    Ritorna (distanza_min_m, (lat, lon) più vicino) su una singola polilinea.
+    Usiamo un'approssimazione semplice: punto della polyline con distanza minore.
+    """
+    best_d = 1e12
+    best_pt = line[0]
+    for lat, lon in line:
+        d = _haversine_m(click_lat, click_lon, lat, lon)
+        if d < best_d:
+            best_d = d
+            best_pt = (lat, lon)
+    return best_d, best_pt
+
+
+def _snap_to_nearest_piste(
+    click_lat: float,
+    click_lon: float,
+    lines: List[List[Tuple[float, float]]],
+    max_dist_m: float = 200.0,
+) -> Tuple[Optional[int], float, Optional[Tuple[float, float]]]:
+    """
+    Cerca la pista più vicina al click.
+    Ritorna: (index_pista, distanza_m, punto_snap) — index_pista può essere None.
+    """
+    if not lines:
+        return None, 1e12, None
+
+    best_idx = None
+    best_d = 1e12
+    best_pt: Optional[Tuple[float, float]] = None
+
+    for idx, line in enumerate(lines):
+        d, pt = _nearest_point_on_polyline(click_lat, click_lon, line)
+        if d < best_d:
+            best_d = d
+            best_pt = pt
+            best_idx = idx
+
+    if best_idx is None or best_d > max_dist_m:
+        return None, best_d, None
+
+    return best_idx, best_d, best_pt
+
+
+# ---------------------------------------------------------
+# Overpass: piste downhill
+# ---------------------------------------------------------
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
 def _fetch_downhill_pistes(
     lat: float,
     lon: float,
     radius_km: float = 10.0,
 ) -> Tuple[int, List[List[Tuple[float, float]]], List[Optional[str]]]:
     """
-    Scarica piste di discesa (piste:type=downhill) attorno a (lat, lon).
+    Scarica piste:type=downhill da Overpass attorno a (lat, lon).
 
     Ritorna:
-      - numero piste
-      - lista polilinee (lista di (lat, lon))
-      - lista nomi (stessa lunghezza delle polilinee, può contenere None)
+      - num_piste
+      - lista di polilinee [ [(lat, lon), ...], ... ]
+      - lista nomi (stessa lunghezza, può contenere None)
     """
     radius_m = int(radius_km * 1000)
 
@@ -56,9 +116,9 @@ def _fetch_downhill_pistes(
     try:
         r = requests.post(
             "https://overpass-api.de/api/interpreter",
-            data=query.encode("utf-8"),
+            data={"data": query},
             headers=UA,
-            timeout=25,
+            timeout=30,
         )
         r.raise_for_status()
         js = r.json()
@@ -66,369 +126,227 @@ def _fetch_downhill_pistes(
         return 0, [], []
 
     elements = js.get("elements", [])
-    nodes = {el["id"]: el for el in elements if el.get("type") == "node"}
+    nodes: Dict[int, Tuple[float, float]] = {}
+    ways: Dict[int, Dict[str, Any]] = {}
+
+    # indicizziamo nodes & ways
+    for el in elements:
+        if el.get("type") == "node":
+            nid = el.get("id")
+            nodes[nid] = (float(el.get("lat", 0.0)), float(el.get("lon", 0.0)))
+        elif el.get("type") == "way":
+            wid = el.get("id")
+            ways[wid] = el
 
     polylines: List[List[Tuple[float, float]]] = []
     names: List[Optional[str]] = []
-    piste_count = 0
 
-    def _name_from_tags(tags: Dict[str, Any]) -> Optional[str]:
-        if not tags:
-            return None
-        for key in ("name", "piste:name", "ref"):
-            if key in tags:
-                val = str(tags[key]).strip()
-                if val:
-                    return val
-        return None
-
+    # tutte le way downhill
     for el in elements:
-        if el.get("type") not in ("way", "relation"):
+        if el.get("type") != "way":
             continue
-        tags = el.get("tags") or {}
+        tags = el.get("tags", {})
         if tags.get("piste:type") != "downhill":
             continue
 
         coords: List[Tuple[float, float]] = []
+        for nid in el.get("nodes", []):
+            if nid in nodes:
+                coords.append(nodes[nid])
 
-        if el["type"] == "way":
-            for nid in el.get("nodes", []):
-                nd = nodes.get(nid)
-                if not nd:
-                    continue
-                coords.append((nd["lat"], nd["lon"]))
-        else:  # relation
-            for mem in el.get("members", []):
-                if mem.get("type") != "way":
-                    continue
-                wid = mem.get("ref")
-                way = next(
-                    (e for e in elements if e.get("type") == "way" and e.get("id") == wid),
-                    None,
-                )
-                if not way:
-                    continue
-                for nid in way.get("nodes", []):
-                    nd = nodes.get(nid)
-                    if not nd:
-                        continue
-                    coords.append((nd["lat"], nd["lon"]))
+        if len(coords) < 2:
+            continue
 
-        if len(coords) >= 2:
-            polylines.append(coords)
-            names.append(_name_from_tags(tags))
-            piste_count += 1
+        name = (
+            tags.get("piste:name")
+            or tags.get("name")
+            or tags.get("ref")
+            or None
+        )
+        polylines.append(coords)
+        names.append(name)
 
-    return piste_count, polylines, names
+    # relations che raggruppano più ways
+    for el in elements:
+        if el.get("type") != "relation":
+            continue
+        tags = el.get("tags", {})
+        if tags.get("piste:type") != "downhill":
+            continue
 
+        rel_coords: List[Tuple[float, float]] = []
+        for mem in el.get("members", []):
+            if mem.get("type") != "way":
+                continue
+            wid = mem.get("ref")
+            way = ways.get(wid)
+            if not way:
+                continue
+            for nid in way.get("nodes", []):
+                if nid in nodes:
+                    rel_coords.append(nodes[nid])
 
-# ----------------------------------------------------------------------
-# Utility distanza & snapping
-# ----------------------------------------------------------------------
-def _haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    R = 6371000.0
-    phi1 = math.radians(lat1)
-    phi2 = math.radians(lat2)
-    dphi = math.radians(lat2 - lat1)
-    dlambda = math.radians(lon2 - lon1)
+        if len(rel_coords) < 2:
+            continue
 
-    a = (
-        math.sin(dphi / 2.0) ** 2
-        + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2.0) ** 2
-    )
-    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
-    return R * c
+        name = (
+            tags.get("piste:name")
+            or tags.get("name")
+            or tags.get("ref")
+            or None
+        )
+        polylines.append(rel_coords)
+        names.append(name)
 
-
-def _snap_to_nearest_piste_point(
-    click_lat: float,
-    click_lon: float,
-    polylines: List[List[Tuple[float, float]]],
-    max_snap_m: float = 150.0,
-) -> Tuple[float, float, Optional[int], Optional[float]]:
-    """
-    Se trova un punto di pista entro max_snap_m:
-      -> (lat_snapped, lon_snapped, index_pista, distanza_m)
-    Altrimenti:
-      -> (click_lat, click_lon, None, None)
-    """
-    best_lat = click_lat
-    best_lon = click_lon
-    best_dist = float("inf")
-    best_idx: Optional[int] = None
-
-    for idx, line in enumerate(polylines):
-        for pt_lat, pt_lon in line:
-            d = _haversine_m(click_lat, click_lon, pt_lat, pt_lon)
-            if d < best_dist:
-                best_dist = d
-                best_lat = pt_lat
-                best_lon = pt_lon
-                best_idx = idx
-
-    if best_dist <= max_snap_m and best_idx is not None:
-        return best_lat, best_lon, best_idx, best_dist
-
-    return click_lat, click_lon, None, None
+    return len(polylines), polylines, names
 
 
-# ----------------------------------------------------------------------
-# Funzione principale
-# ----------------------------------------------------------------------
+# ---------------------------------------------------------
+# Stato mappa per contesto (località / gara)
+# ---------------------------------------------------------
+
+
+def _get_map_state_key(ctx: Dict[str, Any]) -> str:
+    return f"map_state_{ctx.get('map_context', 'default')}"
+
+
+def _load_map_state(ctx: Dict[str, Any]) -> Dict[str, Any]:
+    key = _get_map_state_key(ctx)
+    base_lat = float(ctx.get("lat", 45.83333))
+    base_lon = float(ctx.get("lon", 7.73333))
+    if key not in st.session_state:
+        st.session_state[key] = {
+            "lat": base_lat,
+            "lon": base_lon,
+            "selected_idx": None,
+        }
+    return st.session_state[key]
+
+
+def _save_map_state(ctx: Dict[str, Any], state: Dict[str, Any]) -> None:
+    key = _get_map_state_key(ctx)
+    st.session_state[key] = state
+
+
+# ---------------------------------------------------------
+# Render mappa principale
+# ---------------------------------------------------------
+
+
 def render_map(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Disegna la mappa basata su ctx:
-      - ctx["lat"], ctx["lon"] centro
-      - ctx["map_context"] separa lo stato fra pagine
-
-    Ritorna ctx aggiornato con eventuale click e pista selezionata.
+    Disegna mappa Folium con piste.
+    - Mostra piste se la checkbox è attiva.
+    - Aggiorna marker ad ogni click.
+    - Se vicino ad una pista (< 200 m) evidenzia la pista e la salva in ctx.
     """
-    # ----- chiave di contesto (local, race, ecc.) -----
-    map_context = str(ctx.get("map_context", "default"))
+    map_ctx = ctx.get("map_context", "default")
 
-    marker_lat_key = f"marker_lat_{map_context}"
-    marker_lon_key = f"marker_lon_{map_context}"
-    map_key = f"map_{map_context}"
-    selected_piste_idx_key = f"selected_piste_idx_{map_context}"
-    last_click_lat_key = f"last_click_lat_{map_context}"
-    last_click_lon_key = f"last_click_lon_{map_context}"
+    state = _load_map_state(ctx)
+    lat = float(state.get("lat", ctx.get("lat", 45.83333)))
+    lon = float(state.get("lon", ctx.get("lon", 7.73333)))
+    selected_idx: Optional[int] = state.get("selected_idx")
 
-    # se è la prima volta per questo contesto, resetto eventuali residui
-    if map_key not in st.session_state:
-        for k in (
-            marker_lat_key,
-            marker_lon_key,
-            selected_piste_idx_key,
-            last_click_lat_key,
-            last_click_lon_key,
-        ):
-            if k in st.session_state:
-                del st.session_state[k]
-
-    # ----- posizione base -----
-    default_lat = float(ctx.get("lat", 45.83333))
-    default_lon = float(ctx.get("lon", 7.73333))
-
-    if marker_lat_key not in st.session_state:
-        st.session_state[marker_lat_key] = float(ctx.get("marker_lat", default_lat))
-    if marker_lon_key not in st.session_state:
-        st.session_state[marker_lon_key] = float(ctx.get("marker_lon", default_lon))
-
-    marker_lat = float(st.session_state[marker_lat_key])
-    marker_lon = float(st.session_state[marker_lon_key])
-
-    # stato selezione pista
-    selected_idx: Optional[int] = st.session_state.get(selected_piste_idx_key, None)
-    selected_dist_m: Optional[float] = ctx.get("selected_piste_distance_m")
-
-    # ------------------------------------------------------------------
-    # 1) Leggo l'ultimo click SALVATO e lo gestisco UNA sola volta
-    # ------------------------------------------------------------------
-    prev_state = st.session_state.get(map_key)
-    had_new_click = False
-    click_lat: Optional[float] = None
-    click_lon: Optional[float] = None
-
-    if isinstance(prev_state, dict):
-        last_clicked = prev_state.get("last_clicked")
-        if last_clicked not in (None, {}):
-            try:
-                raw_lat = float(last_clicked.get("lat"))
-                raw_lon = float(last_clicked.get("lng"))
-            except Exception:
-                raw_lat = raw_lon = None
-
-            if raw_lat is not None and raw_lon is not None:
-                # confronto con l'ultimo click già gestito
-                prev_lat = st.session_state.get(last_click_lat_key)
-                prev_lon = st.session_state.get(last_click_lon_key)
-
-                if prev_lat is None or prev_lon is None:
-                    had_new_click = True
-                else:
-                    # se è praticamente lo stesso punto -> non è un click nuovo
-                    if _haversine_m(prev_lat, prev_lon, raw_lat, raw_lon) > 0.5:
-                        had_new_click = True
-
-                if had_new_click:
-                    click_lat = raw_lat
-                    click_lon = raw_lon
-                    st.session_state[last_click_lat_key] = raw_lat
-                    st.session_state[last_click_lon_key] = raw_lon
-
-    # se ho un click grezzo (prima dello snap) sposto subito il marker lì
-    if had_new_click and click_lat is not None and click_lon is not None:
-        marker_lat = click_lat
-        marker_lon = click_lon
-
-    # aggiorno ctx + marker grezzo
-    ctx["lat"] = marker_lat
-    ctx["lon"] = marker_lon
-    ctx["marker_lat"] = marker_lat
-    ctx["marker_lon"] = marker_lon
-    st.session_state[marker_lat_key] = marker_lat
-    st.session_state[marker_lon_key] = marker_lon
-
-    # ------------------------------------------------------------------
-    # 2) Checkbox piste & fetch
-    # ------------------------------------------------------------------
+    # Checkbox per attivare/disattivare le piste
     show_pistes = st.checkbox(
-        T.get("show_pistes_label", "Mostra piste sci alpino sulla mappa"),
+        "Mostra piste sci alpino sulla mappa",
         value=True,
-        key=f"show_pistes_{map_context}",
+        key=f"show_pistes_{map_ctx}",
     )
 
     piste_count = 0
-    polylines: List[List[Tuple[float, float]]] = []
+    piste_lines: List[List[Tuple[float, float]]] = []
     piste_names: List[Optional[str]] = []
 
     if show_pistes:
-        piste_count, polylines, piste_names = _fetch_downhill_pistes(
-            marker_lat,
-            marker_lon,
-            radius_km=10.0,
-        )
+        piste_count, piste_lines, piste_names = _fetch_downhill_pistes(lat, lon)
+    st.write(f"Piste downhill trovate: {piste_count}")
 
-        # se esiste un NUOVO click e ho piste, faccio lo snap
-        if had_new_click and polylines and click_lat is not None and click_lon is not None:
-            snapped_lat, snapped_lon, idx, dist_m = _snap_to_nearest_piste_point(
-                click_lat,
-                click_lon,
-                polylines,
-                max_snap_m=150.0,
-            )
-
-            marker_lat = snapped_lat
-            marker_lon = snapped_lon
-
-            ctx["lat"] = marker_lat
-            ctx["lon"] = marker_lon
-            ctx["marker_lat"] = marker_lat
-            ctx["marker_lon"] = marker_lon
-            st.session_state[marker_lat_key] = marker_lat
-            st.session_state[marker_lon_key] = marker_lon
-
-            if idx is not None:
-                selected_idx = idx
-                st.session_state[selected_piste_idx_key] = idx
-                selected_dist_m = dist_m
-                ctx["selected_piste_distance_m"] = dist_m
-                ctx["selected_piste_name"] = piste_names[idx] or "pista senza nome"
-            else:
-                selected_idx = None
-                st.session_state[selected_piste_idx_key] = None
-                ctx["selected_piste_distance_m"] = None
-                ctx["selected_piste_name"] = None
-
-    else:
-        # se tolgo le piste, azzero selezione per questo contesto
-        selected_idx = None
-        st.session_state[selected_piste_idx_key] = None
-        ctx["selected_piste_distance_m"] = None
-        ctx["selected_piste_name"] = None
-
-    st.caption(f"Piste downhill trovate: {piste_count}")
-
-    # ------------------------------------------------------------------
-    # 3) Costruzione mappa Folium (con marker già definitivo)
-    # ------------------------------------------------------------------
-    m = folium.Map(
-        location=[marker_lat, marker_lon],
-        zoom_start=13,
-        tiles=None,
+    # --- Crea mappa Folium ---
+    fmap = folium.Map(
+        location=(lat, lon),
+        zoom_start=14,
+        tiles="Esri.WorldImagery",
         control_scale=True,
     )
 
-    folium.TileLayer("OpenStreetMap", name="Strade", control=True).add_to(m)
+    # layer piste
+    for idx, line in enumerate(piste_lines):
+        if not line:
+            continue
+        is_selected = selected_idx is not None and idx == selected_idx
+        color = "#ffd60a" if is_selected else "#38bdf8"  # giallo / azzurro
+        weight = 5 if is_selected else 2
 
-    folium.TileLayer(
-        tiles=(
-            "https://server.arcgisonline.com/ArcGIS/rest/services/"
-            "World_Imagery/MapServer/tile/{z}/{y}/{x}"
-        ),
-        attr="Esri World Imagery",
-        name="Satellite",
-        control=True,
-    ).add_to(m)
+        folium.PolyLine(
+            locations=line,
+            color=color,
+            weight=weight,
+            opacity=0.9 if is_selected else 0.7,
+        ).add_to(fmap)
 
-    # piste + label sempre visibile + highlight selezionata
-    if show_pistes and polylines:
-        for i, (coords, name) in enumerate(zip(polylines, piste_names)):
-            tooltip = name if name else None
-            is_selected = selected_idx is not None and i == selected_idx
+        # aggiungiamo un'etichetta testuale semplice (primo punto)
+        name = piste_names[idx]
+        if name:
+            folium.Marker(
+                location=line[len(line) // 2],
+                icon=folium.DivIcon(
+                    html=f'<div style="color:white;font-size:10px;'
+                    f'text-shadow:0 0 4px black;">{name}</div>'
+                ),
+            ).add_to(fmap)
 
-            line_kwargs = {
-                "locations": coords,
-                "weight": 5 if is_selected else 3,
-                "opacity": 1.0 if is_selected else 0.9,
-            }
-            if is_selected:
-                line_kwargs["color"] = "yellow"
-
-            folium.PolyLine(
-                tooltip=tooltip,
-                **line_kwargs,
-            ).add_to(m)
-
-            if name:
-                mid_idx = len(coords) // 2
-                label_lat, label_lon = coords[mid_idx]
-
-                text_color = "#fde047" if is_selected else "#e5e7eb"
-                font_weight = "bold" if is_selected else "normal"
-
-                html = (
-                    f'<div style="'
-                    f'font-size:10px; '
-                    f'color:{text_color}; '
-                    f'font-weight:{font_weight}; '
-                    f'text-shadow:0 0 3px #000, 0 0 5px #000;'
-                    f'white-space:nowrap; '
-                    f'background:rgba(0,0,0,0.35); '
-                    f'padding:1px 3px; '
-                    f'border-radius:3px;'
-                    f'">'
-                    f"{name}"
-                    f"</div>"
-                )
-
-                folium.Marker(
-                    location=[label_lat, label_lon],
-                    icon=folium.DivIcon(html=html),
-                ).add_to(m)
-
-    # marker puntatore
+    # marker centrale (sempre sulla posizione corrente, anche se non su pista)
     folium.Marker(
-        location=[marker_lat, marker_lon],
-        icon=folium.Icon(color="red", icon="flag"),
-    ).add_to(m)
+        location=(lat, lon),
+        icon=folium.Icon(color="red", icon="flag", prefix="fa"),
+    ).add_to(fmap)
 
-    # render mappa (aggiorna st.session_state[map_key] per il prossimo click)
-    _ = st_folium(
-        m,
-        height=450,
-        width=None,
-        key=map_key,
-    )
+    # --- Mostra mappa e leggi click ---
+    map_key = f"folium_{map_ctx}"
+    map_data = st_folium(fmap, width=None, height=500, key=map_key)
 
-    # ------------------------------------------------------------------
-    # 4) Info pista selezionata
-    # ------------------------------------------------------------------
-    if (
-        show_pistes
-        and polylines
-        and selected_idx is not None
-        and 0 <= selected_idx < len(piste_names)
-    ):
-        selected_name = piste_names[selected_idx] or "pista senza nome"
-        ctx["selected_piste_name"] = selected_name
+    # Gestione click NUOVA: ad ogni click muovo SEMPRE il marker.
+    if map_data and map_data.get("last_clicked"):
+        click = map_data["last_clicked"]
+        click_lat = float(click["lat"])
+        click_lon = float(click["lng"])
 
-        if selected_dist_m is not None:
-            st.markdown(
-                f"**Pista selezionata:** {selected_name} "
-                f"(~{selected_dist_m:.0f} m dal punto cliccato)"
+        # Aggiorno sempre la posizione marker
+        lat = click_lat
+        lon = click_lon
+        snapped_idx = None
+        snapped_pt: Optional[Tuple[float, float]] = None
+
+        # Se abbiamo piste, provo lo snap ma senza bloccare il movimento del marker
+        if piste_lines:
+            snapped_idx, dist_m, snapped_pt = _snap_to_nearest_piste(
+                click_lat, click_lon, piste_lines, max_dist_m=200.0
             )
-        else:
-            st.markdown(f"**Pista selezionata:** {selected_name}")
+            if snapped_idx is not None and snapped_pt is not None:
+                lat, lon = snapped_pt  # centra sulla pista
+                selected_idx = snapped_idx
+
+        # salva nuovo stato
+        state["lat"] = lat
+        state["lon"] = lon
+        state["selected_idx"] = selected_idx
+        _save_map_state(ctx, state)
+
+    # Aggiorno ctx
+    ctx["lat"] = state["lat"]
+    ctx["lon"] = state["lon"]
+
+    selected_name: Optional[str] = None
+    if state.get("selected_idx") is not None:
+        idx = int(state["selected_idx"])
+        if 0 <= idx < len(piste_names):
+            selected_name = piste_names[idx]
+
+    if selected_name:
+        st.markdown(f"**Pista selezionata:** {selected_name}")
+        ctx["selected_piste_name"] = selected_name
+    else:
+        ctx.pop("selected_piste_name", None)
 
     return ctx
