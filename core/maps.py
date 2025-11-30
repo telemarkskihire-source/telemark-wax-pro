@@ -276,8 +276,9 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
             radius_km=10.0,
         )
 
-        # se abbiamo piste e il click è stato lontano, agganciamo il marker
         nearest_idx_from_click: Optional[int] = None
+
+        # se abbiamo piste e il click è stato lontano, agganciamo il marker
         if polylines and prev_state and prev_state.get("last_clicked"):
             snapped_lat, snapped_lon = _snap_to_nearest_piste_point(
                 marker_lat,
@@ -302,7 +303,8 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
             )
 
         # --------------------------------------------------------------
-        # Lista piste selezionabile (toggle via selectbox)
+        # Lista piste selezionabile (selectbox) che NON sposta la mappa
+        # finché l'utente non cambia effettivamente la selezione.
         # --------------------------------------------------------------
         if polylines:
             options = list(range(len(polylines)))
@@ -311,35 +313,42 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
                 base = piste_names[i] or f"Pista {i + 1}"
                 return base
 
-            # indice di default: o quello vicino al click, o 0
-            default_index = 0
-            if (
-                nearest_idx_from_click is not None
-                and 0 <= nearest_idx_from_click < len(options)
-            ):
-                default_index = nearest_idx_from_click
+            piste_key = f"piste_select_{map_context}"
 
-            # selectbox per scegliere la pista
+            # valore precedente della select (run precedente)
+            prev_selected_idx = st.session_state.get(piste_key, None)
+
+            # indice di default solo per il rendering della lista
+            # (non usato per muovere il marker alla prima esecuzione)
+            if prev_selected_idx is not None and 0 <= prev_selected_idx < len(options):
+                default_index = prev_selected_idx
+            elif nearest_idx_from_click is not None:
+                default_index = nearest_idx_from_click
+            else:
+                default_index = 0
+
             selected_piste_idx = st.selectbox(
                 T.get("piste_select_label", "Seleziona pista"),
                 options=options,
                 index=default_index,
                 format_func=_fmt,
-                key=f"piste_select_{map_context}",
+                key=piste_key,
             )
 
-            # aggiorna marker al centro della pista selezionata
-            coords_sel = polylines[selected_piste_idx]
-            if coords_sel:
-                mid_idx_sel = len(coords_sel) // 2
-                marker_lat, marker_lon = coords_sel[mid_idx_sel]
+            # SOLO se l'utente ha cambiato selezione rispetto al run precedente
+            # spostiamo il marker al centro della pista scelta.
+            if prev_selected_idx is not None and selected_piste_idx != prev_selected_idx:
+                coords_sel = polylines[selected_piste_idx]
+                if coords_sel:
+                    mid_idx_sel = len(coords_sel) // 2
+                    marker_lat, marker_lon = coords_sel[mid_idx_sel]
 
-                ctx["lat"] = marker_lat
-                ctx["lon"] = marker_lon
-                ctx["marker_lat"] = marker_lat
-                ctx["marker_lon"] = marker_lon
-                st.session_state[marker_lat_key] = marker_lat
-                st.session_state[marker_lon_key] = marker_lon
+                    ctx["lat"] = marker_lat
+                    ctx["lon"] = marker_lon
+                    ctx["marker_lat"] = marker_lat
+                    ctx["marker_lon"] = marker_lon
+                    st.session_state[marker_lat_key] = marker_lat
+                    st.session_state[marker_lon_key] = marker_lon
 
     # salviamo nel contesto quale pista è selezionata (se esiste)
     ctx["selected_piste_index"] = selected_piste_idx
