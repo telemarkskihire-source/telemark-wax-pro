@@ -10,7 +10,7 @@
 #     · viene "agganciato" al punto più vicino di una pista downhill
 # - Marker separato per ogni contesto (ctx["map_context"])
 # - Etichetta con nome pista (sempre visibile) al centro della linea
-# - Evidenzia la pista più vicina al marker
+# - Evidenzia la pista selezionata (via click o via lista)
 # - Ritorna ctx aggiornato (lat/lon + marker_lat/lon)
 
 from __future__ import annotations
@@ -277,6 +277,7 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
         )
 
         # se abbiamo piste e il click è stato lontano, agganciamo il marker
+        nearest_idx_from_click: Optional[int] = None
         if polylines and prev_state and prev_state.get("last_clicked"):
             snapped_lat, snapped_lon = _snap_to_nearest_piste_point(
                 marker_lat,
@@ -293,14 +294,52 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
             st.session_state[marker_lat_key] = marker_lat
             st.session_state[marker_lon_key] = marker_lon
 
-        # individua la pista più vicina al marker (pista "attuale")
-        if polylines:
-            selected_piste_idx = _find_nearest_piste_index(
+            nearest_idx_from_click = _find_nearest_piste_index(
                 marker_lat,
                 marker_lon,
                 polylines,
                 max_dist_m=400.0,
             )
+
+        # --------------------------------------------------------------
+        # Lista piste selezionabile (toggle via selectbox)
+        # --------------------------------------------------------------
+        if polylines:
+            options = list(range(len(polylines)))
+
+            def _fmt(i: int) -> str:
+                base = piste_names[i] or f"Pista {i + 1}"
+                return base
+
+            # indice di default: o quello vicino al click, o 0
+            default_index = 0
+            if (
+                nearest_idx_from_click is not None
+                and 0 <= nearest_idx_from_click < len(options)
+            ):
+                default_index = nearest_idx_from_click
+
+            # selectbox per scegliere la pista
+            selected_piste_idx = st.selectbox(
+                T.get("piste_select_label", "Seleziona pista"),
+                options=options,
+                index=default_index,
+                format_func=_fmt,
+                key=f"piste_select_{map_context}",
+            )
+
+            # aggiorna marker al centro della pista selezionata
+            coords_sel = polylines[selected_piste_idx]
+            if coords_sel:
+                mid_idx_sel = len(coords_sel) // 2
+                marker_lat, marker_lon = coords_sel[mid_idx_sel]
+
+                ctx["lat"] = marker_lat
+                ctx["lon"] = marker_lon
+                ctx["marker_lat"] = marker_lat
+                ctx["marker_lon"] = marker_lon
+                st.session_state[marker_lat_key] = marker_lat
+                st.session_state[marker_lon_key] = marker_lon
 
     # salviamo nel contesto quale pista è selezionata (se esiste)
     ctx["selected_piste_index"] = selected_piste_idx
@@ -342,7 +381,7 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
         for idx, (coords, name) in enumerate(zip(polylines, piste_names)):
             tooltip = name if name else None
 
-            # evidenzia la pista selezionata (quella più vicina al marker)
+            # evidenzia la pista selezionata (via lista o via click)
             is_selected = selected_piste_idx is not None and idx == selected_piste_idx
             line_weight = 6 if is_selected else 3
             line_opacity = 1.0 if is_selected else 0.6
