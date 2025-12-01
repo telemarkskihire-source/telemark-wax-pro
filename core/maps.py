@@ -303,10 +303,21 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
     # ------------------ TOGGLE PISTE: SOLO DOPO IL PRIMO CLICK ------------------
     has_click = bool(st.session_state.get(has_click_key, False))
     if show_pistes and polylines and has_click:
-        options = list(range(len(polylines)))
+        # --- Ordine alfabetico piste senza perdere gli indici originali ---
+# Creiamo lista di tuple: (nome, indice)
+sortable = [
+    ((piste_names[i] or f"Pista {i+1}"), i)
+    for i in range(len(polylines))
+]
 
-        def _fmt(i: int) -> str:
-            return piste_names[i] or f"Pista {i + 1}"
+# ordina alfabeticamente per nome
+sortable.sort(key=lambda x: x[0].lower())
+
+# le options del toggle sono ora gli indici originali ordinati
+options = [idx for (_, idx) in sortable]
+
+def _fmt(i: int) -> str:
+    return piste_names[i] or f"Pista {i + 1}"
 
         if (
             selected_piste_idx is not None
