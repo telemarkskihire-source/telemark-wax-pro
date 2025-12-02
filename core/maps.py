@@ -149,7 +149,23 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
     marker_lon = float(ctx.get("marker_lon", base_lon))
 
     # -----------------------------
-    # 2) PISTE (attorno alla località base)
+    # 2) Leggo l’eventuale CLICK precedente
+    #    (st.session_state del componente folium)
+    # -----------------------------
+    clicked = False
+    prev_state = st.session_state.get(map_key)
+    if isinstance(prev_state, dict):
+        last_clicked = prev_state.get("last_clicked")
+        if last_clicked not in (None, {}):
+            try:
+                marker_lat = float(last_clicked["lat"])
+                marker_lon = float(last_clicked["lng"])
+                clicked = True
+            except Exception:
+                clicked = False
+
+    # -----------------------------
+    # 3) PISTE (attorno alla località base)
     # -----------------------------
     piste_count, pistes, piste_names = load_pistes_for_location(base_lat, base_lon)
 
@@ -177,7 +193,7 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
     selected_piste_id: Optional[str] = ctx.get("selected_piste_id")
 
     # -----------------------------
-    # 3) Checkbox mostra piste
+    # 4) Checkbox mostra piste
     # -----------------------------
     show_pistes = st.checkbox(
         T.get("show_pistes_label", "Mostra piste sci alpino sulla mappa"),
@@ -186,7 +202,32 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
     )
 
     # -----------------------------
-    # 4) COSTRUISCO MAPPA (stato corrente)
+    # 5) Se ho cliccato → snap alla pista più vicina
+    # -----------------------------
+    if clicked and show_pistes and meta:
+        (s_lat, s_lon), dist = snap_to_piste(marker_lat, marker_lon, pistes)
+        if dist <= 400:
+            marker_lat, marker_lon = s_lat, s_lon
+            # trova la pista corrispondente
+            best_meta = None
+            best_d = float("inf")
+            for p in meta:
+                for y, x in p["coords"]:
+                    d = dist_m(marker_lat, marker_lon, y, x)
+                    if d < best_d:
+                        best_d = d
+                        best_meta = p
+            if best_meta:
+                selected_piste_id = best_meta["id"]
+
+    # aggiorno ctx con la posizione (utile anche per DEM)
+    ctx["marker_lat"] = marker_lat
+    ctx["marker_lon"] = marker_lon
+    ctx["lat"] = marker_lat
+    ctx["lon"] = marker_lon
+
+    # -----------------------------
+    # 6) COSTRUISCO MAPPA
     # -----------------------------
     m = folium.Map(
         location=[marker_lat, marker_lon],
@@ -205,16 +246,40 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
         control=True,
     ).add_to(m)
 
-    # piste (se visibili)
+    # piste (se visibili) + NOMI FISSI
     if show_pistes and meta:
         for p in meta:
+            coords = p["coords"]
+            name = p["name"]
             is_sel = (selected_piste_id == p["id"])
+
             folium.PolyLine(
-                p["coords"],
+                coords,
                 color="red" if is_sel else "blue",
                 weight=6 if is_sel else 3,
                 opacity=1.0 if is_sel else 0.6,
             ).add_to(m)
+
+            # etichetta fissa al centro pista
+            if name and coords:
+                mid_idx = len(coords) // 2
+                label_lat, label_lon = coords[mid_idx]
+                folium.Marker(
+                    location=[label_lat, label_lon],
+                    icon=folium.DivIcon(
+                        html=(
+                            f"<div style='"
+                            "font-size:10px;"
+                            "color:white;"
+                            "text-shadow:0 0 3px black;"
+                            "white-space:nowrap;"
+                            "background:rgba(0,0,0,0.3);"
+                            "padding:1px 3px;"
+                            "border-radius:3px;"
+                            f"'>{name}</div>"
+                        )
+                    ),
+                ).add_to(m)
 
     # marker corrente
     folium.Marker(
@@ -223,45 +288,7 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
     ).add_to(m)
 
     # ---- RENDER MAPPA ----
-    map_data = st_folium(m, height=450, key=map_key)
-
-    # -----------------------------
-    # 5) CLICK SULLA MAPPA (puntatore + snap)
-    # -----------------------------
-    if isinstance(map_data, dict):
-        last_clicked = map_data.get("last_clicked")
-        if last_clicked:
-            try:
-                c_lat = float(last_clicked["lat"])
-                c_lon = float(last_clicked["lng"])
-                # sposto marker sul click
-                marker_lat, marker_lon = c_lat, c_lon
-
-                # se ho piste → snap alla più vicina entro 400 m
-                if show_pistes and meta:
-                    (s_lat, s_lon), dist = snap_to_piste(marker_lat, marker_lon, pistes)
-                    if dist <= 400:
-                        marker_lat, marker_lon = s_lat, s_lon
-
-                        # trova la pista corrispondente
-                        best_meta = None
-                        best_d = float("inf")
-                        for p in meta:
-                            for y, x in p["coords"]:
-                                d = dist_m(marker_lat, marker_lon, y, x)
-                                if d < best_d:
-                                    best_d = d
-                                    best_meta = p
-                        if best_meta:
-                            selected_piste_id = best_meta["id"]
-            except Exception:
-                pass
-
-    # salvataggio provvisorio posizione marker
-    ctx["marker_lat"] = marker_lat
-    ctx["marker_lon"] = marker_lon
-    ctx["lat"] = marker_lat
-    ctx["lon"] = marker_lon
+    st_folium(m, height=450, key=map_key)
 
     st.caption(f"Piste downhill trovate: {piste_count}")
 
@@ -269,9 +296,9 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
     st.markdown("&nbsp;", unsafe_allow_html=True)
 
     # -----------------------------
-    # 6) TOGGLE PISTE (SOTTO LA MAPPA)
+    # 7) TOGGLE PISTE (SOTTO LA MAPPA)
     #    - ordine alfabetico
-    #    - NON sposta se non cambi scelta
+    #    - selezionare una pista = sposta subito il marker
     # -----------------------------
     NONE_VALUE = "__NONE__"
     sorted_meta = sorted(meta, key=lambda m: m["name"].lower()) if meta else []
@@ -294,7 +321,7 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
         key=f"piste_select_{map_context}",
     )
 
-    # se l'utente cambia pista dal toggle → sposto marker in CIMA a quella pista
+    # cambio pista dal toggle → marker in CIMA a quella pista
     if chosen_val != current_val and chosen_val != NONE_VALUE:
         chosen_meta = idmap.get(chosen_val)
         if chosen_meta:
@@ -302,9 +329,7 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
             marker_lon = chosen_meta["top_lon"]
             selected_piste_id = chosen_meta["id"]
 
-    # -----------------------------
-    # 7) SALVO stato finale per DEM & co.
-    # -----------------------------
+    # stato finale
     ctx["marker_lat"] = marker_lat
     ctx["marker_lon"] = marker_lon
     ctx["lat"] = marker_lat
