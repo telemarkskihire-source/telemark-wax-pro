@@ -10,13 +10,17 @@ UA = {"User-Agent": "telemark-wax-pro/3.0"}
 
 
 # ------------------------------------------------------------
-# Overpass – chiamata UNA SOLA VOLTA per località
+# Overpass – carica piste UNA VOLTA per località di partenza
 # ------------------------------------------------------------
 @st.cache_data(ttl=1800, show_spinner=False)
 def load_pistes_for_location(
-    base_lat: float, base_lon: float
+    base_lat: float,
+    base_lon: float,
+    radius_km: float = 10.0,
 ) -> Tuple[int, List[List[Tuple[float, float]]], List[str]]:
-    radius_m = 10000
+    """Scarica le piste downhill attorno alla località di partenza."""
+    radius_m = int(radius_km * 1000)
+
     query = f"""
     [out:json][timeout:25];
     (
@@ -26,6 +30,7 @@ def load_pistes_for_location(
     (._;>;);
     out body;
     """
+
     try:
         r = requests.post(
             "https://overpass-api.de/api/interpreter",
@@ -49,7 +54,9 @@ def load_pistes_for_location(
             return None
         for k in ("name", "piste:name", "ref"):
             if k in tags:
-                return str(tags[k]).strip()
+                val = str(tags[k]).strip()
+                if val:
+                    return val
         return None
 
     for el in elements:
@@ -90,10 +97,10 @@ def load_pistes_for_location(
 
 
 # ------------------------------------------------------------
-# Utility
+# Utility distanza + snapping
 # ------------------------------------------------------------
 def dist_m(a: float, b: float, c: float, d: float) -> float:
-    R = 6371000
+    R = 6371000.0
     phi1, phi2 = math.radians(a), math.radians(c)
     dphi = math.radians(c - a)
     dl = math.radians(d - b)
@@ -105,8 +112,11 @@ def dist_m(a: float, b: float, c: float, d: float) -> float:
 
 
 def snap_to_piste(
-    lat: float, lon: float, pistes: List[List[Tuple[float, float]]]
-) -> Tuple[Tuple[float, float], float]:
+    lat: float,
+    lon: float,
+    pistes: List[List[Tuple[float, float]]],
+) -> Tuple[Tuple[float, float]], float]:
+    """Ritorna il punto pista più vicino + distanza in metri."""
     best: Optional[Tuple[float, float]] = None
     best_d = float("inf")
     for line in pistes:
@@ -119,27 +129,28 @@ def snap_to_piste(
 
 
 # ------------------------------------------------------------
-# RENDER MAP
+# RENDER MAP – entry point usato dalla app
 # ------------------------------------------------------------
 def render_map(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
-
-    # -------------------------------------------------
-    # 1. Posizione base (località) e marker corrente
-    # -------------------------------------------------
-    base_lat = float(ctx.get("lat", 45.83333))
-    base_lon = float(ctx.get("lon", 7.73333))
-
-    marker_lat = float(ctx.get("marker_lat", base_lat))
-    marker_lon = float(ctx.get("marker_lon", base_lon))
-
     map_context = str(ctx.get("map_context", "default"))
     map_key = f"map_{map_context}"
 
-    # -------------------------------------------------
-    # 2. PISTE CARICATE UNA SOLA VOLTA PER LOCALITÀ
-    # -------------------------------------------------
+    # -----------------------------
+    # 1) Località di partenza
+    # -----------------------------
+    base_lat = float(ctx.get("lat", 45.83333))
+    base_lon = float(ctx.get("lon", 7.73333))
+
+    # marker corrente (ultima scelta, o località)
+    marker_lat = float(ctx.get("marker_lat", base_lat))
+    marker_lon = float(ctx.get("marker_lon", base_lon))
+
+    # -----------------------------
+    # 2) PISTE (caricate una volta per località)
+    # -----------------------------
     piste_count, pistes, piste_names = load_pistes_for_location(base_lat, base_lon)
 
+    # metadata piste con ID stabile
     meta: List[Dict[str, Any]] = []
     for i, coords in enumerate(pistes):
         if not coords:
@@ -159,12 +170,21 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
         )
     idmap = {m["id"]: m for m in meta}
 
-    # stato attuale della pista
+    # stato corrente pista selezionata
     selected_piste_id: Optional[str] = ctx.get("selected_piste_id")
 
-    # -------------------------------------------------
-    # 3. COSTRUISCO MAPPA, LA DISEGNO E LEGGO IL CLICK
-    # -------------------------------------------------
+    # -----------------------------
+    # 3) Checkbox mostra piste
+    # -----------------------------
+    show_pistes = st.checkbox(
+        T.get("show_pistes_label", "Mostra piste sci alpino sulla mappa"),
+        value=True,
+        key=f"show_pistes_{map_context}",
+    )
+
+    # -----------------------------
+    # 4) COSTRUISCO MAPPA (con stato precedente)
+    # -----------------------------
     m = folium.Map(
         location=[marker_lat, marker_lon],
         zoom_start=13,
@@ -182,63 +202,74 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
         control=True,
     ).add_to(m)
 
-    # piste (le ridisegno dopo, ma le aggiungo già per il primo render)
-    for p in meta:
-        is_sel = selected_piste_id == p["id"]
-        folium.PolyLine(
-            p["coords"],
-            color="red" if is_sel else "blue",
-            weight=6 if is_sel else 3,
-            opacity=1 if is_sel else 0.6,
-        ).add_to(m)
+    # piste (se visibili)
+    if show_pistes and meta:
+        for p in meta:
+            is_sel = (selected_piste_id == p["id"])
+            folium.PolyLine(
+                p["coords"],
+                color="red" if is_sel else "blue",
+                weight=6 if is_sel else 3,
+                opacity=1.0 if is_sel else 0.6,
+            ).add_to(m)
 
-    # marker provvisorio
+    # marker corrente
     folium.Marker(
-        [marker_lat, marker_lon], icon=folium.Icon(color="red")
+        [marker_lat, marker_lon],
+        icon=folium.Icon(color="red", icon="flag"),
     ).add_to(m)
 
+    # ---- RENDER MAPPA ----
     map_data = st_folium(m, height=450, key=map_key)
 
-    # -------------------------------------------------
-    # 4. GESTIONE CLICK (PUNTATORE) – questa è l’ULTIMA AZIONE
-    # -------------------------------------------------
-    last_clicked = None
+    # -----------------------------
+    # 5) CLICK SULLA MAPPA (puntatore)
+    # -----------------------------
     if isinstance(map_data, dict):
         last_clicked = map_data.get("last_clicked")
+        if last_clicked:
+            try:
+                c_lat = float(last_clicked["lat"])
+                c_lon = float(last_clicked["lng"])
+                # sposto marker sul click
+                marker_lat, marker_lon = c_lat, c_lon
 
-    if last_clicked:
-        try:
-            c_lat = float(last_clicked["lat"])
-            c_lon = float(last_clicked["lng"])
-            marker_lat, marker_lon = c_lat, c_lon
+                # se ho piste → snap alla più vicina entro 400 m
+                if meta:
+                    (s_lat, s_lon), dist = snap_to_piste(marker_lat, marker_lon, pistes)
+                    if dist <= 400:
+                        marker_lat, marker_lon = s_lat, s_lon
 
-            # snap alla pista più vicina, se esiste
-            if meta:
-                (s_lat, s_lon), dist = snap_to_piste(marker_lat, marker_lon, pistes)
-                if dist <= 400:
-                    marker_lat, marker_lon = s_lat, s_lon
+                        # trova la pista corrispondente
+                        best_meta = None
+                        best_d = float("inf")
+                        for p in meta:
+                            for y, x in p["coords"]:
+                                d = dist_m(marker_lat, marker_lon, y, x)
+                                if d < best_d:
+                                    best_d = d
+                                    best_meta = p
+                        if best_meta:
+                            selected_piste_id = best_meta["id"]
+            except Exception:
+                pass
 
-                    # trova la pista più vicina
-                    best_meta = None
-                    best_d = float("inf")
-                    for p in meta:
-                        for y, x in p["coords"]:
-                            d = dist_m(marker_lat, marker_lon, y, x)
-                            if d < best_d:
-                                best_d = d
-                                best_meta = p
-                    if best_meta:
-                        selected_piste_id = best_meta["id"]
-        except Exception:
-            pass
+    # salvo subito la posizione aggiornata del marker nel ctx
+    ctx["lat"] = marker_lat
+    ctx["lon"] = marker_lon
+    ctx["marker_lat"] = marker_lat
+    ctx["marker_lon"] = marker_lon
 
-    # -------------------------------------------------
-    # 5. TOGGLE PISTE (ORDINE ALFABETICO, NON MUOVE FINCHÉ NON CAMBI)
-    # -------------------------------------------------
     st.caption(f"Piste downhill trovate: {piste_count}")
 
+    # -----------------------------
+    # 6) TOGGLE PISTE (SOTTO LA MAPPA)
+    #    - ordine alfabetico
+    #    - NON sposta se non cambi scelta
+    # -----------------------------
     NONE_VALUE = "__NONE__"
-    sorted_meta = sorted(meta, key=lambda m: m["name"].lower())
+    sorted_meta = sorted(meta, key=lambda m: m["name"].lower()) if meta else []
+
     option_values: List[str] = [NONE_VALUE] + [m["id"] for m in sorted_meta]
     option_labels: List[str] = ["— Nessuna —"] + [m["name"] for m in sorted_meta]
     label_map = {v: l for v, l in zip(option_values, option_labels)}
@@ -257,20 +288,21 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
         key=f"piste_select_{map_context}",
     )
 
+    # se l'utente cambia pista dal toggle → sposto marker in CIMA a quella pista
     if chosen_val != current_val and chosen_val != NONE_VALUE:
-        # l'utente ha CAMBIATO pista dal toggle → sposto marker in cima
         chosen_meta = idmap.get(chosen_val)
         if chosen_meta:
             marker_lat = chosen_meta["top_lat"]
             marker_lon = chosen_meta["top_lon"]
             selected_piste_id = chosen_meta["id"]
 
-    # -------------------------------------------------
-    # 6. SALVO in ctx per DEM & co.
-    # -------------------------------------------------
+    # -----------------------------
+    # 7) SALVO stato finale per DEM & co.
+    # -----------------------------
+    ctx["lat"] = marker_lat
+    ctx["lon"] = marker_lon
     ctx["marker_lat"] = marker_lat
     ctx["marker_lon"] = marker_lon
     ctx["selected_piste_id"] = selected_piste_id
 
-    # (lasciamo ctx["lat"]/["lon"] come coordinate della località base)
     return ctx
