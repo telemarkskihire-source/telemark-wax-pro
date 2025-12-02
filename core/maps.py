@@ -137,20 +137,19 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
 
     # -----------------------------
     # 1) Località base per le piste
-    #    (NON cambia più dopo il primo run)
+    #    (NON cambia quando ti muovi col marker)
     # -----------------------------
     base_lat = float(ctx.get("base_lat", ctx.get("lat", 45.83333)))
     base_lon = float(ctx.get("base_lon", ctx.get("lon", 7.73333)))
-    if "base_lat" not in ctx:
-        ctx["base_lat"] = base_lat
-        ctx["base_lon"] = base_lon
+    ctx["base_lat"] = base_lat
+    ctx["base_lon"] = base_lon
 
-    # marker corrente (ultima scelta, o località base)
+    # marker corrente (ultima posizione nota o località base)
     marker_lat = float(ctx.get("marker_lat", base_lat))
     marker_lon = float(ctx.get("marker_lon", base_lon))
 
     # -----------------------------
-    # 2) PISTE (caricate una volta per base_lat/base_lon)
+    # 2) PISTE (attorno alla località base)
     # -----------------------------
     piste_count, pistes, piste_names = load_pistes_for_location(base_lat, base_lon)
 
@@ -187,7 +186,7 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
     )
 
     # -----------------------------
-    # 4) COSTRUISCO MAPPA (con stato precedente)
+    # 4) COSTRUISCO MAPPA (stato corrente)
     # -----------------------------
     m = folium.Map(
         location=[marker_lat, marker_lon],
@@ -227,7 +226,7 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
     map_data = st_folium(m, height=450, key=map_key)
 
     # -----------------------------
-    # 5) CLICK SULLA MAPPA (puntatore)
+    # 5) CLICK SULLA MAPPA (puntatore + snap)
     # -----------------------------
     if isinstance(map_data, dict):
         last_clicked = map_data.get("last_clicked")
@@ -258,11 +257,16 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
             except Exception:
                 pass
 
-    # salvataggio provvisorio del marker
+    # salvataggio provvisorio posizione marker
     ctx["marker_lat"] = marker_lat
     ctx["marker_lon"] = marker_lon
+    ctx["lat"] = marker_lat
+    ctx["lon"] = marker_lon
 
     st.caption(f"Piste downhill trovate: {piste_count}")
+
+    # piccolo spazio per staccare la tendina dalla mappa
+    st.markdown("&nbsp;", unsafe_allow_html=True)
 
     # -----------------------------
     # 6) TOGGLE PISTE (SOTTO LA MAPPA)
