@@ -144,6 +144,7 @@ def snap_to_piste(
 def render_map(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
     map_context = str(ctx.get("map_context", "default"))
     map_key = f"map_{map_context}"
+    last_click_key = f"last_click_pair_{map_context}"
 
     # layout: mappa sopra, controlli sotto
     map_container = st.container()
@@ -194,11 +195,13 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
         )
     index_map = {m["idx"]: m for m in meta}
 
-    if selected_idx is not None and selected_idx not in index_map:
-        selected_idx = None
+    # se selected_idx fuori range SOLO se non abbiamo piste, altrimenti lo teniamo
+    if meta and (selected_idx is None or selected_idx not in index_map):
+        # se non c'è selezione, scegliamo la prima come default
+        selected_idx = None  # nessuna pista selezionata finché non clicchi o usi il toggle
 
     # -----------------------------
-    # 3) CLICK DEL RUN PRECEDENTE (subito, prima di tutto)
+    # 3) GESTIONE CLICK (run PRECEDENTE) – PRIMA di checkbox e toggle
     # -----------------------------
     prev_state = st.session_state.get(map_key)
     if isinstance(prev_state, dict):
@@ -207,20 +210,22 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
             try:
                 c_lat = float(last_clicked["lat"])
                 c_lon = float(last_clicked["lng"])
-                # sposto marker sul click
-                marker_lat, marker_lon = c_lat, c_lon
+                pair = (round(c_lat, 6), round(c_lon, 6))
 
-                if meta:
-                    all_coords = [m_p["coords"] for m_p in meta]
-                    (snap_lat, snap_lon), dist, idx = snap_to_piste(
-                        marker_lat, marker_lon, all_coords
-                    )
-                    if dist <= MAX_SNAP_M and idx is not None and 0 <= idx < len(meta):
-                        marker_lat, marker_lon = snap_lat, snap_lon
-                        selected_idx = meta[idx]["idx"]
+                prev_pair = st.session_state.get(last_click_key)
+                # elaboro solo se è un click NUOVO
+                if prev_pair != pair:
+                    st.session_state[last_click_key] = pair
+                    marker_lat, marker_lon = c_lat, c_lon
 
-                # consumo il click (così non viene riapplicato al prossimo run)
-                prev_state["last_clicked"] = None
+                    if meta:
+                        all_coords = [m_p["coords"] for m_p in meta]
+                        (snap_lat, snap_lon), dist, idx = snap_to_piste(
+                            marker_lat, marker_lon, all_coords
+                        )
+                        if dist <= MAX_SNAP_M and idx is not None and 0 <= idx < len(meta):
+                            marker_lat, marker_lon = snap_lat, snap_lon
+                            selected_idx = meta[idx]["idx"]
             except Exception:
                 pass
 
@@ -235,27 +240,27 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
 
     # -----------------------------
     # 5) TOGGLE PISTE (selectbox dentro expander)
-    #    - stato basato su selected_idx
+    #    - NON ha opzione "nessuna"
+    #    - default = selected_idx
     # -----------------------------
     if meta:
-        NONE_VALUE = -1
         sorted_meta = sorted(meta, key=lambda m: m["name"].lower())
-        option_values: List[int] = [NONE_VALUE] + [m["idx"] for m in sorted_meta]
+        option_values: List[int] = [m["idx"] for m in sorted_meta]
 
         def _fmt(val: int) -> str:
-            if val == NONE_VALUE:
-                return "— Nessuna —"
             return index_map[val]["name"]
 
-        current_val = selected_idx if selected_idx in index_map else NONE_VALUE
-        default_index = option_values.index(current_val)
+        if selected_idx in option_values:
+            default_index = option_values.index(selected_idx)
+        else:
+            default_index = 0  # se non c'è selezione, default = prima pista in lista
 
         with controls_container:
             with st.expander(
                 T.get("piste_select_label", "Seleziona pista dalla lista"),
                 expanded=False,
             ):
-                chosen_val: int = st.selectbox(
+                chosen_idx: int = st.selectbox(
                     "Pista",
                     options=option_values,
                     index=default_index,
@@ -264,9 +269,9 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
                 )
 
         # Se l'utente cambia pista dal toggle → questa scelta prevale
-        if chosen_val != NONE_VALUE and chosen_val in index_map:
-            selected_idx = chosen_val
-            coords = index_map[chosen_val]["coords"]
+        if chosen_idx != selected_idx and chosen_idx in index_map:
+            selected_idx = chosen_idx
+            coords = index_map[chosen_idx]["coords"]
             if coords:
                 marker_lat, marker_lon = coords[0]
 
@@ -295,7 +300,7 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
             for m_p in meta:
                 coords = m_p["coords"]
                 name = m_p["name"]
-                is_sel = (m_p["idx"] == selected_idx)
+                is_sel = (selected_idx is not None and m_p["idx"] == selected_idx)
 
                 folium.PolyLine(
                     coords,
@@ -329,7 +334,7 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
             icon=folium.Icon(color="red", icon="flag"),
         ).add_to(m)
 
-        # questo salva il click per il PROSSIMO run
+        # salva il click per il PROSSIMO run
         st_folium(m, height=450, key=map_key)
 
     st.caption(f"Piste downhill trovate: {piste_count}")
