@@ -8,6 +8,9 @@ import folium
 
 UA = {"User-Agent": "telemark-wax-pro/3.0"}
 
+# raggio massimo per lo snap alla pista (in metri)
+MAX_SNAP_M = 150.0
+
 
 # ------------------------------------------------------------
 # Overpass – carica piste UNA VOLTA per località di partenza
@@ -140,21 +143,40 @@ def load_pistes_for_location(
 
 
 # ------------------------------------------------------------
-# RENDER MAP – solo selezione da lista piste
+# Distanza (per snap da click alla pista)
+# ------------------------------------------------------------
+def _dist_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    R = 6371000.0
+    phi1 = math.radians(lat1)
+    phi2 = math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlambda = math.radians(lon2 - lon1)
+    a = (
+        math.sin(dphi / 2.0) ** 2
+        + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2.0) ** 2
+    )
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+    return R * c
+
+
+# ------------------------------------------------------------
+# RENDER MAP – selezione da lista + selezione da click
 # ------------------------------------------------------------
 def render_map(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
     """
     Comportamento:
       - Usa ctx["lat"], ctx["lon"] come località base.
       - Mostra mappa Folium con piste downhill in un raggio di 5 km.
-      - NIENTE selezione da click sulla mappa: la mappa è solo per pan/zoom.
-      - Selezione pista SOLO da selectbox (toggle) sotto la mappa.
+      - Selezione pista:
+          · da lista (selectbox, con "__NONE__" solo prima scelta)
+          · da click sulla mappa (snap alla pista più vicina entro MAX_SNAP_M).
       - Pista selezionata:
           · tutti i segmenti con quel nome sono evidenziati in rosso
           · il marker è posizionato su un punto della pista
     """
     map_context = str(ctx.get("map_context", "default"))
     map_key = f"map_{map_context}"
+    last_click_key = f"last_click_pair_{map_context}"
 
     # --- layout: mappa sopra, controlli sotto ---
     map_container = st.container()
@@ -184,12 +206,54 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
     # 2) Carico piste (raggruppate per nome) entro 5 km
     # -----------------------------
     segment_count, pistes = load_pistes_for_location(base_lat, base_lon, radius_km=5.0)
-
-    # ordino piste per nome
     pistes_sorted = sorted(pistes, key=lambda p: p["name"].lower()) if pistes else []
+    all_names = [p["name"] for p in pistes_sorted]
 
     # -----------------------------
-    # 3) Checkbox mostra piste
+    # 3) CLICK DEL RUN PRECEDENTE (snap alla pista più vicina)
+    # -----------------------------
+    prev_state = st.session_state.get(map_key)
+    if isinstance(prev_state, dict):
+        last_clicked = prev_state.get("last_clicked")
+        if last_clicked:
+            try:
+                c_lat = float(last_clicked["lat"])
+                c_lon = float(last_clicked["lng"])
+                pair = (round(c_lat, 6), round(c_lon, 6))
+
+                prev_pair = st.session_state.get(last_click_key)
+                # elaboro solo se è un click NUOVO
+                if prev_pair != pair:
+                    st.session_state[last_click_key] = pair
+                    # marker sulla posizione cliccata
+                    marker_lat, marker_lon = c_lat, c_lon
+
+                    # se abbiamo piste, cerco la pista più vicina
+                    if pistes_sorted:
+                        best_name = None
+                        best_lat = c_lat
+                        best_lon = c_lon
+                        best_d = float("inf")
+
+                        for piste in pistes_sorted:
+                            for seg in piste["segments"]:
+                                for lat, lon in seg:
+                                    d = _dist_m(c_lat, c_lon, lat, lon)
+                                    if d < best_d:
+                                        best_d = d
+                                        best_name = piste["name"]
+                                        best_lat = lat
+                                        best_lon = lon
+
+                        if best_name is not None and best_d <= MAX_SNAP_M:
+                            selected_name = best_name
+                            marker_lat = best_lat
+                            marker_lon = best_lon
+            except Exception:
+                pass
+
+    # -----------------------------
+    # 4) Checkbox mostra piste
     # -----------------------------
     show_pistes = st.checkbox(
         T.get("show_pistes_label", "Mostra piste sci alpino sulla mappa"),
@@ -198,22 +262,17 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
     )
 
     # -----------------------------
-    # 4) TOGGLE PISTE (selectbox in expander)
-    #    - prima selezione: include "nessuna"
-    #    - dopo la prima selezione: NIENTE più "nessuna"
+    # 5) TOGGLE PISTE (selectbox in expander)
+    #    - prima selezione: include "__NONE__"
+    #    - dopo la prima selezione: solo nomi, niente "__NONE__"
     # -----------------------------
     if pistes_sorted:
-        # lista dei nomi (unici, già raggruppati)
-        all_names = [p["name"] for p in pistes_sorted]
-
-        # se ancora non c'è selezione → opzione "nessuna"
         if selected_name is None:
             option_values: List[str] = ["__NONE__"] + all_names
             label_map = {"__NONE__": "— Nessuna —"}
             label_map.update({n: n for n in all_names})
             current_val = "__NONE__"
         else:
-            # dopo la prima selezione: solo piste, niente "nessuna"
             option_values = all_names
             label_map = {n: n for n in all_names}
             current_val = selected_name if selected_name in all_names else all_names[0]
@@ -241,21 +300,22 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
 
         # aggiorno selezione SOLO se non è "__NONE__"
         if chosen_val != "__NONE__":
-            selected_name = chosen_val
-            # posiziono il marker su un punto della pista (any_lat/lon)
-            chosen_piste = next(
-                (p for p in pistes_sorted if p["name"] == selected_name),
-                None,
-            )
-            if chosen_piste:
-                marker_lat = chosen_piste["any_lat"]
-                marker_lon = chosen_piste["any_lon"]
+            if chosen_val in all_names:
+                selected_name = chosen_val
+                # posiziono il marker su un punto della pista (any_lat/lon)
+                chosen_piste = next(
+                    (p for p in pistes_sorted if p["name"] == selected_name),
+                    None,
+                )
+                if chosen_piste:
+                    marker_lat = chosen_piste["any_lat"]
+                    marker_lon = chosen_piste["any_lon"]
         else:
-            # "__NONE__" viene usato solo PRIMA selezione, poi sparisce
+            # "__NONE__" solo finché non si sceglie una pista
             selected_name = None
 
     # -----------------------------
-    # 5) DISEGNO MAPPA
+    # 6) DISEGNO MAPPA
     # -----------------------------
     with map_container:
         m = folium.Map(
@@ -281,6 +341,7 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
                 name = piste["name"]
                 is_selected = (selected_name == name)
 
+                # tutti i segmenti della stessa pista
                 for seg in piste["segments"]:
                     folium.PolyLine(
                         seg,
@@ -289,7 +350,6 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
                         opacity=1.0 if is_selected else 0.6,
                     ).add_to(m)
 
-                    # etichetta solo una volta per pista (sul primo segmento)
                 # etichetta al centro del primo segmento
                 if piste["segments"]:
                     seg0 = piste["segments"][0]
@@ -312,22 +372,24 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
                         ),
                     ).add_to(m)
 
-        # marker (località base o pista selezionata)
+        # marker (località base o pista selezionata / click)
         folium.Marker(
             [marker_lat, marker_lon],
             icon=folium.Icon(color="red", icon="flag"),
         ).add_to(m)
 
-        # mappa solo interattiva (pan/zoom); ignoriamo i click
+        # mappa interattiva (pan/zoom + click per selezione pista)
         st_folium(m, height=450, key=map_key)
 
     st.caption(f"Segmenti piste downhill trovati: {segment_count}")
 
     # -----------------------------
-    # 6) Salvo stato in ctx
+    # 7) Salvo stato in ctx
     # -----------------------------
     ctx["marker_lat"] = marker_lat
     ctx["marker_lon"] = marker_lon
+    ctx["lat"] = marker_lat
+    ctx["lon"] = marker_lon
     ctx["selected_piste_name"] = selected_name
 
     # testo esplicito pista selezionata
