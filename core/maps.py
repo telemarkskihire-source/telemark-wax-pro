@@ -110,6 +110,7 @@ def dist_m(a: float, b: float, c: float, d: float) -> float:
     )
     return R * 2 * math.atan2(math.sqrt(h), math.sqrt(1 - h))
 
+
 def snap_to_piste(
     lat: float,
     lon: float,
@@ -135,17 +136,21 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
     map_key = f"map_{map_context}"
 
     # -----------------------------
-    # 1) Località di partenza
+    # 1) Località base per le piste
+    #    (NON cambia più dopo il primo run)
     # -----------------------------
-    base_lat = float(ctx.get("lat", 45.83333))
-    base_lon = float(ctx.get("lon", 7.73333))
+    base_lat = float(ctx.get("base_lat", ctx.get("lat", 45.83333)))
+    base_lon = float(ctx.get("base_lon", ctx.get("lon", 7.73333)))
+    if "base_lat" not in ctx:
+        ctx["base_lat"] = base_lat
+        ctx["base_lon"] = base_lon
 
-    # marker corrente (ultima scelta, o località)
+    # marker corrente (ultima scelta, o località base)
     marker_lat = float(ctx.get("marker_lat", base_lat))
     marker_lon = float(ctx.get("marker_lon", base_lon))
 
     # -----------------------------
-    # 2) PISTE (caricate una volta per località)
+    # 2) PISTE (caricate una volta per base_lat/base_lon)
     # -----------------------------
     piste_count, pistes, piste_names = load_pistes_for_location(base_lat, base_lon)
 
@@ -234,7 +239,7 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
                 marker_lat, marker_lon = c_lat, c_lon
 
                 # se ho piste → snap alla più vicina entro 400 m
-                if meta:
+                if show_pistes and meta:
                     (s_lat, s_lon), dist = snap_to_piste(marker_lat, marker_lon, pistes)
                     if dist <= 400:
                         marker_lat, marker_lon = s_lat, s_lon
@@ -253,9 +258,7 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
             except Exception:
                 pass
 
-    # salvo subito la posizione aggiornata del marker nel ctx
-    ctx["lat"] = marker_lat
-    ctx["lon"] = marker_lon
+    # salvataggio provvisorio del marker
     ctx["marker_lat"] = marker_lat
     ctx["marker_lon"] = marker_lon
 
@@ -298,10 +301,10 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
     # -----------------------------
     # 7) SALVO stato finale per DEM & co.
     # -----------------------------
-    ctx["lat"] = marker_lat
-    ctx["lon"] = marker_lon
     ctx["marker_lat"] = marker_lat
     ctx["marker_lon"] = marker_lon
+    ctx["lat"] = marker_lat
+    ctx["lon"] = marker_lon
     ctx["selected_piste_id"] = selected_piste_id
 
     return ctx
