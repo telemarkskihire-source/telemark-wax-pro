@@ -8,6 +8,9 @@ import folium
 
 UA = {"User-Agent": "telemark-wax-pro/3.0"}
 
+# raggio massimo per lo snap alla pista (in metri)
+MAX_SNAP_M = 150.0
+
 
 # ------------------------------------------------------------
 # Overpass – carica piste UNA VOLTA per località di partenza
@@ -116,7 +119,12 @@ def snap_to_piste(
     lon: float,
     pistes: List[List[Tuple[float, float]]],
 ) -> Tuple[Tuple[float, float], float, Optional[int]]:
-    """Ritorna il punto pista più vicino + distanza in metri + indice pista."""
+    """
+    Ritorna:
+      - punto snappato più vicino (lat, lon)
+      - distanza in metri
+      - indice pista (0..n-1) oppure None
+    """
     best: Optional[Tuple[float, float]] = None
     best_d = float("inf")
     best_idx: Optional[int] = None
@@ -137,12 +145,12 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
     map_context = str(ctx.get("map_context", "default"))
     map_key = f"map_{map_context}"
 
-    # --- layout: mappa sopra, controlli sotto ---
+    # layout: mappa sopra, controlli sotto
     map_container = st.container()
     controls_container = st.container()
 
     # -----------------------------
-    # 1) Località base per Overpass (NON si muove col marker)
+    # 1) Località base per Overpass (non segue il marker)
     # -----------------------------
     default_lat = 45.83333
     default_lon = 7.73333
@@ -152,21 +160,20 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
     ctx["base_lat"] = base_lat
     ctx["base_lon"] = base_lon
 
-    # marker corrente (se non c'è → località base)
+    # marker corrente (fallback: località base)
     marker_lat = float(ctx.get("marker_lat", ctx.get("lat", base_lat)))
     marker_lon = float(ctx.get("marker_lon", ctx.get("lon", base_lon)))
 
-    # pista selezionata (indice in polylines)
+    # pista selezionata (indice)
     selected_idx: Optional[int] = ctx.get("selected_piste_index")
     if not isinstance(selected_idx, int):
         selected_idx = None
 
     # -----------------------------
-    # 2) Carico piste intorno alla località base
+    # 2) Carico piste attorno alla località base
     # -----------------------------
     piste_count, polylines, raw_names = load_pistes_for_location(base_lat, base_lon)
 
-    # preparo nomi e meta
     names: List[str] = []
     for i, n in enumerate(raw_names):
         n = (n or "").strip()
@@ -187,12 +194,38 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
         )
     index_map = {m["idx"]: m for m in meta}
 
-    # se selected_idx fuori range, reset
     if selected_idx is not None and selected_idx not in index_map:
         selected_idx = None
 
     # -----------------------------
-    # 3) Checkbox mostra piste
+    # 3) CLICK DEL RUN PRECEDENTE (subito, prima di tutto)
+    # -----------------------------
+    prev_state = st.session_state.get(map_key)
+    if isinstance(prev_state, dict):
+        last_clicked = prev_state.get("last_clicked")
+        if last_clicked:
+            try:
+                c_lat = float(last_clicked["lat"])
+                c_lon = float(last_clicked["lng"])
+                # sposto marker sul click
+                marker_lat, marker_lon = c_lat, c_lon
+
+                if meta:
+                    all_coords = [m_p["coords"] for m_p in meta]
+                    (snap_lat, snap_lon), dist, idx = snap_to_piste(
+                        marker_lat, marker_lon, all_coords
+                    )
+                    if dist <= MAX_SNAP_M and idx is not None and 0 <= idx < len(meta):
+                        marker_lat, marker_lon = snap_lat, snap_lon
+                        selected_idx = meta[idx]["idx"]
+
+                # consumo il click (così non viene riapplicato al prossimo run)
+                prev_state["last_clicked"] = None
+            except Exception:
+                pass
+
+    # -----------------------------
+    # 4) Checkbox mostra piste
     # -----------------------------
     show_pistes = st.checkbox(
         T.get("show_pistes_label", "Mostra piste sci alpino sulla mappa"),
@@ -201,8 +234,8 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
     )
 
     # -----------------------------
-    # 4) TOGGLE PISTE (selectbox dentro expander)
-    #    - calcolato PRIMA di disegnare la mappa
+    # 5) TOGGLE PISTE (selectbox dentro expander)
+    #    - stato basato su selected_idx
     # -----------------------------
     if meta:
         NONE_VALUE = -1
@@ -222,7 +255,7 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
                 T.get("piste_select_label", "Seleziona pista dalla lista"),
                 expanded=False,
             ):
-                choice: int = st.selectbox(
+                chosen_val: int = st.selectbox(
                     "Pista",
                     options=option_values,
                     index=default_index,
@@ -230,16 +263,15 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
                     key=f"piste_select_{map_context}",
                 )
 
-        # Se l'utente ha scelto una pista dal toggle
-        if choice != NONE_VALUE and choice in index_map:
-            selected_idx = choice
-            coords = index_map[choice]["coords"]
+        # Se l'utente cambia pista dal toggle → questa scelta prevale
+        if chosen_val != NONE_VALUE and chosen_val in index_map:
+            selected_idx = chosen_val
+            coords = index_map[chosen_val]["coords"]
             if coords:
-                # marker in cima alla pista
                 marker_lat, marker_lon = coords[0]
 
     # -----------------------------
-    # 5) DISEGNO MAPPA con stato (marker + selected_idx)
+    # 6) DISEGNO MAPPA con stato aggiornato (click + toggle)
     # -----------------------------
     with map_container:
         m = folium.Map(
@@ -259,7 +291,6 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
             control=True,
         ).add_to(m)
 
-        # piste + etichette
         if show_pistes and meta:
             for m_p in meta:
                 coords = m_p["coords"]
@@ -293,40 +324,15 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
                         ),
                     ).add_to(m)
 
-        # marker corrente
         folium.Marker(
             [marker_lat, marker_lon],
             icon=folium.Icon(color="red", icon="flag"),
         ).add_to(m)
 
-        # OUTPUT click per questo run
-        map_data = st_folium(m, height=450, key=map_key)
+        # questo salva il click per il PROSSIMO run
+        st_folium(m, height=450, key=map_key)
 
     st.caption(f"Piste downhill trovate: {piste_count}")
-
-    # -----------------------------
-    # 6) CLICK SULLA MAPPA (aggiorna per il PROSSIMO refresh)
-    # -----------------------------
-    if isinstance(map_data, dict):
-        last_clicked = map_data.get("last_clicked")
-        if last_clicked:
-            try:
-                c_lat = float(last_clicked["lat"])
-                c_lon = float(last_clicked["lng"])
-                marker_lat = c_lat
-                marker_lon = c_lon
-
-                if show_pistes and meta:
-                    all_coords = [m_p["coords"] for m_p in meta]
-                    (snap_lat, snap_lon), dist, idx = snap_to_piste(
-                        marker_lat, marker_lon, all_coords
-                    )
-                    if dist <= 400 and idx is not None and 0 <= idx < len(meta):
-                        marker_lat = snap_lat
-                        marker_lon = snap_lon
-                        selected_idx = meta[idx]["idx"]
-            except Exception:
-                pass
 
     # -----------------------------
     # 7) Salvo stato in ctx
