@@ -110,12 +110,11 @@ def dist_m(a: float, b: float, c: float, d: float) -> float:
     )
     return R * 2 * math.atan2(math.sqrt(h), math.sqrt(1 - h))
 
-
 def snap_to_piste(
     lat: float,
     lon: float,
     pistes: List[List[Tuple[float, float]]],
-) -> Tuple[Tuple[float, float]], float]:
+) -> Tuple[Tuple[float, float], float]:
     """Ritorna il punto pista più vicino + distanza in metri."""
     best: Optional[Tuple[float, float]] = None
     best_d = float("inf")
