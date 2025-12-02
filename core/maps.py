@@ -149,23 +149,7 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
     marker_lon = float(ctx.get("marker_lon", base_lon))
 
     # -----------------------------
-    # 2) Leggo l’eventuale CLICK precedente
-    #    (st.session_state del componente folium)
-    # -----------------------------
-    clicked = False
-    prev_state = st.session_state.get(map_key)
-    if isinstance(prev_state, dict):
-        last_clicked = prev_state.get("last_clicked")
-        if last_clicked not in (None, {}):
-            try:
-                marker_lat = float(last_clicked["lat"])
-                marker_lon = float(last_clicked["lng"])
-                clicked = True
-            except Exception:
-                clicked = False
-
-    # -----------------------------
-    # 3) PISTE (attorno alla località base)
+    # 2) PISTE (attorno alla località base)
     # -----------------------------
     piste_count, pistes, piste_names = load_pistes_for_location(base_lat, base_lon)
 
@@ -193,7 +177,7 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
     selected_piste_id: Optional[str] = ctx.get("selected_piste_id")
 
     # -----------------------------
-    # 4) Checkbox mostra piste
+    # 3) Checkbox mostra piste
     # -----------------------------
     show_pistes = st.checkbox(
         T.get("show_pistes_label", "Mostra piste sci alpino sulla mappa"),
@@ -202,8 +186,21 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
     )
 
     # -----------------------------
-    # 5) Se ho cliccato → snap alla pista più vicina
+    # 4) CLICK SULLA MAPPA (puntatore + snap)
+    #    - leggo il click dall'output di st_folium del run precedente
     # -----------------------------
+    clicked = False
+    prev_state = st.session_state.get(map_key)
+    if isinstance(prev_state, dict):
+        last_clicked = prev_state.get("last_clicked")
+        if last_clicked not in (None, {}):
+            try:
+                marker_lat = float(last_clicked["lat"])
+                marker_lon = float(last_clicked["lng"])
+                clicked = True
+            except Exception:
+                clicked = False
+
     if clicked and show_pistes and meta:
         (s_lat, s_lon), dist = snap_to_piste(marker_lat, marker_lon, pistes)
         if dist <= 400:
@@ -227,7 +224,7 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
     ctx["lon"] = marker_lon
 
     # -----------------------------
-    # 6) COSTRUISCO MAPPA
+    # 5) COSTRUISCO MAPPA
     # -----------------------------
     m = folium.Map(
         location=[marker_lat, marker_lon],
@@ -287,7 +284,7 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
         icon=folium.Icon(color="red", icon="flag"),
     ).add_to(m)
 
-    # ---- RENDER MAPPA ----
+    # ---- RENDER MAPPA (aggiorna st.session_state[map_key] per il prossimo click) ----
     st_folium(m, height=450, key=map_key)
 
     st.caption(f"Piste downhill trovate: {piste_count}")
@@ -296,7 +293,7 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
     st.markdown("&nbsp;", unsafe_allow_html=True)
 
     # -----------------------------
-    # 7) TOGGLE PISTE (SOTTO LA MAPPA)
+    # 6) TOGGLE PISTE (SOTTO LA MAPPA)
     #    - ordine alfabetico
     #    - selezionare una pista = sposta subito il marker
     # -----------------------------
