@@ -2,9 +2,10 @@
 # Modello meteo & profilo neve per Telemark · Pro Wax & Tune
 #
 # - Fetch da Open-Meteo (hourly) per giorno/località
+#   con models=gfs_seamless (fonte NOAA GFS)
 # - Costruzione profilo:
 #     · temperatura aria
-#     · temperatura neve (con bias di calibrazione)
+#     · temperatura neve (nuovo modello calibrato)
 #     · umidità, vento, copertura nuvole
 #     · indici: shade_index, snow_moisture_index, glide_index
 # - Tuning dinamico: costruisce TuningParamsInput per la gara
@@ -15,10 +16,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, date as Date, timedelta
+from datetime import datetime, date as Date
 from typing import List, Optional, Dict, Any
 
-import math
 import requests
 import pandas as pd
 
@@ -31,15 +31,47 @@ from core.race_tuning import (
 
 UA = {"User-Agent": "telemark-wax-pro/3.0"}
 
+
 # ------------------------------------------------------------------
-# Calibrazione temperatura neve (bias globale)
-# Misura reale Champoluc:
-#   modello: ~ -1.5 °C
-#   misura:  ~ -4.7 °C
-#   delta:   ~ -3.2 °C
-# => partiamo da un bias di -3.0 °C (affineremo con altre misure)
+# Nuovo modello temperatura neve superficiale
 # ------------------------------------------------------------------
-SNOW_TEMP_BIAS_C: float = -3.0
+@dataclass
+class SnowTempContext:
+    air_temp_c: float           # T aria a 2 m (°C)
+    rel_humidity_pct: float     # UR (%)
+    is_night: bool              # True = notte, False = giorno
+    sky_condition: str          # "clear", "partly", "overcast"
+
+
+def estimate_surface_snow_temperature(ctx: SnowTempContext) -> float:
+    """
+    Stima T neve (°C) dai parametri principali.
+    Calibrata su Champoluc: aria -1.3 °C, UR 93%, neve ~ -2.4 °C.
+    """
+    ta = ctx.air_temp_c
+    rh = max(0.0, min(100.0, ctx.rel_humidity_pct))
+
+    # base_delta cresce con l'umidità
+    #  - a 70% → ~0.6 °C
+    #  - a 90–100% → ~1.1–1.3 °C
+    base_delta = 0.6 + 0.025 * max(0.0, rh - 70.0)
+
+    if ctx.is_night:
+        base_delta += 0.2
+    else:
+        sc = ctx.sky_condition.lower()
+        if sc in {"clear", "sunny"}:
+            base_delta -= 0.2  # sole scalda la neve
+        elif sc in {"partly", "partly_cloudy"}:
+            base_delta -= 0.1  # un po' di sole = neve meno fredda
+
+    # limiti fisicamente sensati
+    base_delta = max(0.3, min(1.5, base_delta))
+
+    t_snow = ta - base_delta
+    # clamp morbido: neve non sopra 0, non assurda tipo -50
+    t_snow = max(-35.0, min(t_snow, -0.0))
+    return float(t_snow)
 
 
 # ------------------------------------------------------------------
@@ -70,7 +102,7 @@ class DynamicTuningResult:
 
 
 # ------------------------------------------------------------------
-# Fetch da Open-Meteo
+# Fetch da Open-Meteo (con models=gfs_seamless → NOAA GFS)
 # ------------------------------------------------------------------
 def _fetch_hourly_meteo(
     lat: float,
@@ -79,6 +111,7 @@ def _fetch_hourly_meteo(
 ) -> Optional[pd.DataFrame]:
     """
     Scarica dati orari da Open-Meteo per il giorno target_day su (lat, lon).
+    Usa models=gfs_seamless (fonte NOAA GFS).
 
     Ritorna DataFrame con colonne:
       time, temp_air, rh, cloudcover, windspeed, precip, snowfall, sw_rad
@@ -101,6 +134,8 @@ def _fetch_hourly_meteo(
         "timezone": "auto",
         "start_date": target_day.isoformat(),
         "end_date": target_day.isoformat(),
+        # qui abilitiamo il modello NOAA GFS "seamless"
+        "models": "gfs_seamless",
     }
 
     try:
@@ -175,83 +210,15 @@ def _compute_shade_index(row: pd.Series) -> float:
     rad = float(row.get("sw_rad", 0.0) or 0.0)
     cc = float(row.get("cloudcover", 0.0) or 0.0)  # 0–100
 
-    # Normalizziamo la radiazione in modo robusto
     # 0 W/m² = notte / ombra totale
     # ~ 600–800 W/m² = sole pieno
     rad_norm = max(0.0, min(rad / 700.0, 1.0))
 
-    # Base: più radiazione -> meno shade
     shade_from_rad = 1.0 - rad_norm
-
-    # Cloud boost: se nuvoloso, aumentiamo shade
     cloud_factor = cc / 100.0
+
     shade = 0.6 * shade_from_rad + 0.4 * cloud_factor
-
     return float(max(0.0, min(shade, 1.0)))
-
-
-def _estimate_snow_temp(
-    t_air_c: float,
-    shade_index: float,
-    rh_pct: float,
-    precip_mm: float,
-    snowfall_cm: float,
-    tod_frac: float,
-) -> float:
-    """
-    Stima temperatura neve superficiale (°C) a partire da:
-      - T aria
-      - ombreggiatura
-      - umidità
-      - precipitazione/neve
-      - ora del giorno
-
-    Poi applica il bias globale SNOW_TEMP_BIAS_C.
-    """
-    # 1) base: neve tende ad essere più fredda dell’aria, soprattutto se secca/ombra
-    if t_air_c <= -10:
-        base = t_air_c - 0.5
-    elif t_air_c <= -4:
-        base = t_air_c - 1.0
-    elif t_air_c <= 0:
-        base = t_air_c - 1.5
-    else:
-        # neve intorno allo zero, ma non oltre
-        base = min(t_air_c - 0.5, -0.2)
-
-    # 2) notte vs giorno
-    # notte (0–5 / 19–24) tende a raffreddare neve
-    hour = tod_frac * 24.0
-    if hour < 5 or hour > 19:
-        base -= 0.8  # raffreddamento notturno
-
-    # 3) ombra: più shade => più fredda
-    base -= 1.0 * (shade_index - 0.5)  # se shade=1 spinge ~ -0.5, se shade=0 spinge ~ +0.5
-
-    # 4) umidità: aria molto umida vicino allo zero -> neve leggermente più “calda”
-    if t_air_c > -4:
-        if rh_pct > 90:
-            base += 0.5
-        elif rh_pct < 50:
-            base -= 0.5
-
-    # 5) precipitazioni:
-    # - se nevica molto, neve tende verso T aria (ma non oltre 0)
-    if snowfall_cm > 0.5:
-        base = 0.6 * base + 0.4 * min(t_air_c, -0.1)
-
-    # - se piove vicino allo zero, neve si scalda ma resta <= 0
-    if precip_mm > 0.5 and t_air_c > -1.0:
-        base = max(base, -0.3)
-
-    # Applica bias globale di calibrazione (da Champoluc, ~ -3 °C)
-    T_snow_biased = base + SNOW_TEMP_BIAS_C
-
-    # Limiti fisici morbidi (non vogliamo -40 / +2 °C come outlier)
-    T_snow_biased = max(T_snow_biased, -35.0)
-    T_snow_biased = min(T_snow_biased, -0.0)
-
-    return float(T_snow_biased)
 
 
 def _compute_snow_moisture_index(
@@ -339,11 +306,10 @@ def _classify_snow_type(
     injected: bool,
 ) -> SnowType:
     """
-    Prova a mappare (T neve, umidità, injected) su uno SnowType.
+    Mappa (T neve, umidità, injected) su uno SnowType.
     Usa nomi "classici" se esistono nella Enum, altrimenti ripiega
     sul primo elemento disponibile.
     """
-    # fallback robusto
     fallback = list(SnowType)[0]
 
     try:
@@ -457,14 +423,27 @@ def build_meteo_profile_for_race_day(ctx: Dict[str, Any]) -> Optional[MeteoProfi
         # cm approx from mm for neve (non perfetto, ma sufficiente per indice)
         snowfall_cm = snowfall
 
-        t_snow = _estimate_snow_temp(
-            t_air_c=t_air,
-            shade_index=shade,
-            rh_pct=rh,
-            precip_mm=precip,
-            snowfall_cm=snowfall_cm,
-            tod_frac=tod_frac,
+        # definisco notte / giorno e cielo per il modello neve
+        hour = tod_frac * 24.0
+        is_night = hour < 6 or hour >= 18
+
+        cc = float(row.get("cloudcover", 0.0) or 0.0)
+        rad = float(row.get("sw_rad", 0.0) or 0.0)
+
+        if rad > 300 and cc < 30:
+            sky_condition = "clear"
+        elif cc > 70:
+            sky_condition = "overcast"
+        else:
+            sky_condition = "partly"
+
+        snow_ctx = SnowTempContext(
+            air_temp_c=t_air,
+            rel_humidity_pct=rh,
+            is_night=is_night,
+            sky_condition=sky_condition,
         )
+        t_snow = estimate_surface_snow_temperature(snow_ctx)
         snow_temps.append(t_snow)
 
         moisture = _compute_snow_moisture_index(
