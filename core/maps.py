@@ -1,4 +1,19 @@
+# core/maps.py
+# Mappa & piste per Telemark · Pro Wax & Tune
+#
+# - Base OSM + satellite (Esri World Imagery)
+# - Checkbox "Mostra piste sci alpino sulla mappa"
+# - Piste da Overpass: piste:type=downhill (raggio 5 km)
+# - Raggruppa segmenti per nome pista (niente duplicati nel toogle)
+# - Selezione pista:
+#     · da click su mappa (snap alla pista più vicina entro MAX_SNAP_M)
+#     · da selectbox (lista piste)
+# - Dopo la PRIMA selezione (da click o da lista) l'opzione "nessuna" sparisce
+#   (non può più resettare la pista).
+# - La pista selezionata è evidenziata in rosso, con marker su di essa e nome in etichetta.
+
 from __future__ import annotations
+
 from typing import Dict, Any, List, Tuple, Optional
 import math
 import requests
@@ -8,18 +23,18 @@ import folium
 
 UA = {"User-Agent": "telemark-wax-pro/3.0"}
 
-# raggio massimo per lo snap dalla mappa alla pista (in metri)
+# raggio massimo per snap (in metri) dal click alla pista
 MAX_SNAP_M = 150.0
 
 
 # ------------------------------------------------------------
-# Overpass – carica piste UNA VOLTA per località di partenza
+# Overpass – carica piste downhill raggruppate per nome
 # ------------------------------------------------------------
 @st.cache_data(ttl=1800, show_spinner=False)
-def load_pistes_for_location(
+def load_pistes_grouped_by_name(
     base_lat: float,
     base_lon: float,
-    radius_km: float = 5.0,  # raggio ridotto a 5 km
+    radius_km: float = 5.0,
 ) -> Tuple[int, List[Dict[str, Any]]]:
     """
     Scarica le piste downhill (piste:type=downhill) intorno a (base_lat, base_lon)
@@ -30,8 +45,8 @@ def load_pistes_for_location(
       - lista di piste raggruppate, ciascuna come:
         {
           "name": str,
-          "segments": List[List[Tuple[lat, lon]]],
-          "any_lat": float,  # un punto della pista (per centrare il marker)
+          "segments": List[List[(lat, lon)]],
+          "any_lat": float,
           "any_lon": float,
         }
     """
@@ -62,7 +77,6 @@ def load_pistes_for_location(
     elements = js.get("elements", [])
     nodes = {el["id"]: el for el in elements if el.get("type") == "node"}
 
-    # segmenti grezzi
     raw_segments: List[Tuple[Optional[str], List[Tuple[float, float]]]] = []
 
     def get_name(tags: Dict[str, Any]) -> Optional[str]:
@@ -111,11 +125,7 @@ def load_pistes_for_location(
 
     segment_count = len(raw_segments)
 
-    # ----------------------------------------
-    # Raggruppo per nome:
-    # - se nome presente -> gruppo per quel nome
-    # - se nome mancante -> ogni segmento è una pista separata "Pista senza nome N"
-    # ----------------------------------------
+    # Raggruppo per nome
     grouped: Dict[str, List[List[Tuple[float, float]]]] = {}
     unnamed_counter = 1
 
@@ -147,38 +157,36 @@ def load_pistes_for_location(
 # ------------------------------------------------------------
 def _dist_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     R = 6371000.0
-    phi1 = math.radians(lat1)
-    phi2 = math.radians(lat2)
-    dphi = math.radians(lat2 - lat1)
-    dlambda = math.radians(lon2 - lon1)
-    a = (
-        math.sin(dphi / 2.0) ** 2
-        + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2.0) ** 2
-    )
-    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+    from math import radians, sin, cos, atan2, sqrt
+
+    phi1 = radians(lat1)
+    phi2 = radians(lat2)
+    dphi = radians(lat2 - lat1)
+    dlambda = radians(lon2 - lon1)
+
+    a = sin(dphi / 2.0) ** 2 + cos(phi1) * cos(phi2) * sin(dlambda / 2.0) ** 2
+    c = 2 * atan2(sqrt(a), sqrt(1 - a))
     return R * c
 
 
 # ------------------------------------------------------------
-# RENDER MAP – selezione da lista + selezione da click (che aggiorna il toggle)
+# RENDER MAP – selezione da click + selezione da lista
 # ------------------------------------------------------------
 def render_map(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
     """
     Comportamento:
       - Usa ctx["lat"], ctx["lon"] come località base.
-      - Mostra mappa Folium con piste downhill in un raggio di 5 km (raggruppate per nome).
+      - Mostra mappa Folium con piste downhill in un raggio di 5 km.
       - Selezione pista:
-          · da lista (selectbox, con "__NONE__" solo prima scelta globale)
-          · da click sulla mappa (snap alla pista più vicina entro MAX_SNAP_M).
-      - Dopo la PRIMA selezione (da lista o da click), l'opzione "nessuna" sparisce.
-      - Pista selezionata:
-          · tutti i segmenti con quel nome sono evidenziati in rosso
-          · il marker è posizionato su un punto della pista
+          · da click sulla mappa (snap alla pista più vicina entro MAX_SNAP_M)
+          · da selectbox (lista piste raggruppate per nome)
+      - Dopo la PRIMA selezione (qualsiasi origine) l'opzione "nessuna" sparisce.
+      - La pista selezionata resta evidenziata in rosso e il toggle NON torna più su "nessuna".
     """
     map_context = str(ctx.get("map_context", "default"))
     map_key = f"map_{map_context}"
 
-    # --- layout: mappa sopra, controlli sotto ---
+    # layout: mappa sopra, controlli sotto
     map_container = st.container()
     controls_container = st.container()
 
@@ -193,25 +201,27 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
     ctx["base_lat"] = base_lat
     ctx["base_lon"] = base_lon
 
-    # marker:
+    # marker corrente (fallback: località base)
     marker_lat = float(ctx.get("marker_lat", base_lat))
     marker_lon = float(ctx.get("marker_lon", base_lon))
 
-    # pista selezionata (per nome)
+    # stato selezione persistente
     selected_name: Optional[str] = ctx.get("selected_piste_name")
     if not isinstance(selected_name, str):
         selected_name = None
 
+    has_selection: bool = bool(ctx.get("has_piste_selection", False))
+
     # -----------------------------
-    # 2) Carico piste (raggruppate per nome) entro 5 km
+    # 2) Carico piste raggruppate per nome entro 5 km
     # -----------------------------
-    segment_count, pistes = load_pistes_for_location(base_lat, base_lon, radius_km=5.0)
+    segment_count, pistes = load_pistes_grouped_by_name(base_lat, base_lon, radius_km=5.0)
     pistes_sorted = sorted(pistes, key=lambda p: p["name"].lower()) if pistes else []
     all_names = [p["name"] for p in pistes_sorted]
 
     # -----------------------------
-    # 3) GESTIONE CLICK del run PRECEDENTE
-    #    (Se hai cliccato sulla mappa, qui decidiamo se agganciare a una pista)
+    # 3) GESTIONE CLICK DEL RUN PRECEDENTE
+    #    (se c'è stato un click, lo usiamo per selezionare una pista)
     # -----------------------------
     prev_state = st.session_state.get(map_key)
     if isinstance(prev_state, dict):
@@ -237,10 +247,11 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
                                 best_lon = lon
 
                 if best_name is not None and best_d <= MAX_SNAP_M:
-                    # Click valido: seleziono la pista e sposto marker
+                    # Click valido: seleziono la pista e aggiorno marker
                     selected_name = best_name
                     marker_lat = best_lat
                     marker_lon = best_lon
+                    has_selection = True  # da ora in poi "nessuna" sparisce
             except Exception:
                 pass
 
@@ -254,7 +265,7 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
     )
 
     # -----------------------------
-    # 5) DISEGNO MAPPA con stato (selected_name + marker)
+    # 5) DISEGNO MAPPA con lo stato attuale (selected_name, marker)
     # -----------------------------
     with map_container:
         m = folium.Map(
@@ -263,6 +274,7 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
             tiles=None,
             control_scale=True,
         )
+
         folium.TileLayer("OpenStreetMap", name="Strade", control=True).add_to(m)
         folium.TileLayer(
             tiles=(
@@ -274,7 +286,6 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
             control=True,
         ).add_to(m)
 
-        # piste + nomi
         if show_pistes and pistes_sorted:
             for piste in pistes_sorted:
                 name = piste["name"]
@@ -311,7 +322,7 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
                         ),
                     ).add_to(m)
 
-        # marker (località base o pista selezionata / click)
+        # marker (località base o pista selezionata / da click)
         folium.Marker(
             [marker_lat, marker_lon],
             icon=folium.Icon(color="red", icon="flag"),
@@ -324,20 +335,25 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
 
     # -----------------------------
     # 6) TOGGLE PISTE (selectbox in expander)
-    #    - se selected_name è None: "__NONE__" + lista piste
-    #    - se selected_name esiste: SOLO piste, niente "__NONE__"
-    #    E se la selezione è avvenuta da click, QUI il toggle si aggiorna
+    #    - Se non c'è mai stata selezione → "__NONE__" + lista piste
+    #    - Dopo la prima selezione (click o lista) → SOLO piste (niente "__NONE__")
+    #    In questo modo il toogle NON può più resettare la pista.
     # -----------------------------
     if pistes_sorted:
-        if selected_name is None:
+        if not has_selection and selected_name is None:
+            # primo avvio: permettiamo ancora "nessuna"
             option_values: List[str] = ["__NONE__"] + all_names
             label_map = {"__NONE__": "— Nessuna —"}
             label_map.update({n: n for n in all_names})
             current_val = "__NONE__"
         else:
+            # da qui in poi: nessuna opzione "nessuna"
             option_values = all_names
             label_map = {n: n for n in all_names}
-            current_val = selected_name if selected_name in all_names else all_names[0]
+            if selected_name and selected_name in all_names:
+                current_val = selected_name
+            else:
+                current_val = all_names[0]
 
         def _fmt(val: str) -> str:
             return label_map.get(val, val)
@@ -360,11 +376,12 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
                     key=f"piste_select_{map_context}",
                 )
 
-        # aggiorno selezione SOLO se non è "__NONE__"
+        # aggiorno selezione da toogle
         if chosen_val != "__NONE__":
             if chosen_val in all_names:
                 selected_name = chosen_val
-                # posiziono il marker su un punto della pista (any_lat/lon)
+                has_selection = True
+                # posiziono il marker su un punto della pista
                 chosen_piste = next(
                     (p for p in pistes_sorted if p["name"] == selected_name),
                     None,
@@ -373,7 +390,8 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
                     marker_lat = chosen_piste["any_lat"]
                     marker_lon = chosen_piste["any_lon"]
         else:
-            # "__NONE__" solo finché non si sceglie una pista
+            # "__NONE__" esiste SOLO finché non hai mai selezionato nulla
+            # non impostiamo has_selection a True, la prossima volta sarà ancora così
             selected_name = None
 
     # -----------------------------
@@ -384,6 +402,7 @@ def render_map(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
     ctx["lat"] = marker_lat
     ctx["lon"] = marker_lon
     ctx["selected_piste_name"] = selected_name
+    ctx["has_piste_selection"] = has_selection
 
     # testo esplicito pista selezionata
     if selected_name:
