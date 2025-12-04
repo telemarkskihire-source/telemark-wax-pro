@@ -7,11 +7,9 @@
 # - Piste raggruppate per nome (niente duplicati nel toogle)
 # - Selezione pista:
 #     · da click su mappa (snap alla pista più vicina entro MAX_SNAP_M)
-#     · da selectbox in un expander sotto la mappa
-# - Dopo la PRIMA selezione (click o lista) l'opzione "nessuna" non può più
-#   resettare lo stato automaticamente.
-# - La pista selezionata rimane evidenziata in rosso, con nome sempre visibile.
-from __future__ import annotations
+#     · da selectbox in un expander opzionale (on/off)
+# - Nessuna opzione "nessuna pista" nel toogle: se usi la lista scegli SEMPRE
+#   una pista; se vuoi usare solo la mappa, spegni la lista con lo switch.
 
 from __future__ import annotations
 
@@ -195,31 +193,22 @@ def _dist_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
 # ----------------------------------------------------------------------
 def render_map(T, ctx):
     """
-    Disegna la mappa basata su ctx:
-      - ctx["lat"], ctx["lon"]  → località di partenza (centro piste)
-      - ctx["marker_lat"], ctx["marker_lon"] → puntatore (fallback = lat/lon)
-      - ctx["map_context"] → usato per separare lo stato fra pagine
-
-    Comportamento:
-      - Piste caricate in raggio 5km da base_lat/base_lon (che NON si muovono
-        dopo il primo set, per non perdere le piste).
-      - Click su mappa:
-          · snappa alla pista più vicina entro MAX_SNAP_M
-          · aggiorna marker e selezione pista
-      - Selectbox:
-          · inizialmente permette "nessuna"
-          · dopo la prima selezione (click o lista) mostra solo piste
-          · non torna più a "nessuna" da solo.
+    Mappa Telemark:
+      - base_lat/base_lon = centro fisso per le piste (non cambia coi click)
+      - marker_lat/marker_lon = posizione attuale (click o toogle)
+      - Selezione pista da:
+          · click mappa (snap alla pista più vicina entro MAX_SNAP_M)
+          · lista piste (se lo switch è attivo)
     """
     map_context = str(ctx.get("map_context", "default"))
     map_key = f"map_{map_context}"
 
-    # layout: mappa sopra, controlli sotto
+    # contenitori per layout
     map_container = st.container()
     controls_container = st.container()
 
     # -----------------------------
-    # 1) Località base (centro fisso per le piste)
+    # 1) Località base (centro fisso per Overpass)
     # -----------------------------
     default_lat = 45.83333
     default_lon = 7.73333
@@ -227,35 +216,27 @@ def render_map(T, ctx):
     base_lat = float(ctx.get("base_lat", ctx.get("lat", default_lat)))
     base_lon = float(ctx.get("base_lon", ctx.get("lon", default_lon)))
 
-    # salvo nel contesto: da qui in poi li usiamo SEMPRE per le piste
     ctx["base_lat"] = base_lat
     ctx["base_lon"] = base_lon
 
-    # marker iniziale (puntatore) – se non presente parte dalla località
+    # marker (si muove coi click / lista)
     marker_lat = float(ctx.get("marker_lat", base_lat))
     marker_lon = float(ctx.get("marker_lon", base_lon))
 
-    # stato selezione pista
+    # stato selezione
     selected_name: Optional[str] = ctx.get("selected_piste_name")
     if not isinstance(selected_name, str):
         selected_name = None
 
-    has_selection: bool = bool(ctx.get("has_piste_selection", False))
-
     # -----------------------------
-    # 2) Carico piste raggruppate per nome (raggio 5km)
+    # 2) Carico piste raggruppate per nome
     # -----------------------------
-    segment_count, pistes = load_pistes_grouped_by_name(
-        base_lat,
-        base_lon,
-        radius_km=5.0,
-    )
+    segment_count, pistes = load_pistes_grouped_by_name(base_lat, base_lon, radius_km=5.0)
     pistes_sorted = sorted(pistes, key=lambda p: p["name"].lower()) if pistes else []
     all_names = [p["name"] for p in pistes_sorted]
 
     # -----------------------------
-    # 3) Gestisco eventuale click della run precedente
-    #    (prima di disegnare la mappa!)
+    # 3) Gestisco un eventuale click sulla mappa (run precedente)
     # -----------------------------
     prev_state = st.session_state.get(map_key)
     if isinstance(prev_state, dict):
@@ -284,12 +265,11 @@ def render_map(T, ctx):
                     selected_name = best_name
                     marker_lat = best_lat
                     marker_lon = best_lon
-                    has_selection = True
             except Exception:
                 pass
 
     # -----------------------------
-    # 4) Checkbox per mostrare / nascondere piste
+    # 4) Checkbox mostra piste
     # -----------------------------
     show_pistes = st.checkbox(
         T.get("show_pistes_label", "Mostra piste sci alpino sulla mappa"),
@@ -298,7 +278,7 @@ def render_map(T, ctx):
     )
 
     # -----------------------------
-    # 5) Disegno mappa Folium con marker e piste
+    # 5) Disegno mappa
     # -----------------------------
     with map_container:
         m = folium.Map(
@@ -308,7 +288,6 @@ def render_map(T, ctx):
             control_scale=True,
         )
 
-        # layer base
         folium.TileLayer("OpenStreetMap", name="Strade", control=True).add_to(m)
         folium.TileLayer(
             tiles=(
@@ -334,7 +313,8 @@ def render_map(T, ctx):
                         opacity=1.0 if is_selected else 0.6,
                     ).add_to(m)
 
-                # etichetta sempre visibile
+                # etichetta con nome (cliccabile come la pista: se clicchi sul nome,
+                # il click è su quel punto e il nostro snap lo prende)
                 if piste["segments"]:
                     seg0 = piste["segments"][0]
                     mid_idx = len(seg0) // 2
@@ -356,13 +336,12 @@ def render_map(T, ctx):
                         ),
                     ).add_to(m)
 
-        # marker puntatore
+        # marker
         folium.Marker(
             location=[marker_lat, marker_lon],
             icon=folium.Icon(color="red", icon="flag"),
         ).add_to(m)
 
-        # mappa interattiva (aggiornerà st.session_state[map_key].last_clicked)
         st_folium(
             m,
             height=450,
@@ -372,30 +351,19 @@ def render_map(T, ctx):
     st.caption(f"Segmenti piste downhill trovati: {segment_count}")
 
     # -----------------------------
-    # 6) Selectbox piste in expander sotto la mappa
+    # 6) Switch: attiva/disattiva selezione da lista
     # -----------------------------
-    if pistes_sorted:
-        if not has_selection and selected_name is None:
-            # Prima volta: permetto ancora "nessuna"
-            option_values: List[str] = ["__NONE__"] + all_names
-            label_map = {"__NONE__": "— Nessuna pista —"}
-            label_map.update({n: n for n in all_names})
-            current_val = "__NONE__"
+    use_list = st.checkbox(
+        "Attiva selezione da lista piste",
+        value=False,
+        key=f"use_piste_list_{map_context}",
+    )
+
+    if use_list and pistes_sorted:
+        # default: se c'è già una pista selezionata, la mostro; altrimenti la prima
+        if selected_name and selected_name in all_names:
+            default_index = all_names.index(selected_name)
         else:
-            # Dopo la prima selezione: niente più "__NONE__"
-            option_values = all_names
-            label_map = {n: n for n in all_names}
-            if selected_name and selected_name in all_names:
-                current_val = selected_name
-            else:
-                current_val = all_names[0]
-
-        def _fmt(val: str) -> str:
-            return label_map.get(val, val)
-
-        try:
-            default_index = option_values.index(current_val)
-        except ValueError:
             default_index = 0
 
         with controls_container:
@@ -403,46 +371,35 @@ def render_map(T, ctx):
                 T.get("piste_select_label", "Seleziona pista dalla lista"),
                 expanded=False,
             ):
-                chosen_val: str = st.selectbox(
+                chosen_name: str = st.selectbox(
                     "Pista",
-                    options=option_values,
+                    options=all_names,
                     index=default_index,
-                    format_func=_fmt,
                     key=f"piste_select_{map_context}",
                 )
 
-        # aggiorno selezione da lista
-        if chosen_val != "__NONE__":
-            if chosen_val in all_names:
-                selected_name = chosen_val
-                has_selection = True
-                chosen_piste = next(
-                    (p for p in pistes_sorted if p["name"] == selected_name),
-                    None,
-                )
-                if chosen_piste:
-                    marker_lat = chosen_piste["any_lat"]
-                    marker_lon = chosen_piste["any_lon"]
-        else:
-            # resta senza selezione finché non scegli una pista
-            selected_name = None
-            # has_selection rimane False, quindi al prossimo giro "nessuna" esiste ancora
+        if chosen_name != selected_name:
+            selected_name = chosen_name
+            chosen_piste = next(
+                (p for p in pistes_sorted if p["name"] == selected_name),
+                None,
+            )
+            if chosen_piste:
+                marker_lat = chosen_piste["any_lat"]
+                marker_lon = chosen_piste["any_lon"]
 
     # -----------------------------
-    # 7) Salvo stato aggiornato in ctx
+    # 7) Salvo stato in ctx
     # -----------------------------
     ctx["marker_lat"] = marker_lat
     ctx["marker_lon"] = marker_lon
-    # lat/lon per DEM = posizione del marker
     ctx["lat"] = marker_lat
     ctx["lon"] = marker_lon
     ctx["selected_piste_name"] = selected_name
-    ctx["has_piste_selection"] = has_selection
 
-    # testo esplicito pista selezionata
     if selected_name:
         st.markdown(f"**Pista selezionata:** {selected_name}")
     else:
-        st.markdown("**Pista selezionata:** nessuna")
+        st.markdown("**Pista selezionata:** nessuna (solo mappa)")
 
     return ctx
