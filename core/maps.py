@@ -11,6 +11,7 @@
 # - Dopo la PRIMA selezione (click o lista) l'opzione "nessuna" non può più
 #   resettare lo stato automaticamente.
 # - La pista selezionata rimane evidenziata in rosso, con nome sempre visibile.
+from __future__ import annotations
 
 from __future__ import annotations
 
@@ -192,7 +193,7 @@ def _dist_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
 # ----------------------------------------------------------------------
 # Funzione principale chiamata dalla app
 # ----------------------------------------------------------------------
-def render_map(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
+def render_map(T, ctx):
     """
     Disegna la mappa basata su ctx:
       - ctx["lat"], ctx["lon"]  → località di partenza (centro piste)
