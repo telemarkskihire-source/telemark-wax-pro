@@ -49,10 +49,7 @@ from core.race_integration import (
 from core import meteo as meteo_mod
 from core import wax_logic as wax_mod
 from core.pages.ski_selector import recommend_skis_for_day
-
-# POV 2D + estrazione pista
 from core import pov as pov_mod
-# POV 3D
 from core import pov_3d as pov3d_mod
 
 import core.search as search_mod  # debug / uso interno
