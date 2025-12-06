@@ -1,5 +1,5 @@
 # streamlit_app.py
-# Telemark · Pro Wax & Tune
+# Telemark · Skim8
 
 from __future__ import annotations
 
@@ -49,15 +49,15 @@ from core.race_integration import (
 from core import meteo as meteo_mod
 from core import wax_logic as wax_mod
 from core.pages.ski_selector import recommend_skis_for_day
-from core import pov as pov_mod          # POV 2D + estrazione pista
-from core import pov_3d as pov3d_mod     # POV 3D
+
+# POV 2D + estrazione pista
+from core import pov as pov_mod
+# POV 3D
+from core import pov_3d as pov3d_mod
 
 import core.search as search_mod  # debug / uso interno
 
 
-st.write("DEBUG secrets:", "MAPBOX_API_KEY" in st.secrets)
-if "MAPBOX_API_KEY" in st.secrets:
-    st.write("Token prefix:", st.secrets["MAPBOX_API_KEY"][:4])
 # ---------------------- THEME ----------------------
 PRIMARY = "#06b6d4"
 ACCENT = "#f97316"
