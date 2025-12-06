@@ -391,7 +391,21 @@ def render_map(T, ctx):
     ctx["lon"] = marker_lon
     ctx["selected_piste_name"] = selected_name
     st.session_state[sel_key] = selected_name
+# ----------------------------------------------------
+# 8) SALVA I PUNTI DELLA PISTA SELEZIONATA PER MODULO POV
+# ----------------------------------------------------
+selected_points = None
 
+if selected_name:
+    for coords, nm in zip(polylines, names):
+        if nm == selected_name:
+            # coords è una lista di (lat, lon)
+            selected_points = [{"lat": lat, "lon": lon, "elev": 0.0} for (lat, lon) in coords]
+            break
+
+# salva per modulo POV 2D + 3D
+ctx["selected_piste_points"] = selected_points
+ctx["pov_piste_points"] = selected_points
     # info utente
     if selected_name:
         st.markdown(f"**Pista selezionata:** {selected_name}")
