@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 from typing import Dict, Any, List, Tuple, Optional
+from collections.abc import Mapping
 
 import math
 import os
@@ -44,11 +45,10 @@ def _configure_mapbox_token() -> None:
 
     Cerca nell'ordine:
       1) se pdk.settings.mapbox_api_key è già settato → non fa nulla
-      2) st.secrets:
-         - "MAPBOX_API_KEY", "MAPBOX_ACCESS_TOKEN", "MAPBOX_TOKEN"
-         - varianti minuscole
-         - eventuali sezioni nidificate che contengono un token che inizia
-           con "pk." (tipico dei token Mapbox pubblici)
+      2) st.secrets (convertito in dict):
+         - chiavi "MAPBOX_API_KEY", "MAPBOX_ACCESS_TOKEN", "MAPBOX_TOKEN"
+           e varianti minuscole
+         - valori annidati che sembrano un token Mapbox (es. iniziano con "pk.")
       3) variabili d'ambiente:
          - MAPBOX_API_KEY, MAPBOX_ACCESS_TOKEN, MAPBOX_TOKEN
 
@@ -61,8 +61,15 @@ def _configure_mapbox_token() -> None:
 
     token: Optional[str] = None
 
-    # --- 1) st.secrets: chiavi dirette ---
+    # --- 1) st.secrets: chiavi dirette + oggetto completo convertito in dict ---
+    secrets_dict: Dict[str, Any] = {}
     try:
+        # Streamlit Secrets supporta .to_dict(), se no facciamo cast
+        if hasattr(st.secrets, "to_dict"):
+            secrets_dict = st.secrets.to_dict()  # type: ignore[assignment]
+        else:
+            secrets_dict = dict(st.secrets)  # type: ignore[arg-type]
+
         direct_keys = [
             "MAPBOX_API_KEY",
             "MAPBOX_ACCESS_TOKEN",
@@ -72,42 +79,46 @@ def _configure_mapbox_token() -> None:
             "mapbox_token",
         ]
         for key in direct_keys:
-            if key in st.secrets:
-                val = st.secrets[key]
+            if key in secrets_dict:
+                val = secrets_dict[key]
                 if isinstance(val, str) and val.strip():
                     token = val.strip()
                     break
     except Exception:
         # se st.secrets non è disponibile, ignoriamo
-        pass
+        secrets_dict = {}
 
     # --- 2) st.secrets: sezioni nidificate / valori che "assomigliano" a un token Mapbox ---
-    if not token:
-        try:
-            def _search_in_obj(obj: Any) -> Optional[str]:
-                # stringa diretta
-                if isinstance(obj, str):
-                    v = obj.strip()
-                    # i token Mapbox pubblici di solito iniziano con "pk."
-                    if v.startswith("pk."):
-                        return v
-                    # comunque, se è abbastanza lungo, ci proviamo
-                    if len(v) > 30:
-                        return v
-                    return None
-                # mapping/dict
-                if isinstance(obj, dict):
-                    for v in obj.values():
-                        found = _search_in_obj(v)
-                        if found:
-                            return found
-                return None
+    if not token and secrets_dict:
 
-            candidate = _search_in_obj(st.secrets)  # type: ignore[arg-type]
-            if candidate:
-                token = candidate
-        except Exception:
-            pass
+        def _search_in_obj(obj: Any) -> Optional[str]:
+            # stringa diretta
+            if isinstance(obj, str):
+                v = obj.strip()
+                # i token Mapbox pubblici di solito iniziano con "pk."
+                if v.startswith("pk."):
+                    return v
+                # comunque, se è abbastanza lungo, ci proviamo
+                if len(v) > 30:
+                    return v
+                return None
+            # mapping generico (dict, Secrets, ecc.)
+            if isinstance(obj, Mapping):
+                for v in obj.values():
+                    found = _search_in_obj(v)
+                    if found:
+                        return found
+            # liste/tuple
+            if isinstance(obj, (list, tuple)):
+                for v in obj:
+                    found = _search_in_obj(v)
+                    if found:
+                        return found
+            return None
+
+        candidate = _search_in_obj(secrets_dict)
+        if candidate:
+            token = candidate
 
     # --- 3) variabili d'ambiente ---
     if not token:
@@ -122,6 +133,7 @@ def _configure_mapbox_token() -> None:
     if token:
         pdk.settings.mapbox_api_key = token
     else:
+        # Messaggio solo se proprio non troviamo niente
         st.info(
             "Per una vista 3D più realistica (satellite), configura una API key "
             "Mapbox (`MAPBOX_API_KEY`) in *Secrets* o come variabile d'ambiente."
