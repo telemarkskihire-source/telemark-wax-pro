@@ -5,12 +5,14 @@
 #   intorno alla località (ctx["lat"], ctx["lon"]) iniziale.
 # - La località base (centro ricerca piste) resta FISSA: i click sulla mappa
 #   muovono solo il marker, non il centro della query → le piste non spariscono.
-# - Selezione pista SOLO da:
+# - Selezione pista:
 #     · CLICK su mappa: snap alla pista più vicina (entro MAX_SNAP_M).
+#     · Lista piste opzionale (switch + selectbox sotto la mappa).
 # - La pista selezionata rimane evidenziata in ROSSO finché non ne scegli
 #   un’altra. Il nome è salvato anche in st.session_state.
 # - Le piste SENZA nome non hanno label (niente "pista senza nome").
-# - La chiamata a st_folium usa la FIRMA che sai già funzionare: (m, height=..., width=None, key=...).
+# - La chiamata a st_folium usa la FIRMA che sul progetto funzionava:
+#   st_folium(m, height=..., width=None, key=...).
 
 from __future__ import annotations
 
@@ -148,9 +150,9 @@ def _dist_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
 # ----------------------------------------------------------------------
 def render_map(T, ctx):
     """
-    Mappa Telemark semplificata e robusta:
-    - click → snap alla pista più vicina (entro MAX_SNAP_M)
-    - evidenziazione persistente
+    Mappa Telemark:
+      - click mappa → snap a pista più vicina
+      - lista piste opzionale (non rompe la selezione da click)
     """
     map_context = str(ctx.get("map_context", "default"))
     map_key = f"map_{map_context}"
@@ -187,10 +189,12 @@ def render_map(T, ctx):
         radius_km=5.0,
     )
 
+    # per la lista piste: solo quelle con nome
+    named_pairs = [(coords, nm) for coords, nm in zip(polylines, names) if nm]
+    unique_names = sorted({nm for _, nm in named_pairs})
+
     # -----------------------------
-    # 3) Se c'è un click memorizzato da st_folium, applico lo snap
-    #    PRIMA di ridisegnare (così il tap che ha causato questo rerun
-    #    è già visibile).
+    # 3) Se c'è un click memorizzato, applico lo snap PRIMA di ridisegnare
     # -----------------------------
     prev_state = st.session_state.get(map_key)
     if isinstance(prev_state, dict):
@@ -283,7 +287,7 @@ def render_map(T, ctx):
         icon=folium.Icon(color="red", icon="flag"),
     ).add_to(m)
 
-    # QUI usiamo la firma che sul tuo progetto ha sempre funzionato
+    # firma "sicura" di st_folium
     _ = st_folium(
         m,
         height=450,
@@ -294,7 +298,43 @@ def render_map(T, ctx):
     st.caption(f"Segmenti piste downhill trovati: {segment_count}")
 
     # -----------------------------
-    # 5) Salvo stato in ctx + session_state
+    # 5) Switch + lista piste (OPZIONALE, sotto la mappa)
+    # -----------------------------
+    use_list = st.checkbox(
+        "Attiva selezione da lista piste",
+        value=False,
+        key=f"use_piste_list_{map_context}",
+    )
+
+    if use_list and unique_names:
+        # default: se ho già una pista selezionata, la uso; altrimenti la prima
+        if selected_name in unique_names:
+            default_index = unique_names.index(selected_name)
+        else:
+            default_index = 0
+
+        with st.expander(
+            T.get("piste_select_label", "Seleziona pista dalla lista"),
+            expanded=False,
+        ):
+            chosen_name: str = st.selectbox(
+                "Pista",
+                options=unique_names,
+                index=default_index,
+                key=f"piste_select_{map_context}",
+            )
+
+        # se l'utente cambia pista dalla lista, aggiorno selezione + marker
+        if chosen_name != selected_name:
+            selected_name = chosen_name
+            for coords, nm in named_pairs:
+                if nm == selected_name and coords:
+                    mid_idx = len(coords) // 2
+                    marker_lat, marker_lon = coords[mid_idx]
+                    break
+
+    # -----------------------------
+    # 6) Salvo stato in ctx + session_state
     # -----------------------------
     ctx["marker_lat"] = marker_lat
     ctx["marker_lon"] = marker_lon
@@ -307,6 +347,6 @@ def render_map(T, ctx):
     if selected_name:
         st.markdown(f"**Pista selezionata:** {selected_name}")
     else:
-        st.markdown("**Pista selezionata:** nessuna (clicca sulla mappa per scegliere)")
+        st.markdown("**Pista selezionata:** nessuna (clicca sulla mappa o usa la lista)")
 
     return ctx
