@@ -1,325 +1,171 @@
 # core/pov.py
-# Vista 3D (POV) di una pista selezionata
+# POV 2D + estrazione pista per Telemark · Pro Wax & Tune
 #
-# - ctx["selected_piste_name"]   → nome pista scelto in maps.py
-# - ctx["base_lat"], ["base_lon"] o ctx["lat"], ["lon"] come centro
-# - Riusa core.maps._fetch_downhill_pistes per i segmenti OSM
-# - Unisce i segmenti della stessa pista
-# - Mostra:
-#     · basemap satellitare Mapbox (se la key funziona)
-#     · linea rossa 3D (dislivello finto ma coerente)
-#     · START/FINISH
-# - Espone:
-#     · render_pov_3d(ctx)
-#     · render_pov_extract(...) (compatibilità vecchio nome)
+# Questo modulo:
+#   - prende la pista selezionata dal ctx
+#   - normalizza i punti in una polyline
+#   - li salva in ctx["pov_piste_points"] + ctx["pov_piste_name"]
+#   - mostra un POV 2D statico (linea rossa) usando pydeck se disponibile
+#
+# Nessun uso di deck_kwargs, nessuna gestione Mapbox (solo linea su sfondo semplice).
 
 from __future__ import annotations
 
-from typing import Dict, Any, List, Tuple, Optional
-
-import math
-import os
+from typing import Any, Dict, List
 
 import streamlit as st
-import pydeck as pdk
 
 try:
-    from core.maps import _fetch_downhill_pistes
-except Exception:  # pragma: no cover
-    _fetch_downhill_pistes = None  # type: ignore[assignment]
+    import pydeck as pdk
+except Exception:  # pydeck non disponibile
+    pdk = None  # type: ignore[assignment]
 
 
-# ----------------------------------------------------------------------
-# Mapbox token: lettura semplice + forzatura su Deck(mapbox_key=...)
-# ----------------------------------------------------------------------
-def _get_mapbox_token() -> Optional[str]:
-    """Ritorna il token Mapbox da usare, se disponibile."""
-
-    # 1) Secrets con nomi "classici"
-    try:
-        for key in (
-            "MAPBOX_API_KEY",
-            "MAPBOX_ACCESS_TOKEN",
-            "MAPBOX_TOKEN",
-            "mapbox_api_key",
-            "mapbox_access_token",
-            "mapbox_token",
-        ):
-            if key in st.secrets:
-                val = st.secrets[key]
-                if isinstance(val, str) and val.strip():
-                    return val.strip()
-    except Exception:
-        pass
-
-    # 2) Variabile d'ambiente
-    for key in ("MAPBOX_API_KEY", "MAPBOX_ACCESS_TOKEN", "MAPBOX_TOKEN"):
-        val = os.environ.get(key)
-        if isinstance(val, str) and val.strip():
-            return val.strip()
-
-    return None
-
-
-# ----------------------------------------------------------------------
-# Utility: distanza in metri
-# ----------------------------------------------------------------------
-def _dist_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    R = 6371000.0
-    phi1 = math.radians(lat1)
-    phi2 = math.radians(lat2)
-    dphi = math.radians(lat2 - lat1)
-    dlambda = math.radians(lon2 - lon1)
-
-    a = (
-        math.sin(dphi / 2.0) ** 2
-        + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2.0) ** 2
-    )
-    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
-    return R * c
-
-
-# ----------------------------------------------------------------------
-# Recupero e costruzione traccia per la pista selezionata
-# ----------------------------------------------------------------------
-def _get_selected_piste_coords(ctx: Dict[str, Any]) -> Optional[List[Tuple[float, float]]]:
+def _normalize_points(raw_points: Any) -> List[Dict[str, float]]:
     """
-    Ritorna una lista ordinata di (lat, lon) per la pista selezionata.
-
-    Usa:
-      - ctx["selected_piste_name"]
-      - ctx["base_lat"], ctx["base_lon"] oppure ctx["lat"], ctx["lon"]
-      - core.maps._fetch_downhill_pistes
-    """
-    piste_name = ctx.get("selected_piste_name")
-    if not isinstance(piste_name, str) or not piste_name.strip():
-        return None
-
-    if _fetch_downhill_pistes is None:
-        return None
-
-    default_lat = 45.83333
-    default_lon = 7.73333
-
-    base_lat = float(ctx.get("base_lat", ctx.get("lat", default_lat)))
-    base_lon = float(ctx.get("base_lon", ctx.get("lon", default_lon)))
-
-    _, polylines, names = _fetch_downhill_pistes(base_lat, base_lon, radius_km=5.0)
-
-    segments: List[List[Tuple[float, float]]] = [
-        coords
-        for coords, nm in zip(polylines, names)
-        if nm == piste_name and coords
-    ]
-
-    if not segments:
-        return None
-
-    if len(segments) == 1:
-        return segments[0]
-
-    # Unione dei segmenti (approccio greedy semplice)
-    segments = sorted(segments, key=len, reverse=True)
-    track: List[Tuple[float, float]] = list(segments[0])
-    used = {0}
-
-    while len(used) < len(segments):
-        last_lat, last_lon = track[-1]
-        best_idx = None
-        best_dist = float("inf")
-        for idx, seg in enumerate(segments):
-            if idx in used:
-                continue
-            start_lat, start_lon = seg[0]
-            d = _dist_m(last_lat, last_lon, start_lat, start_lon)
-            if d < best_dist:
-                best_dist = d
-                best_idx = idx
-        if best_idx is None:
-            break
-        used.add(best_idx)
-        track.extend(segments[best_idx])
-
-    return track
-
-
-# ----------------------------------------------------------------------
-# Render POV 3D con pydeck
-# ----------------------------------------------------------------------
-def render_pov_3d(ctx: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Renderizza una vista 3D (POV) della pista selezionata.
-
-    Richiede:
-      - ctx["selected_piste_name"] impostato (da maps.py)
-      - core.maps._fetch_downhill_pistes disponibile
-    """
-    piste_name = ctx.get("selected_piste_name")
-    if not isinstance(piste_name, str) or not piste_name.strip():
-        st.info("Seleziona prima una pista sulla mappa per vedere la vista 3D.")
-        return ctx
-
-    if _fetch_downhill_pistes is None:
-        st.error(
-            "Modulo mappe non disponibile per il POV 3D "
-            "(core.maps._fetch_downhill_pistes mancante)."
-        )
-        return ctx
-
-    coords = _get_selected_piste_coords(ctx)
-    if not coords or len(coords) < 2:
-        st.warning(
-            f"Non sono riuscito a ricostruire il tracciato per la pista "
-            f"**{piste_name}**. Prova a zoomare sulla zona e riselezionarla."
-        )
-        return ctx
-
-    # Mapbox token
-    token = _get_mapbox_token()
-    if token:
-        # forza uso Mapbox satellite (la key è già in pdk.settings.mapbox_api_key)
-        deck_kwargs.update(
-            map_provider="mapbox",
-            map_style="mapbox://styles/mapbox/satellite-v9",
-        )
-    else:
-        # fallback minimale (senza sfondo)
-        deck_kwargs.update(
-            map_provider=None,
-            map_style=None,
-        )
-
-    # piccolo debug visivo (puoi toglierlo dopo)
-    st.caption(
-        f"Mapbox key attiva: {bool(token)} "
-        f"(prefisso: {token[:3] if token else '---'})"
-    )
-
-    # centro della pista per la camera
-    avg_lat = sum(lat for lat, _ in coords) / len(coords)
-    avg_lon = sum(lon for _, lon in coords) / len(coords)
-
-    # start/finish
-    start_lat, start_lon = coords[0]
-    finish_lat, finish_lon = coords[-1]
-
-    # --- path 3D: [lon, lat, alt] con dislivello finto ---
-    n = len(coords)
-    max_drop_m = 250.0
-    path_lonlat: List[List[float]] = []
-    for i, (lat, lon) in enumerate(coords):
-        t = i / max(1, n - 1)  # 0 → 1
-        alt = max_drop_m * (1.0 - t)  # alto → basso
-        path_lonlat.append([lon, lat, alt])
-
-    path_data = [
-        {
-            "name": piste_name,
-            "path": path_lonlat,
-        }
-    ]
-
-    points_data = [
-        {
-            "type": "start",
-            "name": f"{piste_name} · START",
-            "position": [start_lon, start_lat, max_drop_m],
-        },
-        {
-            "type": "finish",
-            "name": f"{piste_name} · FINISH",
-            "position": [finish_lon, finish_lat, 0.0],
-        },
-    ]
-
-    view_state = pdk.ViewState(
-        latitude=avg_lat,
-        longitude=avg_lon,
-        zoom=14.8,
-        pitch=70,
-        bearing=-35,
-    )
-
-    path_layer = pdk.Layer(
-        "PathLayer",
-        data=path_data,
-        get_path="path",
-        get_color=[255, 70, 40],
-        width_scale=6,
-        width_min_pixels=4,
-    )
-
-    points_layer = pdk.Layer(
-        "ScatterplotLayer",
-        data=points_data,
-        get_position="position",
-        get_radius=20,
-        get_fill_color=[
-            "255 * (type == 'finish')",
-            "255 * (type == 'start')",
-            0,
-        ],
-        pickable=True,
-    )
-
-    deck_kwargs: Dict[str, Any] = dict(
-        layers=[path_layer, points_layer],
-        initial_view_state=view_state,
-        tooltip={"text": "{name}"},
-    )
-
-    if token:
-        # forza uso Mapbox satellite
-        deck_kwargs.update(
-            map_provider="mapbox",
-            map_style="mapbox://styles/mapbox/satellite-v9",
-            mapbox_key=token,
-        )
-    else:
-        # fallback minimale (senza sfondo) – ma dovrebbe essere il tuo caso solo se manca la key
-        deck_kwargs.update(
-            map_provider=None,
-            map_style=None,
-        )
-
-    deck = pdk.Deck(**deck_kwargs)
-
-    st.subheader("🎥 POV pista (beta)")
-    st.pydeck_chart(deck)
-
-    st.caption(
-        f"POV 3D della pista **{piste_name}** "
-        "(puoi ruotare e zoomare con le dita o il mouse)."
-    )
-
-    ctx["pov_coords"] = coords
-    return ctx
-
-
-# ----------------------------------------------------------------------
-# Wrapper retro-compatibile
-# ----------------------------------------------------------------------
-def render_pov_extract(*args, **kwargs) -> Dict[str, Any]:
-    """
-    Compatibilità col vecchio nome `render_pov_extract`.
-
+    Normalizza i punti della pista in formato uniforme:
+      [{ "lat": ..., "lon": ..., "elev": ... }, ...]
     Accetta:
-      - render_pov_extract(ctx)
-      - render_pov_extract(T, ctx)
-      - render_pov_extract(ctx=ctx)
+      - lista di dict con chiavi lat/lon/elev_m
+      - lista di liste/tuple [lat, lon] o [lat, lon, elev] o [lon, lat, elev]
     """
-    ctx: Optional[Dict[str, Any]] = None
+    if not raw_points:
+        return []
 
-    if args:
-        if len(args) == 1:
-            ctx = args[0]
-        elif len(args) >= 2:
-            ctx = args[1]
+    out: List[Dict[str, float]] = []
 
-    if ctx is None:
-        ctx = kwargs.get("ctx")
+    for p in raw_points:
+        lat = lon = elev = None
 
-    if ctx is None:
-        ctx = {}
+        # dict
+        if isinstance(p, dict):
+            lat = p.get("lat") or p.get("latitude")
+            lon = p.get("lon") or p.get("longitude")
+            elev = p.get("elev_m") or p.get("elevation") or 0.0
 
-    return render_pov_3d(ctx)
+        # lista/tuple
+        elif isinstance(p, (list, tuple)) and len(p) >= 2:
+            a, b = float(p[0]), float(p[1])
+
+            # euristica: lon di solito ha modulo > 90
+            if abs(a) > 90 and abs(b) <= 90:
+                lon, lat = a, b
+            else:
+                lat, lon = a, b
+
+            elev = float(p[2]) if len(p) > 2 else 0.0
+
+        if lat is None or lon is None:
+            continue
+
+        try:
+            out.append(
+                {
+                    "lat": float(lat),
+                    "lon": float(lon),
+                    "elev": float(elev or 0.0),
+                }
+            )
+        except Exception:
+            continue
+
+    return out
+
+
+def _guess_piste_points_from_ctx(ctx: Dict[str, Any]) -> List[Dict[str, float]]:
+    """
+    Cerca i punti della pista nel contesto.
+    Prova varie chiavi per compatibilità con versioni precedenti di core.maps.
+    """
+    candidates = [
+        "pov_piste_points",
+        "selected_piste_points",
+        "selected_piste_polyline",
+        "selected_piste_coords",
+    ]
+
+    raw = None
+    for key in candidates:
+        if key in ctx and ctx[key]:
+            raw = ctx[key]
+            break
+
+    return _normalize_points(raw)
+
+
+def render_pov_extract(T: Dict[str, Any], ctx: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Estrae la pista selezionata dal ctx, la salva nei campi POV e,
+    se possibile, mostra un POV 2D statico.
+    """
+    # 1) Trovo i punti della pista
+    points = _guess_piste_points_from_ctx(ctx)
+    if not points:
+        st.info("POV non disponibile per questa località (nessuna pista selezionata).")
+        return ctx
+
+    # 2) Salvo nel contesto per l'uso da parte del modulo 3D
+    ctx["pov_piste_points"] = points
+    piste_name = (
+        ctx.get("pov_piste_name")
+        or ctx.get("selected_piste_name")
+        or T.get("selected_slope", "pista")
+    )
+    ctx["pov_piste_name"] = piste_name
+
+    # 3) POV 2D statico con pydeck (se presente)
+    if pdk is None:
+        st.caption(
+            f"POV 2D statico della pista {piste_name} (pydeck non disponibile, "
+            "niente anteprima grafica)."
+        )
+        return ctx
+
+    # Costruisco la polyline come [lon, lat, elev]
+    path = [[p["lon"], p["lat"], p["elev"]] for p in points]
+
+    line_layer = pdk.PathLayer(
+        "pov_2d_pista",
+        data=[{"path": path}],
+        get_path="path",
+        get_color=[255, 80, 60],
+        width_scale=3,
+        width_min_pixels=2,
+        get_width=3,
+    )
+
+    # Punto di partenza (marker)
+    start = points[0]
+    start_layer = pdk.ScatterplotLayer(
+        "pov_2d_start",
+        data=[{"lon": start["lon"], "lat": start["lat"]}],
+        get_position="[lon, lat]",
+        get_color=[0, 255, 80],
+        get_radius=20,
+        radius_min_pixels=5,
+    )
+
+    # View centrata circa a metà pista
+    mid = points[len(points) // 2]
+    view_state = pdk.ViewState(
+        longitude=mid["lon"],
+        latitude=mid["lat"],
+        zoom=12,
+        pitch=0,
+        bearing=0,
+    )
+
+    deck = pdk.Deck(
+        layers=[line_layer, start_layer],
+        initial_view_state=view_state,
+        map_style=None,  # sfondo neutro (niente Mapbox)
+        tooltip={"text": piste_name},
+    )
+
+    st.pydeck_chart(deck)
+    st.caption(
+        f"POV 2D statico della pista {piste_name} "
+        "(vista dall'alto; il vero 3D è gestito dal modulo POV 3D)."
+    )
+
+    return ctx
