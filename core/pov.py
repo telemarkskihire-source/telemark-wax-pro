@@ -1,260 +1,218 @@
 # core/pov.py
-# POV 2D (solo export) + estrazione pista per POV 3D
-# V7 – Telemark · Pro Wax & Tune
+# Vista 3D (POV) di una pista selezionata
 #
-# Questo modulo NON mostra mappe in pagina.
-# Serve solo per:
-#   - trovare la pista downhill più vicina via Overpass
-#   - calcolare profilo distanza
-#   - esportare POV 2D HTML
-#   - preparare ctx["pov_piste_points"] per POV 3D
+# - Legge dal contesto:
+#     · ctx["selected_piste_name"]   → nome pista scelto in maps.py
+#     · ctx["base_lat"], ["base_lon"] o ctx["lat"], ["lon"] come centro
+# - Riusa la funzione _fetch_downhill_pistes di core.maps per recuperare
+#   i segmenti OSM (piste:type=downhill).
+# - Trova tutti i segmenti con lo stesso nome, li unisce in un'unica traccia
+#   ordinata (per ora in modo semplice).
+# - Mostra una vista 3D “tipo POV” con pydeck:
+#     · mappa satellitare
+#     · linea rossa della pista
+#     · camera inclinata (pitch) e ruotata (bearing)
+#
+# Requisiti:
+#   - pydeck deve essere disponibile (Streamlit lo include di default)
+#   - MAPBOX_API_KEY configurata nell'ambiente Streamlit
+#
+# Uso dalla app:
+#   from core.pov import render_pov_3d
+#   ...
+#   ctx = render_pov_3d(ctx)
 
 from __future__ import annotations
 
-import json
-import math
 from typing import Dict, Any, List, Tuple, Optional
 
-import requests
+import math
+
 import streamlit as st
+import pydeck as pdk
+
+try:
+    # usiamo la stessa funzione di core.maps per non duplicare la logica Overpass
+    from core.maps import _fetch_downhill_pistes
+except Exception:
+    _fetch_downhill_pistes = None  # type: ignore[assignment]
 
 
-UA = {"User-Agent": "telemark-wax-pro/3.1"}
+# ----------------------------------------------------------------------
+# Utility: distanza in metri (per ordinare i segmenti)
+# ----------------------------------------------------------------------
+def _dist_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    R = 6371000.0
+    phi1 = math.radians(lat1)
+    phi2 = math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlambda = math.radians(lon2 - lon1)
+
+    a = (
+        math.sin(dphi / 2.0) ** 2
+        + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2.0) ** 2
+    )
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+    return R * c
 
 
-# ------------------------------------------------------------------
-# 1) Overpass → downhill pistes
-# ------------------------------------------------------------------
-@st.cache_data(ttl=1800, show_spinner=False)
-def fetch_pistes(lat: float, lon: float, radius_km: float = 10) -> Tuple[List, List]:
-    """Ritorna (polylines, names)."""
-    radius_m = int(radius_km * 1000)
-
-    q = f"""
-    [out:json][timeout:25];
-    (
-      way["piste:type"="downhill"](around:{radius_m},{lat},{lon});
-      relation["piste:type"="downhill"](around:{radius_m},{lat},{lon});
-    );
-    (._;>;);
-    out body;
+# ----------------------------------------------------------------------
+# Recupero e costruzione traccia per la pista selezionata
+# ----------------------------------------------------------------------
+def _get_selected_piste_coords(ctx: Dict[str, Any]) -> Optional[List[Tuple[float, float]]]:
     """
-    try:
-        r = requests.post(
-            "https://overpass-api.de/api/interpreter",
-            data=q.encode("utf-8"),
-            headers=UA,
-            timeout=25,
-        )
-        r.raise_for_status()
-        js = r.json()
-    except Exception:
-        return [], []
+    Ritorna una lista ordinata di (lat, lon) per la pista selezionata.
 
-    elements = js.get("elements", [])
-    nodes = {el["id"]: el for el in elements if el.get("type") == "node"}
+    Usa:
+      - ctx["selected_piste_name"]
+      - ctx["base_lat"], ctx["base_lon"] oppure ctx["lat"], ctx["lon"]
+    e chiama _fetch_downhill_pistes di core.maps.
 
-    polylines = []
-    names = []
-
-    def _nm(tags):
-        if not tags:
-            return None
-        for key in ("piste:name", "name", "ref"):
-            val = tags.get(key)
-            if val and str(val).strip():
-                return str(val).strip()
+    Se non trova nulla, ritorna None.
+    """
+    piste_name = ctx.get("selected_piste_name")
+    if not isinstance(piste_name, str) or not piste_name.strip():
         return None
 
-    def valid(pt):
-        lat, lon = pt
-        return (35 < lat < 48) and (5 < lon < 14)
+    if _fetch_downhill_pistes is None:
+        return None
 
-    for el in elements:
-        if el.get("type") not in ("way", "relation"):
-            continue
-        tags = el.get("tags") or {}
-        if tags.get("piste:type") != "downhill":
-            continue
+    default_lat = 45.83333
+    default_lon = 7.73333
 
-        pts = []
+    base_lat = float(ctx.get("base_lat", ctx.get("lat", default_lat)))
+    base_lon = float(ctx.get("base_lon", ctx.get("lon", default_lon)))
 
-        if el["type"] == "way":
-            for nid in el.get("nodes", []):
-                nd = nodes.get(nid)
-                if nd:
-                    pt = (nd["lat"], nd["lon"])
-                    if valid(pt):
-                        pts.append(pt)
+    # raggio più stretto: ci basta 5 km attorno al centro
+    _, polylines, names = _fetch_downhill_pistes(base_lat, base_lon, radius_km=5.0)
 
-        elif el["type"] == "relation":
-            for mem in el.get("members", []):
-                if mem.get("type") != "way":
-                    continue
-                wid = mem.get("ref")
-                way = next(
-                    (w for w in elements if w.get("type") == "way" and w.get("id") == wid),
-                    None,
-                )
-                if not way:
-                    continue
-                for nid in way.get("nodes", []):
-                    nd = nodes.get(nid)
-                    if nd:
-                        pt = (nd["lat"], nd["lon"])
-                        if valid(pt):
-                            pts.append(pt)
+    # prendo tutti i segmenti che hanno esattamente quel nome
+    segments: List[List[Tuple[float, float]]] = [
+        coords
+        for coords, nm in zip(polylines, names)
+        if nm == piste_name and coords
+    ]
 
-        if len(pts) >= 2:
-            polylines.append(pts)
-            names.append(_nm(tags))
+    if not segments:
+        return None
 
-    return polylines, names
+    if len(segments) == 1:
+        # caso semplice: un solo segmento
+        return segments[0]
 
+    # Se ci sono più segmenti con lo stesso nome (pista spezzata),
+    # li uniamo in modo grezzo: partiamo dal segmento più lungo e
+    # aggiungiamo ogni volta il segmento il cui inizio è più vicino alla fine.
+    segments = sorted(segments, key=len, reverse=True)
+    track: List[Tuple[float, float]] = list(segments[0])
+    used = {0}
 
-# ------------------------------------------------------------------
-# 2) Distanze e pista più vicina
-# ------------------------------------------------------------------
-def haversine_m(a, b, c, d):
-    R = 6371000.0
-    dphi = math.radians(c - a)
-    dl = math.radians(d - b)
-    aa = (
-        math.sin(dphi / 2) ** 2
-        + math.cos(math.radians(a))
-        * math.cos(math.radians(c))
-        * math.sin(dl / 2) ** 2
-    )
-    return R * 2 * math.atan2(math.sqrt(aa), math.sqrt(1 - aa))
+    while len(used) < len(segments):
+        last_lat, last_lon = track[-1]
+        best_idx = None
+        best_dist = float("inf")
+
+        for idx, seg in enumerate(segments):
+            if idx in used:
+                continue
+            start_lat, start_lon = seg[0]
+            d = _dist_m(last_lat, last_lon, start_lat, start_lon)
+            if d < best_dist:
+                best_dist = d
+                best_idx = idx
+
+        if best_idx is None:
+            break
+
+        used.add(best_idx)
+        track.extend(segments[best_idx])
+
+    return track
 
 
-def distance_profile(pts: List[Tuple[float, float]]):
-    d = [0.0]
-    tot = 0.0
-    for i in range(1, len(pts)):
-        lat1, lon1 = pts[i - 1]
-        lat2, lon2 = pts[i]
-        seg = haversine_m(lat1, lon1, lat2, lon2)
-        tot += seg
-        d.append(tot)
-    return d, tot
-
-
-def nearest_piste(lat, lon, polylines):
-    best = None
-    best_d = float("inf")
-    for i, line in enumerate(polylines):
-        for la, lo in line:
-            d = haversine_m(lat, lon, la, lo)
-            if d < best_d:
-                best_d = d
-                best = i
-    return best, best_d
-
-
-# ------------------------------------------------------------------
-# 3) POV 2D flythrough HTML
-# ------------------------------------------------------------------
-def build_pov2d_html(points: List[Tuple[float, float]], name: Optional[str]) -> str:
-    if not points:
-        return "<html><body><h3>Nessun dato POV</h3></body></html>"
-
-    pts_js = json.dumps(points)
-    start_lat, start_lon = points[0]
-
-    N = max(2, len(points))
-    step_ms = max(20, int(8000 / N))
-
-    label = name or "Pista"
-
-    return f"""<!DOCTYPE html>
-<html>
-<head>
-<meta charset="utf-8" />
-<title>POV 2D – {label}</title>
-<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
-<style>
-html,body,#map {{ margin:0; padding:0; height:100%; background:#000; }}
-</style>
-</head>
-<body>
-<div id="map"></div>
-<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
-<script>
-var pts = {pts_js};
-var map = L.map('map').setView([{start_lat},{start_lon}], 15);
-L.tileLayer('https://tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png').addTo(map);
-var line = L.polyline(pts, {{color:'#38bdf8',weight:4}}).addTo(map);
-map.fitBounds(line.getBounds());
-var m = L.marker(pts[0]).addTo(map);
-
-let i = 0;
-const maxI = pts.length - 1;
-const step = {step_ms};
-
-function move(){{
-    i++;
-    if(i>maxI) i=maxI;
-    var p = pts[i];
-    m.setLatLng(p);
-    map.panTo(p, {{animate:true, duration: step/1000}});
-    if(i<maxI) requestAnimationFrame(move);
-}}
-setTimeout(move, 400);
-</script>
-</body>
-</html>
-"""
-
-
-# ------------------------------------------------------------------
-# 4) Public entry: extract piste + attach to ctx + export POV 2D
-# ------------------------------------------------------------------
-def render_pov_extract(T: Dict[str, Any], ctx: Dict[str, Any]) -> Dict[str, Any]:
+# ----------------------------------------------------------------------
+# Render POV 3D con pydeck
+# ----------------------------------------------------------------------
+def render_pov_3d(ctx: Dict[str, Any]) -> Dict[str, Any]:
     """
-    ESCLUSIVAMENTE:
-    - trova pista più vicina
-    - popola ctx["pov_piste_points"] in formato:
-         [{"lat":..., "lon":..., "ele":0.0}, ...]
-    - offre pulsante "Scarica POV 2D"
-    (Il POV 3D è gestito da core/pov_3d.py)
+    Renderizza una vista 3D (POV) della pista selezionata.
+
+    Richiede:
+      - ctx["selected_piste_name"] impostato (da maps.py)
+      - core.maps._fetch_downhill_pistes disponibile
+
+    Se non ci sono dati sufficienti, mostra un messaggio informativo.
     """
-    import streamlit as st
-
-    st.markdown("### 🎥 POV – estrazione pista")
-
-    base_lat = float(ctx.get("marker_lat", ctx.get("lat", 45.833)))
-    base_lon = float(ctx.get("marker_lon", ctx.get("lon", 7.733)))
-
-    with st.spinner("Cerco piste downhill vicine…"):
-        polylines, names = fetch_pistes(base_lat, base_lon)
-
-    if not polylines:
-        st.info("Nessuna pista downhill trovata.")
+    piste_name = ctx.get("selected_piste_name")
+    if not isinstance(piste_name, str) or not piste_name.strip():
+        st.info("Seleziona prima una pista sulla mappa per vedere la vista 3D.")
         return ctx
 
-    idx, dist = nearest_piste(base_lat, base_lon, polylines)
-    if idx is None:
-        st.info("Nessuna pista valida trovata.")
+    if _fetch_downhill_pistes is None:
+        st.error(
+            "Modulo mappe non disponibile per il POV 3D "
+            "(core.maps._fetch_downhill_pistes mancante)."
+        )
         return ctx
 
-    pts = polylines[idx]
-    name = names[idx] or "Pista"
+    coords = _get_selected_piste_coords(ctx)
+    if not coords or len(coords) < 2:
+        st.warning(
+            f"Non sono riuscito a ricostruire il tracciato per la pista "
+            f"**{piste_name}**. Prova a zoomare sulla zona e riselezionarla."
+        )
+        return ctx
 
-    # Convert to 3D format expected by POV 3D (ele=0 for now)
-    pts3d = [{"lat": la, "lon": lo, "ele": 0.0} for (la, lo) in pts]
-    ctx["pov_piste_points"] = pts3d
-    ctx["pov_piste_name"] = name
+    # centro della pista per la camera
+    avg_lat = sum(lat for lat, _ in coords) / len(coords)
+    avg_lon = sum(lon for _, lon in coords) / len(coords)
 
-    # POV 2D download
-    html2d = build_pov2d_html(pts, name)
-    st.download_button(
-        "⬇️ Scarica POV 2D (HTML)",
-        data=html2d,
-        file_name="pov2d_telemark.html",
-        mime="text/html"
+    # converto in formato [lon, lat] per pydeck
+    path_lonlat: List[List[float]] = [[lon, lat] for lat, lon in coords]
+
+    data = [
+        {
+            "name": piste_name,
+            "path": path_lonlat,
+        }
+    ]
+
+    # View "POV": camera inclinata e leggermente ruotata
+    view_state = pdk.ViewState(
+        latitude=avg_lat,
+        longitude=avg_lon,
+        zoom=15,      # abbastanza vicino per vedere bene la pista
+        pitch=60,     # inclinazione in gradi (0 = vista dall'alto)
+        bearing=-45,  # rotazione orizzontale
     )
 
-    st.success(f"Pista trovata: {name} · {len(pts)} punti")
+    layer = pdk.Layer(
+        "PathLayer",
+        data=data,
+        get_path="path",
+        get_color=[255, 0, 0],
+        width_scale=4,
+        width_min_pixels=3,
+    )
+
+    deck = pdk.Deck(
+        layers=[layer],
+        initial_view_state=view_state,
+        map_style="mapbox://styles/mapbox/satellite-v9",
+        tooltip={
+            "text": "{name}"
+        },
+    )
+
+    st.subheader("Vista 3D / POV pista selezionata")
+    st.pydeck_chart(deck)
+
+    st.caption(
+        f"POV 3D statico della pista **{piste_name}** "
+        "(puoi ruotare e zoomare la vista con le dita o il mouse)."
+    )
+
+    # potremmo salvare la traccia nel contesto per usi futuri (es. DEM, animazione)
+    ctx["pov_coords"] = coords
 
     return ctx
