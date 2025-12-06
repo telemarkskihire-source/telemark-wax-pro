@@ -14,14 +14,12 @@
 from __future__ import annotations
 
 import math
-import os
 from pathlib import Path
 from typing import List, Dict, Any
 
 import numpy as np
 import requests
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
-import moviepy.editor as mpy
 
 # ---------------------------------------------------------------------
 # CONFIGURAZIONE
@@ -212,7 +210,7 @@ def _draw_winter_background() -> Image.Image:
     draw.polygon(m1, fill=(190, 195, 205))
     draw.polygon(m2, fill=(200, 205, 215))
 
-    # Nevicate sulle cime (bordi superiori più chiari)
+    # Nevicate sulle cime
     for poly in (m1, m2):
         ridge = []
         for i in range(1, len(poly) - 1):
@@ -269,11 +267,7 @@ def _draw_trees(draw: ImageDraw.ImageDraw, snow_top: int) -> None:
 
 def _draw_pov_frame(track: List[Dict[str, float]], t_norm: float, pista_name: str) -> np.ndarray:
     """
-    Crea un singolo frame POV stile "prima persona invernale":
-    - neve in primo piano
-    - pista centrale in prospettiva
-    - alberi e montagne innevate
-    - HUD con altitudine e distanza
+    Crea un singolo frame POV stile "prima persona invernale".
     """
     base_img = _draw_winter_background()
     draw = ImageDraw.Draw(base_img)
@@ -292,10 +286,10 @@ def _draw_pov_frame(track: List[Dict[str, float]], t_norm: float, pista_name: st
     idx = int(t_norm * (len(track) - 1))
     idx = max(2, min(len(track) - 3, idx))
 
-    # Valuto curvatura in base all'andamento orizzontale
+    # Curvatura
     window = track[idx - 2: idx + 3]
     dlon = window[-1]["lon"] - window[0]["lon"]
-    curvature = max(-1.0, min(1.0, dlon * 200))  # fattore grezzo per curva
+    curvature = max(-1.0, min(1.0, dlon * 200))
 
     # Larghezze pista
     width_bottom = WIDTH * 0.7
@@ -313,10 +307,8 @@ def _draw_pov_frame(track: List[Dict[str, float]], t_norm: float, pista_name: st
         (cx_top - width_top / 2, horizon_y),
     ]
 
-    # Ombreggio leggermente i bordi pista (neve smossa)
     draw.polygon(pista_poly, fill=(234, 240, 246))
 
-    # Textura sulla pista con leggere strisce
     lane_color = (220, 228, 240)
     for i in range(18):
         f = i / 18.0
@@ -325,7 +317,6 @@ def _draw_pov_frame(track: List[Dict[str, float]], t_norm: float, pista_name: st
         y = bottom_y + (horizon_y - bottom_y) * f
         draw.line([(x1, y), (x2, y)], fill=lane_color, width=1)
 
-    # Reti laterali rosse
     net_color = (215, 40, 40)
     steps = 12
     for side in (-1, 1):
@@ -337,7 +328,6 @@ def _draw_pov_frame(track: List[Dict[str, float]], t_norm: float, pista_name: st
             y2 = y1 - 26
             draw.line([(x1, y1), (x2, y2)], fill=net_color, width=2)
 
-    # Traccia centrale (linea gara)
     line_color = (170, 180, 210)
     for i in range(32):
         f = i / 32.0
@@ -346,16 +336,12 @@ def _draw_pov_frame(track: List[Dict[str, float]], t_norm: float, pista_name: st
         r = max(1, int(5 - 3 * f))
         draw.ellipse([x - r, y - r, x + r, y + r], fill=line_color)
 
-    # Leggera sfocatura lontano per effetto profondità
     blur_mask = Image.new("L", (WIDTH, HEIGHT), 0)
     bm_draw = ImageDraw.Draw(blur_mask)
     bm_draw.rectangle([0, 0, WIDTH, horizon_y + 10], fill=220)
     blurred = base_img.filter(ImageFilter.GaussianBlur(radius=2.0))
     base_img = Image.composite(blurred, base_img, blur_mask)
 
-    # -----------------------------------------------------------------
-    # HUD / TESTO
-    # -----------------------------------------------------------------
     p = track[idx]
     alt = p["elev"]
     dist = p["dist"]
@@ -388,7 +374,6 @@ def _draw_pov_frame(track: List[Dict[str, float]], t_norm: float, pista_name: st
         font=font_small,
     )
 
-    # Indicatore progressione a destra
     bar_w = 14
     bar_x = WIDTH - 50
     bar_y1 = 16
@@ -414,32 +399,39 @@ def generate_pov_video(feature: Dict[str, Any], pista_name: str) -> str:
     pista_name: nome leggibile pista (usato per filename).
 
     Ritorna: path del file MP4 generato.
+
+    Richiede il pacchetto `moviepy`. Se non è installato, lancia un
+    RuntimeError con messaggio esplicito.
     """
-    # filename "pulito"
+    # import lazy per non rompere l'app se moviepy non c'è
+    try:
+        import moviepy.editor as mpy  # type: ignore
+    except Exception as e:
+        raise RuntimeError(
+            "Modulo 'moviepy' non disponibile. "
+            "Installa `moviepy` (e imageio[ffmpeg]) sull'ambiente per abilitare il video POV."
+        ) from e
+
     safe_name = "".join(
         c if c.isalnum() or c in "-_" else "_" for c in str(pista_name).lower()
     )
     out_path = VIDEO_DIR / f"{safe_name}_pov_12s.mp4"
 
-    # Se esiste già, non rigeneriamo
     if out_path.exists():
         return str(out_path)
 
-    # Costruisci traccia con elevazione
     track = build_track_from_feature(feature)
     if len(track) < 5:
         raise ValueError("Traccia insufficiente per POV (meno di 5 punti).")
 
     track = _resample_track(track, n_points=400)
 
-    # Genera frames
     frames: List[np.ndarray] = []
     for i in range(N_FRAMES):
         t_norm = i / max(1, (N_FRAMES - 1))
         frame = _draw_pov_frame(track, t_norm, pista_name)
         frames.append(frame)
 
-    # Crea clip video
     clip = mpy.ImageSequenceClip(frames, fps=FRAME_RATE)
     clip.write_videofile(
         str(out_path),
