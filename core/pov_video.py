@@ -1,18 +1,26 @@
 # core/pov_video.py
-# Generatore video POV 3D "stilizzato" per piste da sci
+# Generatore video POV 3D "realistico invernale" per piste da sci
 #
 # Uso previsto:
 #   from core.pov_video import generate_pov_video
 #   video_path = generate_pov_video(feature, pista_name)
 #   st.video(video_path)
+#
+# NOTE:
+# - Usa una vista "prima persona" semplificata, con neve, alberi e montagne innevate.
+# - Non usa texture esterne: tutto è disegnato a mano con Pillow.
+# - Risoluzione 1280x720, 30fps, 12 secondi (360 frame).
+
+from __future__ import annotations
 
 import math
 import os
 from pathlib import Path
+from typing import List, Dict, Any
 
 import numpy as np
 import requests
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageFilter
 import moviepy.editor as mpy
 
 # ---------------------------------------------------------------------
@@ -25,8 +33,8 @@ VIDEO_DURATION = 12      # secondi
 N_FRAMES = FRAME_RATE * VIDEO_DURATION
 
 # Risoluzione video (16:9)
-WIDTH = 1920
-HEIGHT = 1080
+WIDTH = 1280
+HEIGHT = 720
 
 # API elevazione (puoi sostituire con un tuo servizio DEM)
 ELEVATION_API_URL = "https://api.open-elevation.com/api/v1/lookup"
@@ -40,7 +48,7 @@ VIDEO_DIR.mkdir(exist_ok=True)
 # UTILS GEOMETRIA & ELEVAZIONE
 # ---------------------------------------------------------------------
 
-def _haversine_dist(lat1, lon1, lat2, lon2):
+def _haversine_dist(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     """
     Distanza in metri tra due punti (lat/lon in gradi).
     """
@@ -55,7 +63,7 @@ def _haversine_dist(lat1, lon1, lat2, lon2):
     return R * c
 
 
-def _fetch_elevation(lat_lon_list):
+def _fetch_elevation(lat_lon_list: List[tuple]) -> List[float]:
     """
     Restituisce una lista di elevazioni per i punti dati (lat, lon).
     Usa una API DEM globale (qui open-elevation).
@@ -63,7 +71,7 @@ def _fetch_elevation(lat_lon_list):
     if not lat_lon_list:
         return []
 
-    elevations = []
+    elevations: List[float] = []
     chunk_size = 80
 
     for i in range(0, len(lat_lon_list), chunk_size):
@@ -84,14 +92,13 @@ def _fetch_elevation(lat_lon_list):
             elevations.extend([0.0] * len(chunk))
 
     if len(elevations) < len(lat_lon_list):
-        # padding in caso di errore
         last = elevations[-1] if elevations else 0.0
         elevations.extend([last] * (len(lat_lon_list) - len(elevations)))
 
     return elevations[: len(lat_lon_list)]
 
 
-def build_track_from_feature(feature):
+def build_track_from_feature(feature: Dict[str, Any]) -> List[Dict[str, float]]:
     """
     Converte una Feature GeoJSON OSM (LineString) in una traccia
     con lat, lon, elev, dist (distanza cumulativa in m).
@@ -105,8 +112,8 @@ def build_track_from_feature(feature):
     if not coords:
         return []
 
-    lons = [c[0] for c in coords]
-    lats = [c[1] for c in coords]
+    lons = [float(c[0]) for c in coords]
+    lats = [float(c[1]) for c in coords]
 
     lat_lon_list = list(zip(lats, lons))
     elevs = _fetch_elevation(lat_lon_list)
@@ -130,7 +137,7 @@ def build_track_from_feature(feature):
     return track
 
 
-def _resample_track(track, n_points=300):
+def _resample_track(track: List[Dict[str, float]], n_points: int = 400) -> List[Dict[str, float]]:
     """
     Riduce / uniforma la traccia a n_points equispaziati in distanza.
     Serve per avere un POV fluido e costante.
@@ -142,7 +149,7 @@ def _resample_track(track, n_points=300):
     total = dists[-1]
     target = np.linspace(0, total, n_points)
 
-    resampled = []
+    resampled: List[Dict[str, float]] = []
     for td in target:
         idx = np.searchsorted(dists, td)
         if idx == 0:
@@ -161,10 +168,10 @@ def _resample_track(track, n_points=300):
 
             resampled.append(
                 {
-                    "lat": lat,
-                    "lon": lon,
-                    "elev": elev,
-                    "dist": td,
+                    "lat": float(lat),
+                    "lon": float(lon),
+                    "elev": float(elev),
+                    "dist": float(td),
                 }
             )
 
@@ -172,68 +179,133 @@ def _resample_track(track, n_points=300):
 
 
 # ---------------------------------------------------------------------
-# RENDERING POV 2.5D (STILE FIS)
+# RENDERING POV "REALISTICO INVERNALE"
 # ---------------------------------------------------------------------
 
-def _draw_pov_frame(track, t_norm, pista_name):
+def _draw_winter_background() -> Image.Image:
     """
-    Crea un singolo frame POV stile FIS:
-    - neve in primo piano
-    - pista centrale in prospettiva
-    - montagne + cielo
-    - HUD con altitudine e distanza
+    Crea un background invernale con cielo blu/azzurro e montagne innevate.
     """
-    # Setup immagine
-    img = Image.new("RGB", (WIDTH, HEIGHT), (180, 210, 240))
+    img = Image.new("RGB", (WIDTH, HEIGHT), (255, 255, 255))
     draw = ImageDraw.Draw(img)
 
-    # Fondo cielo
-    sky_h = int(HEIGHT * 0.45)
-    draw.rectangle([0, 0, WIDTH, sky_h], fill=(135, 176, 220))
+    # Cielo: gradiente dall'azzurro scuro in alto al chiaro verso l'orizzonte
+    for y in range(int(HEIGHT * 0.55)):
+        t = y / max(1, int(HEIGHT * 0.55) - 1)
+        r = int(15 + 30 * t)
+        g = int(60 + 80 * t)
+        b = int(110 + 120 * t)
+        draw.line([(0, y), (WIDTH, y)], fill=(r, g, b))
 
-    # Montagne stilizzate (sfondo)
-    mid_y = sky_h + 80
-    for offset, color in [(-200, (190, 210, 230)), (150, (170, 190, 210))]:
+    # Montagne lontane (grigio + bianco)
+    horizon = int(HEIGHT * 0.45)
+    m1 = [
+        (-200, horizon + 80),
+        (WIDTH * 0.2, horizon - 70),
+        (WIDTH * 0.5, horizon + 40),
+    ]
+    m2 = [
+        (WIDTH * 0.3, horizon + 60),
+        (WIDTH * 0.7, horizon - 90),
+        (WIDTH * 1.1, horizon + 50),
+    ]
+    draw.polygon(m1, fill=(190, 195, 205))
+    draw.polygon(m2, fill=(200, 205, 215))
+
+    # Nevicate sulle cime (bordi superiori più chiari)
+    for poly in (m1, m2):
+        ridge = []
+        for i in range(1, len(poly) - 1):
+            ridge.append(poly[i])
+        for x, y in ridge:
+            draw.ellipse([x - 6, y - 6, x + 6, y + 2], fill=(245, 250, 252))
+
+    # Neve in primo piano (pendenza pista)
+    snow_top = int(HEIGHT * 0.37)
+    draw.rectangle([0, snow_top, WIDTH, HEIGHT], fill=(240, 244, 248))
+
+    # Rumore molto leggero sulla neve per evitare "bianco piatto"
+    noise = Image.effect_noise((WIDTH, HEIGHT - snow_top), 10)
+    noise = noise.convert("L").point(lambda v: 220 + (v - 128) * 0.1)
+    snow_layer = Image.merge("RGB", (noise, noise, noise))
+    img.paste(snow_layer, (0, snow_top), snow_layer.convert("L").point(lambda v: 40))
+
+    return img
+
+
+def _draw_trees(draw: ImageDraw.ImageDraw, snow_top: int) -> None:
+    """
+    Disegna "macchie" di alberi ai lati pista.
+    """
+    tree_color = (32, 68, 58)
+    for i in range(40):
+        # lato sinistro
+        x = np.random.uniform(0, WIDTH * 0.18)
+        y = np.random.uniform(snow_top + 40, HEIGHT + 40)
+        h = np.random.uniform(25, 55)
         draw.polygon(
             [
-                (0 + offset, mid_y),
-                (WIDTH * 0.3 + offset, sky_h - 80),
-                (WIDTH * 0.6 + offset, mid_y),
+                (x, y - h),
+                (x - h * 0.4, y),
+                (x + h * 0.4, y),
             ],
-            fill=color,
+            fill=tree_color,
         )
 
-    # Neve/pendenza (primo piano)
-    snow_top = int(HEIGHT * 0.35)
-    draw.rectangle([0, snow_top, WIDTH, HEIGHT], fill=(240, 245, 250))
+    for i in range(40):
+        # lato destro
+        x = np.random.uniform(WIDTH * 0.82, WIDTH)
+        y = np.random.uniform(snow_top + 40, HEIGHT + 40)
+        h = np.random.uniform(25, 55)
+        draw.polygon(
+            [
+                (x, y - h),
+                (x - h * 0.4, y),
+                (x + h * 0.4, y),
+            ],
+            fill=tree_color,
+        )
+
+
+def _draw_pov_frame(track: List[Dict[str, float]], t_norm: float, pista_name: str) -> np.ndarray:
+    """
+    Crea un singolo frame POV stile "prima persona invernale":
+    - neve in primo piano
+    - pista centrale in prospettiva
+    - alberi e montagne innevate
+    - HUD con altitudine e distanza
+    """
+    base_img = _draw_winter_background()
+    draw = ImageDraw.Draw(base_img)
+
+    snow_top = int(HEIGHT * 0.37)
+
+    # Aggiungo alberi ai lati
+    _draw_trees(draw, snow_top)
 
     # Parametri prospettiva
     center_x = WIDTH // 2
-    horizon_y = snow_top + 40
-    bottom_y = HEIGHT + 40
+    horizon_y = snow_top + 30
+    bottom_y = HEIGHT + 80
 
-    # "Curva" della pista in base alla curva reale (lat/lon)
-    # Per semplicità prendiamo finestra di qualche punto attorno alla posizione
+    # Posizione lungo la traccia
     idx = int(t_norm * (len(track) - 1))
     idx = max(2, min(len(track) - 3, idx))
 
-    # direzioni per simulare curvatura
-    # uso differenze lon/lat per avere tendenza dx/sx
-    pre = track[idx - 2: idx + 3]
-    dlon = pre[-1]["lon"] - pre[0]["lon"]
+    # Valuto curvatura in base all'andamento orizzontale
+    window = track[idx - 2: idx + 3]
+    dlon = window[-1]["lon"] - window[0]["lon"]
     curvature = max(-1.0, min(1.0, dlon * 200))  # fattore grezzo per curva
 
-    # larghezze pista in basso e in alto
+    # Larghezze pista
     width_bottom = WIDTH * 0.7
-    width_top = WIDTH * 0.05
+    width_top = WIDTH * 0.06
 
-    # centro pista spostato lateralmente leggermente in base alla curva
-    center_shift = curvature * (WIDTH * 0.12)
+    center_shift = curvature * (WIDTH * 0.18)
 
     cx_bottom = center_x + center_shift
     cx_top = center_x + center_shift * 0.4
 
-    # Poligono pista (trapezio prospettico)
     pista_poly = [
         (cx_bottom - width_bottom / 2, bottom_y),
         (cx_bottom + width_bottom / 2, bottom_y),
@@ -241,57 +313,68 @@ def _draw_pov_frame(track, t_norm, pista_name):
         (cx_top - width_top / 2, horizon_y),
     ]
 
-    # Ombra ai bordi pista
-    draw.polygon(pista_poly, fill=(225, 235, 245))
+    # Ombreggio leggermente i bordi pista (neve smossa)
+    draw.polygon(pista_poly, fill=(234, 240, 246))
 
-    # Reti laterali (linee rosse)
-    net_color = (220, 40, 40)
+    # Textura sulla pista con leggere strisce
+    lane_color = (220, 228, 240)
+    for i in range(18):
+        f = i / 18.0
+        x1 = cx_bottom - width_bottom * 0.45 * (1 - f)
+        x2 = cx_bottom + width_bottom * 0.45 * (1 - f)
+        y = bottom_y + (horizon_y - bottom_y) * f
+        draw.line([(x1, y), (x2, y)], fill=lane_color, width=1)
+
+    # Reti laterali rosse
+    net_color = (215, 40, 40)
     steps = 12
     for side in (-1, 1):
         for i in range(steps):
             f = i / steps
             x1 = cx_bottom + side * (width_bottom / 2) * (1 - f)
             y1 = bottom_y - (bottom_y - horizon_y) * f
-            x2 = x1 + side * 20
-            y2 = y1 - 30
+            x2 = x1 + side * 14
+            y2 = y1 - 26
             draw.line([(x1, y1), (x2, y2)], fill=net_color, width=2)
 
-    # Linea centrale leggermente più scura (traccia gara)
-    line_color = (160, 180, 200)
-    for i in range(30):
-        f = i / 30.0
+    # Traccia centrale (linea gara)
+    line_color = (170, 180, 210)
+    for i in range(32):
+        f = i / 32.0
         x = cx_bottom + (cx_top - cx_bottom) * f
         y = bottom_y + (horizon_y - bottom_y) * f
-        r = max(1, int(6 - 4 * f))
+        r = max(1, int(5 - 3 * f))
         draw.ellipse([x - r, y - r, x + r, y + r], fill=line_color)
+
+    # Leggera sfocatura lontano per effetto profondità
+    blur_mask = Image.new("L", (WIDTH, HEIGHT), 0)
+    bm_draw = ImageDraw.Draw(blur_mask)
+    bm_draw.rectangle([0, 0, WIDTH, horizon_y + 10], fill=220)
+    blurred = base_img.filter(ImageFilter.GaussianBlur(radius=2.0))
+    base_img = Image.composite(blurred, base_img, blur_mask)
 
     # -----------------------------------------------------------------
     # HUD / TESTO
     # -----------------------------------------------------------------
-    # Info altitudine, dist ecc.
     p = track[idx]
     alt = p["elev"]
     dist = p["dist"]
     total_dist = track[-1]["dist"]
 
-    # Carica font di default (se vuoi puoi usare un TTF)
     try:
-        font_title = ImageFont.truetype("arial.ttf", 40)
-        font_small = ImageFont.truetype("arial.ttf", 28)
+        font_title = ImageFont.truetype("arial.ttf", 34)
+        font_small = ImageFont.truetype("arial.ttf", 24)
     except Exception:
         font_title = ImageFont.load_default()
         font_small = ImageFont.load_default()
 
-    # Barra semi-trasparente in alto
-    hud_h = 80
-    hud_color = (0, 0, 0, 130)
-    hud = Image.new("RGBA", (WIDTH, hud_h), hud_color)
-    img.paste(hud, (0, 0), hud)
+    hud_h = 70
+    hud = Image.new("RGBA", (WIDTH, hud_h), (0, 0, 0, 140))
+    base_img.paste(hud, (0, 0), hud)
 
-    # Testi
-    draw = ImageDraw.Draw(img)
+    draw = ImageDraw.Draw(base_img)
     draw.text(
-        (30, 20),
+        (24, 14),
         f"{pista_name} – POV",
         fill=(255, 255, 255),
         font=font_title,
@@ -299,17 +382,17 @@ def _draw_pov_frame(track, t_norm, pista_name):
 
     info_text = f"Alt: {alt:.0f} m   Distanza: {dist/1000:.2f} km / {total_dist/1000:.2f} km"
     draw.text(
-        (30, 50),
+        (24, 44),
         info_text,
-        fill=(255, 255, 255),
+        fill=(220, 235, 255),
         font=font_small,
     )
 
-    # Piccolo indicatore progresso a destra
-    bar_w = 16
-    bar_x = WIDTH - 60
-    bar_y1 = 20
-    bar_y2 = hud_h - 20
+    # Indicatore progressione a destra
+    bar_w = 14
+    bar_x = WIDTH - 50
+    bar_y1 = 16
+    bar_y2 = hud_h - 12
     draw.rectangle([bar_x, bar_y1, bar_x + bar_w, bar_y2], outline=(255, 255, 255), width=2)
     prog_y = bar_y2 - (bar_y2 - bar_y1) * t_norm
     draw.rectangle(
@@ -317,14 +400,14 @@ def _draw_pov_frame(track, t_norm, pista_name):
         fill=(255, 80, 80),
     )
 
-    return np.array(img)
+    return np.array(base_img)
 
 
 # ---------------------------------------------------------------------
 # GENERAZIONE VIDEO POV
 # ---------------------------------------------------------------------
 
-def generate_pov_video(feature, pista_name: str) -> str:
+def generate_pov_video(feature: Dict[str, Any], pista_name: str) -> str:
     """
     Genera (o recupera da cache) un video POV per la pista data.
     feature: Feature OSM con geometry LineString.
@@ -333,7 +416,9 @@ def generate_pov_video(feature, pista_name: str) -> str:
     Ritorna: path del file MP4 generato.
     """
     # filename "pulito"
-    safe_name = "".join(c if c.isalnum() or c in "-_" else "_" for c in pista_name.lower())
+    safe_name = "".join(
+        c if c.isalnum() or c in "-_" else "_" for c in str(pista_name).lower()
+    )
     out_path = VIDEO_DIR / f"{safe_name}_pov_12s.mp4"
 
     # Se esiste già, non rigeneriamo
@@ -348,7 +433,7 @@ def generate_pov_video(feature, pista_name: str) -> str:
     track = _resample_track(track, n_points=400)
 
     # Genera frames
-    frames = []
+    frames: List[np.ndarray] = []
     for i in range(N_FRAMES):
         t_norm = i / max(1, (N_FRAMES - 1))
         frame = _draw_pov_frame(track, t_norm, pista_name)
