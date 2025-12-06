@@ -263,11 +263,22 @@ def render_map(T, ctx):
                 pass
 
     # -----------------------------
-    # 4) Disegno mappa
+    # 4) Determino lo zoom iniziale
+    #    - se c'è già uno zoom salvato, lo riuso
+    #    - altrimenti parto bello vicino (zoom 15)
+    # -----------------------------
+    zoom_start = 15.0  # zoom di partenza "vicino"
+    if isinstance(prev_state, dict):
+        z = prev_state.get("zoom")
+        if isinstance(z, (int, float)):
+            zoom_start = float(z)
+
+    # -----------------------------
+    # 5) Disegno mappa
     # -----------------------------
     m = folium.Map(
         location=[marker_lat, marker_lon],
-        zoom_start=13,
+        zoom_start=zoom_start,
         tiles=None,
         control_scale=True,
     )
@@ -336,7 +347,7 @@ def render_map(T, ctx):
     )
 
     # -----------------------------
-    # 5) Switch + lista piste (OPZIONALE, sotto la mappa)
+    # 6) Switch + lista piste (OPZIONALE, sotto la mappa)
     # -----------------------------
     use_list = st.checkbox(
         "Attiva selezione da lista piste",
@@ -372,7 +383,7 @@ def render_map(T, ctx):
                     break
 
     # -----------------------------
-    # 6) Salvo stato in ctx + session_state
+    # 7) Salvo stato in ctx + session_state
     # -----------------------------
     ctx["marker_lat"] = marker_lat
     ctx["marker_lon"] = marker_lon
