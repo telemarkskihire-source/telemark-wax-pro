@@ -177,7 +177,6 @@ def render_pov_3d(ctx: Dict[str, Any]) -> Dict[str, Any]:
     # Mapbox token
     token = _get_mapbox_token()
     if token:
-    if token:
         # forza uso Mapbox satellite (la key è già in pdk.settings.mapbox_api_key)
         deck_kwargs.update(
             map_provider="mapbox",
