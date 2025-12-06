@@ -1,5 +1,5 @@
 # streamlit_app.py
-# Telemark · Skim8
+# Telemark · Skim8 / Pro Wax & Tune
 
 from __future__ import annotations
 
@@ -13,15 +13,11 @@ import pandas as pd
 import streamlit as st
 import altair as alt
 
-import core.pov_3d as pov3d_check
-st.sidebar.write("POV3D file path:", pov3d_check.__file__)
 # --- assicura che la root del progetto sia in testa al sys.path ---
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
-import importlib
-import core.pov_3d as _p3dtmp
-importlib.reload(_p3dtmp)
+
 # -------------------- IMPORT DAL CORE --------------------
 
 from core.i18n import L
@@ -55,16 +51,10 @@ from core import wax_logic as wax_mod
 from core.pages.ski_selector import recommend_skis_for_day
 from core import pov as pov_mod
 from core import pov_3d as pov3d_mod
+from core import pov_video as pov_video_mod  # VIDEO POV
 
 import core.search as search_mod  # debug / uso interno
-import importlib
-import sys
 
-# 🔥 forza reload completo di core.* ad ogni esecuzione
-importlib.invalidate_caches()
-for name in list(sys.modules.keys()):
-    if name.startswith("core.pov"):
-        del sys.modules[name]
 
 # ---------------------- THEME ----------------------
 PRIMARY = "#06b6d4"
@@ -274,6 +264,70 @@ def center_ctx_on_race_location(ctx: Dict[str, Any], event: RaceEvent) -> Dict[s
     return ctx
 
 
+def render_pov_video_section(T: Dict[str, Any], ctx: Dict[str, Any], key_suffix: str) -> None:
+    """
+    Se ho una pista in ctx["pov_piste_points"], permette di generare
+    un video POV 12s in stile volo d'uccello usando core.pov_video.
+    """
+    points = ctx.get("pov_piste_points") or []
+    if not points:
+        st.info("Video POV non disponibile: nessuna pista estratta.")
+        return
+
+    # Costruisco una Feature GeoJSON minimale a partire dai punti
+    coords = []
+    for p in points:
+        try:
+            lat = float(p.get("lat"))
+            lon = float(p.get("lon"))
+        except Exception:
+            continue
+        coords.append([lon, lat])  # GeoJSON vuole [lon, lat]
+
+    if len(coords) < 2:
+        st.info("Video POV non disponibile: traccia troppo corta.")
+        return
+
+    feature = {
+        "type": "Feature",
+        "geometry": {
+            "type": "LineString",
+            "coordinates": coords,
+        },
+        "properties": {},
+    }
+
+    pista_name = (
+        ctx.get("pov_piste_name")
+        or ctx.get("selected_piste_name")
+        or T.get("selected_slope", "pista")
+    )
+
+    st.markdown("#### 🎬 Video POV 3D (12 s)")
+
+    if st.button("Genera / aggiorna video POV", key=f"btn_pov_video_{key_suffix}"):
+        with st.spinner("Genero il video POV della pista…"):
+            try:
+                video_path = pov_video_mod.generate_pov_video(feature, pista_name)
+                st.success("Video POV generato.")
+                st.video(video_path)
+            except Exception as e:
+                st.error(f"Impossibile generare il video POV: {e}")
+    else:
+        # Se il video esiste già, lo mostro comunque (cache su disco)
+        try:
+            from pathlib import Path
+
+            safe_name = "".join(
+                c if c.isalnum() or c in "-_" else "_" for c in str(pista_name).lower()
+            )
+            candidate = Path("videos") / f"{safe_name}_pov_12s.mp4"
+            if candidate.exists():
+                st.video(str(candidate))
+        except Exception:
+            pass
+
+
 # ---------------------- SIDEBAR (lingua + debug) ----------------------
 st.sidebar.markdown("### ⚙️")
 
@@ -286,6 +340,7 @@ T = L["it"] if lang == "IT" else L["en"]
 
 debug_mode = st.sidebar.checkbox("🛠 Debug / Dev info", value=False)
 
+# debug percorso search.py
 search_path = os.path.abspath(search_mod.__file__)
 st.sidebar.markdown("**Debug search.py**")
 st.sidebar.code(search_path, language="bash")
@@ -357,10 +412,10 @@ if page == "Località & Mappa":
     st.markdown("## 3) Esposizione & pendenza")
     render_dem(T, ctx)
 
-    # ---------------- POV LOCALITÀ (estrazione + 3D) ----------------
+    # ---------------- POV LOCALITÀ (2D + 3D + VIDEO) ----------------
     st.markdown("### 🎥 POV pista (beta)")
     try:
-        # 1) estraggo pista e attivo download POV 2D
+        # 1) estraggo pista e attivo POV 2D
         ctx = pov_mod.render_pov_extract(T, ctx) or ctx
 
         # 2) se ho una pista, POV 3D integrato
@@ -368,6 +423,9 @@ if page == "Località & Mappa":
             ctx = pov3d_mod.render_pov3d_view(T, ctx) or ctx
     except Exception as e:
         st.info(f"POV non disponibile per questa località: {e}")
+
+    # 3) Video POV 3D (12 s)
+    render_pov_video_section(T, ctx, key_suffix="local")
 
     # ---------------- METEO LOCALITÀ ----------------
     st.markdown("## 4) Meteo località & profilo giornata")
@@ -899,7 +957,7 @@ else:
         st.markdown("### Esposizione & pendenza sulla pista selezionata")
         render_dem(T, ctx)
 
-        # POV GARA (estrazione + 3D)
+        # POV GARA (2D + 3D)
         st.markdown("### 🎥 POV gara (beta)")
         try:
             ctx = pov_mod.render_pov_extract(T, ctx) or ctx
@@ -907,6 +965,9 @@ else:
                 ctx = pov3d_mod.render_pov3d_view(T, ctx) or ctx
         except Exception as e:
             st.info(f"POV non disponibile per questa gara: {e}")
+
+        # Video POV gara (12 s)
+        render_pov_video_section(T, ctx, key_suffix="race")
 
         # ---------- Tuning WC di base (preset statico) ----------
         wc = get_wc_tuning_for_event(selected_event, WCSkierLevel.WC)
