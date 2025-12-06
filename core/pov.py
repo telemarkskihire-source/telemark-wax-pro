@@ -1,27 +1,21 @@
 # core/pov.py
 # Vista 3D (POV) di una pista selezionata
 #
-# - Legge dal contesto:
-#     · ctx["selected_piste_name"]   → nome pista scelto in maps.py
-#     · ctx["base_lat"], ["base_lon"] o ctx["lat"], ["lon"] come centro
-# - Riusa la funzione _fetch_downhill_pistes di core.maps per recuperare
-#   i segmenti OSM (piste:type=downhill).
-# - Trova tutti i segmenti con lo stesso nome, li unisce in un'unica traccia
-#   ordinata (in modo semplice).
-# - Mostra una vista 3D “tipo POV” con pydeck:
-#     · BASEMAP SATELLITARE Mapbox (se è presente una API key)
-#     · linea rossa 3D della pista (con quota finta che scende)
-#     · marker START (verde) e FINISH (rosso)
-#     · camera molto inclinata e zoomata → effetto “discesa”
-#
-# FUNZIONI ESPORTE:
-#   - render_pov_3d(ctx)        → nuova API
-#   - render_pov_extract(...)   → wrapper retro-compatibile per la vecchia app
+# - ctx["selected_piste_name"]   → nome pista scelto in maps.py
+# - ctx["base_lat"], ["base_lon"] o ctx["lat"], ["lon"] come centro
+# - Riusa core.maps._fetch_downhill_pistes per i segmenti OSM
+# - Unisce i segmenti della stessa pista
+# - Mostra:
+#     · basemap satellitare Mapbox (se la key funziona)
+#     · linea rossa 3D (dislivello finto ma coerente)
+#     · START/FINISH
+# - Espone:
+#     · render_pov_3d(ctx)
+#     · render_pov_extract(...) (compatibilità vecchio nome)
 
 from __future__ import annotations
 
 from typing import Dict, Any, List, Tuple, Optional
-from collections.abc import Mapping
 
 import math
 import os
@@ -30,113 +24,45 @@ import streamlit as st
 import pydeck as pdk
 
 try:
-    # riusiamo la funzione del modulo mappe per non duplicare Overpass
     from core.maps import _fetch_downhill_pistes
-except Exception:  # pragma: no cover - fallback se maps non è disponibile
+except Exception:  # pragma: no cover
     _fetch_downhill_pistes = None  # type: ignore[assignment]
 
 
 # ----------------------------------------------------------------------
-# Configurazione Mapbox per avere il SATELLITE (lettura robusta)
+# Mapbox token: lettura semplice + forzatura su Deck(mapbox_key=...)
 # ----------------------------------------------------------------------
-def _configure_mapbox_token() -> None:
-    """
-    Imposta la API key Mapbox per pydeck, se disponibile.
+def _get_mapbox_token() -> Optional[str]:
+    """Ritorna il token Mapbox da usare, se disponibile."""
 
-    Cerca nell'ordine:
-      1) se pdk.settings.mapbox_api_key è già settato → non fa nulla
-      2) st.secrets (convertito in dict):
-         - chiavi "MAPBOX_API_KEY", "MAPBOX_ACCESS_TOKEN", "MAPBOX_TOKEN"
-           e varianti minuscole
-         - valori annidati che sembrano un token Mapbox (es. iniziano con "pk.")
-      3) variabili d'ambiente:
-         - MAPBOX_API_KEY, MAPBOX_ACCESS_TOKEN, MAPBOX_TOKEN
-
-    Mostra un messaggio informativo SOLO se, dopo tutti i tentativi,
-    non trova nessuna API key.
-    """
-    # se è già configurato da qualche altra parte, non tocchiamo niente
-    if getattr(pdk.settings, "mapbox_api_key", None):
-        return
-
-    token: Optional[str] = None
-
-    # --- 1) st.secrets: chiavi dirette + oggetto completo convertito in dict ---
-    secrets_dict: Dict[str, Any] = {}
+    # 1) Secrets con nomi "classici"
     try:
-        if hasattr(st.secrets, "to_dict"):
-            secrets_dict = st.secrets.to_dict()  # type: ignore[assignment]
-        else:
-            secrets_dict = dict(st.secrets)  # type: ignore[arg-type]
-
-        direct_keys = [
+        for key in (
             "MAPBOX_API_KEY",
             "MAPBOX_ACCESS_TOKEN",
             "MAPBOX_TOKEN",
             "mapbox_api_key",
             "mapbox_access_token",
             "mapbox_token",
-        ]
-        for key in direct_keys:
-            if key in secrets_dict:
-                val = secrets_dict[key]
+        ):
+            if key in st.secrets:
+                val = st.secrets[key]
                 if isinstance(val, str) and val.strip():
-                    token = val.strip()
-                    break
+                    return val.strip()
     except Exception:
-        secrets_dict = {}
+        pass
 
-    # --- 2) st.secrets: sezioni nidificate / valori che "assomigliano" a un token Mapbox ---
-    if not token and secrets_dict:
+    # 2) Variabile d'ambiente
+    for key in ("MAPBOX_API_KEY", "MAPBOX_ACCESS_TOKEN", "MAPBOX_TOKEN"):
+        val = os.environ.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
 
-        def _search_in_obj(obj: Any) -> Optional[str]:
-            # stringa diretta
-            if isinstance(obj, str):
-                v = obj.strip()
-                if v.startswith("pk."):
-                    return v
-                if len(v) > 30:
-                    return v
-                return None
-            # mapping generico (dict, Secrets, ecc.)
-            if isinstance(obj, Mapping):
-                for v in obj.values():
-                    found = _search_in_obj(v)
-                    if found:
-                        return found
-            # liste/tuple
-            if isinstance(obj, (list, tuple)):
-                for v in obj:
-                    found = _search_in_obj(v)
-                    if found:
-                        return found
-            return None
-
-        candidate = _search_in_obj(secrets_dict)
-        if candidate:
-            token = candidate
-
-    # --- 3) variabili d'ambiente ---
-    if not token:
-        env_keys = ["MAPBOX_API_KEY", "MAPBOX_ACCESS_TOKEN", "MAPBOX_TOKEN"]
-        for key in env_keys:
-            val = os.environ.get(key)
-            if isinstance(val, str) and val.strip():
-                token = val.strip()
-                break
-
-    # --- 4) se finalmente abbiamo un token, configuriamo pydeck ---
-    if token:
-        pdk.settings.mapbox_api_key = token
-    else:
-        st.info(
-            "Per una vista 3D più realistica (satellite), configura una API key "
-            "Mapbox (`MAPBOX_API_KEY`) in *Secrets* o come variabile d'ambiente."
-        )
+    return None
 
 
 # ----------------------------------------------------------------------
-# Utility: distanza in metri (per ordinare i segmenti)
+# Utility: distanza in metri
 # ----------------------------------------------------------------------
 def _dist_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     R = 6371000.0
@@ -163,9 +89,7 @@ def _get_selected_piste_coords(ctx: Dict[str, Any]) -> Optional[List[Tuple[float
     Usa:
       - ctx["selected_piste_name"]
       - ctx["base_lat"], ctx["base_lon"] oppure ctx["lat"], ctx["lon"]
-    e chiama _fetch_downhill_pistes di core.maps.
-
-    Se non trova nulla, ritorna None.
+      - core.maps._fetch_downhill_pistes
     """
     piste_name = ctx.get("selected_piste_name")
     if not isinstance(piste_name, str) or not piste_name.strip():
@@ -180,10 +104,8 @@ def _get_selected_piste_coords(ctx: Dict[str, Any]) -> Optional[List[Tuple[float
     base_lat = float(ctx.get("base_lat", ctx.get("lat", default_lat)))
     base_lon = float(ctx.get("base_lon", ctx.get("lon", default_lon)))
 
-    # raggio 5 km attorno al centro
     _, polylines, names = _fetch_downhill_pistes(base_lat, base_lon, radius_km=5.0)
 
-    # prendo tutti i segmenti che hanno esattamente quel nome
     segments: List[List[Tuple[float, float]]] = [
         coords
         for coords, nm in zip(polylines, names)
@@ -194,12 +116,9 @@ def _get_selected_piste_coords(ctx: Dict[str, Any]) -> Optional[List[Tuple[float
         return None
 
     if len(segments) == 1:
-        # caso semplice: un solo segmento
         return segments[0]
 
-    # Se ci sono più segmenti con lo stesso nome (pista spezzata),
-    # li uniamo in modo semplice: partiamo dal segmento più lungo e
-    # aggiungiamo ogni volta il segmento il cui inizio è più vicino alla fine.
+    # Unione dei segmenti (approccio greedy semplice)
     segments = sorted(segments, key=len, reverse=True)
     track: List[Tuple[float, float]] = list(segments[0])
     used = {0}
@@ -208,7 +127,6 @@ def _get_selected_piste_coords(ctx: Dict[str, Any]) -> Optional[List[Tuple[float
         last_lat, last_lon = track[-1]
         best_idx = None
         best_dist = float("inf")
-
         for idx, seg in enumerate(segments):
             if idx in used:
                 continue
@@ -217,10 +135,8 @@ def _get_selected_piste_coords(ctx: Dict[str, Any]) -> Optional[List[Tuple[float
             if d < best_dist:
                 best_dist = d
                 best_idx = idx
-
         if best_idx is None:
             break
-
         used.add(best_idx)
         track.extend(segments[best_idx])
 
@@ -228,7 +144,7 @@ def _get_selected_piste_coords(ctx: Dict[str, Any]) -> Optional[List[Tuple[float
 
 
 # ----------------------------------------------------------------------
-# Render POV 3D con pydeck (NUOVA API)
+# Render POV 3D con pydeck
 # ----------------------------------------------------------------------
 def render_pov_3d(ctx: Dict[str, Any]) -> Dict[str, Any]:
     """
@@ -237,8 +153,6 @@ def render_pov_3d(ctx: Dict[str, Any]) -> Dict[str, Any]:
     Richiede:
       - ctx["selected_piste_name"] impostato (da maps.py)
       - core.maps._fetch_downhill_pistes disponibile
-
-    Se non ci sono dati sufficienti, mostra un messaggio informativo.
     """
     piste_name = ctx.get("selected_piste_name")
     if not isinstance(piste_name, str) or not piste_name.strip():
@@ -260,25 +174,37 @@ def render_pov_3d(ctx: Dict[str, Any]) -> Dict[str, Any]:
         )
         return ctx
 
-    # Configuriamo Mapbox per avere il satellite se possibile
-    _configure_mapbox_token()
+    # Mapbox token
+    token = _get_mapbox_token()
+    if token:
+        pdk.settings.mapbox_api_key = token  # per sicurezza
+    else:
+        st.info(
+            "Mapbox API key non trovata: viene mostrato solo il tracciato, "
+            "senza sfondo satellitare."
+        )
+
+    # piccolo debug visivo (puoi toglierlo dopo)
+    st.caption(
+        f"Mapbox key attiva: {bool(token)} "
+        f"(prefisso: {token[:3] if token else '---'})"
+    )
 
     # centro della pista per la camera
     avg_lat = sum(lat for lat, _ in coords) / len(coords)
     avg_lon = sum(lon for _, lon in coords) / len(coords)
 
-    # punti di start/finish (inizio e fine della traccia)
+    # start/finish
     start_lat, start_lon = coords[0]
     finish_lat, finish_lon = coords[-1]
 
-    # --- costruiamo un path 3D: lon, lat, alt ---
-    # quota finta: partiamo alto alla partenza e scendiamo verso il traguardo
+    # --- path 3D: [lon, lat, alt] con dislivello finto ---
     n = len(coords)
-    max_drop_m = 250.0  # dislivello "virtuale" in metri per l'effetto 3D
+    max_drop_m = 250.0
     path_lonlat: List[List[float]] = []
     for i, (lat, lon) in enumerate(coords):
         t = i / max(1, n - 1)  # 0 → 1
-        alt = max_drop_m * (1.0 - t)  # partenza più alta, arrivo più basso
+        alt = max_drop_m * (1.0 - t)  # alto → basso
         path_lonlat.append([lon, lat, alt])
 
     path_data = [
@@ -301,16 +227,14 @@ def render_pov_3d(ctx: Dict[str, Any]) -> Dict[str, Any]:
         },
     ]
 
-    # View "POV": camera molto inclinata e zoomata
     view_state = pdk.ViewState(
         latitude=avg_lat,
         longitude=avg_lon,
-        zoom=14.8,   # un po' più lontano per vedere la discesa 3D
-        pitch=70,    # inclinato → effetto "discesa"
-        bearing=-35, # leggera rotazione
+        zoom=14.8,
+        pitch=70,
+        bearing=-35,
     )
 
-    # Layer pista 3D
     path_layer = pdk.Layer(
         "PathLayer",
         data=path_data,
@@ -318,11 +242,8 @@ def render_pov_3d(ctx: Dict[str, Any]) -> Dict[str, Any]:
         get_color=[255, 70, 40],
         width_scale=6,
         width_min_pixels=4,
-        # usa la terza coordinata (alt) per l'elevazione
-        get_width=4,
     )
 
-    # Layer start/finish
     points_layer = pdk.Layer(
         "ScatterplotLayer",
         data=points_data,
@@ -336,49 +257,54 @@ def render_pov_3d(ctx: Dict[str, Any]) -> Dict[str, Any]:
         pickable=True,
     )
 
-    # Deck completo
-    deck = pdk.Deck(
+    deck_kwargs: Dict[str, Any] = dict(
         layers=[path_layer, points_layer],
         initial_view_state=view_state,
-        map_provider="mapbox",
-        map_style="mapbox://styles/mapbox/satellite-streets-v12",
         tooltip={"text": "{name}"},
     )
 
-    st.subheader("🎥 POV pista (beta)")
+    if token:
+        # forza uso Mapbox satellite
+        deck_kwargs.update(
+            map_provider="mapbox",
+            map_style="mapbox://styles/mapbox/satellite-v9",
+            mapbox_key=token,
+        )
+    else:
+        # fallback minimale (senza sfondo) – ma dovrebbe essere il tuo caso solo se manca la key
+        deck_kwargs.update(
+            map_provider=None,
+            map_style=None,
+        )
 
+    deck = pdk.Deck(**deck_kwargs)
+
+    st.subheader("🎥 POV pista (beta)")
     st.pydeck_chart(deck)
 
     st.caption(
         f"POV 3D della pista **{piste_name}** "
-        "(satellite + start/finish; puoi ruotare e zoomare con le dita o il mouse)."
+        "(puoi ruotare e zoomare con le dita o il mouse)."
     )
 
-    # Salviamo la traccia nel contesto per usi futuri (profilo altimetrico, animazione, ecc.)
     ctx["pov_coords"] = coords
-
     return ctx
 
 
 # ----------------------------------------------------------------------
-# Wrapper retro-compatibile: render_pov_extract
+# Wrapper retro-compatibile
 # ----------------------------------------------------------------------
 def render_pov_extract(*args, **kwargs) -> Dict[str, Any]:
     """
-    Wrapper di compatibilità per il vecchio nome `render_pov_extract`.
+    Compatibilità col vecchio nome `render_pov_extract`.
 
-    Accetta sia:
+    Accetta:
       - render_pov_extract(ctx)
       - render_pov_extract(T, ctx)
       - render_pov_extract(ctx=ctx)
-
-    e inoltra sempre a render_pov_3d(ctx).
     """
     ctx: Optional[Dict[str, Any]] = None
 
-    # pattern più comuni:
-    #   (ctx,)
-    #   (T, ctx)
     if args:
         if len(args) == 1:
             ctx = args[0]
