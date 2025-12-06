@@ -19,7 +19,9 @@ st.sidebar.write("POV3D file path:", pov3d_check.__file__)
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
-
+import importlib
+import core.pov_3d as _p3dtmp
+importlib.reload(_p3dtmp)
 # -------------------- IMPORT DAL CORE --------------------
 
 from core.i18n import L
