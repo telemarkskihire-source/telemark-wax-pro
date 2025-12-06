@@ -1,155 +1,178 @@
 # core/pov_video.py
-# Video POV 3D realistico (satellite stile invernale) per piste da sci
+# POV 3D "in prima persona" generato come GIF animata
 #
-# Uso previsto:
-#   from core.pov_video import generate_pov_video
-#   video_path = generate_pov_video(feature, pista_name)
-#   st.video(video_path)
+# - NIENTE moviepy, NIENTE ffmpeg → compatibile con Streamlit Cloud
+# - Usa solo Pillow + numpy per disegnare i frame
+# - Può lavorare sia:
+#     a) da ctx["pov_piste_points"] (flusso raccomandato, come POV 3D)
+#     b) da una feature GeoJSON (back-compat con generate_pov_video)
 #
-# - Prende una Feature GeoJSON (LineString) della pista
-# - Costruisce una traccia con lat/lon/elev/distanza
-# - Scarica UNA immagine satellitare grande da Mapbox
-# - La "imbianca" per un look invernale
-# - Disegna la pista sopra il satellite
-# - Genera un video POV in cui la camera segue la pista dall'alto
+# Uso consigliato nella app:
+#   from core import pov_video as pov_video_mod
+#   ctx = pov_video_mod.render_pov_video_section(T, ctx)
 #
-# NOTE:
-# - Richiede: moviepy, imageio[ffmpeg], requests, pillow, numpy
-# - Richiede una MAPBOX_API_KEY in st.secrets o in variabile d'ambiente
+# Il file GIF viene salvato in ./videos/<pista>_pov_12s.gif
+# e mostrato con st.image.
 
 from __future__ import annotations
 
-from typing import List, Dict, Any, Optional
-from pathlib import Path
+from typing import Any, Dict, List, Optional, Iterable
+
 import math
 import os
+from pathlib import Path
 
 import numpy as np
-import requests
 from PIL import Image, ImageDraw, ImageFont
-
 import streamlit as st
-
-try:
-    import moviepy.editor as mpy  # type: ignore[import]
-except Exception:
-    mpy = None  # type: ignore[assignment]
 
 # ---------------------------------------------------------------------
 # CONFIGURAZIONE GENERALE
 # ---------------------------------------------------------------------
 
-# Cartella di output per i video
+# Cartella dove salvare le GIF POV
 VIDEO_DIR = Path("videos")
 VIDEO_DIR.mkdir(exist_ok=True)
 
-# Video
-FRAME_RATE = 25          # fps (25 è un buon compromesso)
-VIDEO_DURATION = 12      # secondi
-N_FRAMES = FRAME_RATE * VIDEO_DURATION
+# Durata e frame-rate GIF
+GIF_DURATION_S = 12          # secondi
+GIF_FPS = 24                 # frame al secondo
+N_FRAMES = GIF_DURATION_S * GIF_FPS
 
-# Risoluzione video (16:9, compatibile con limiti Streamlit)
-OUT_WIDTH = 1280
-OUT_HEIGHT = 720
-
-# Dimensione dell'immagine satellitare base (Mapbox Static max 1280)
-MAPBOX_IMG_SIZE = 1280
-
-# API elevazione (per completare la traccia con la quota)
-ELEVATION_API_URL = "https://api.open-elevation.com/api/v1/lookup"
+# Risoluzione GIF (ridotta per peso / performance)
+WIDTH = 960
+HEIGHT = 540
 
 
 # ---------------------------------------------------------------------
 # UTILS GEO
 # ---------------------------------------------------------------------
+
 def _haversine_dist(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    """Distanza in metri tra due punti (lat/lon in gradi)."""
+    """Distanza in metri tra due coordinate geografiche."""
     R = 6371000.0
     p1 = math.radians(lat1)
     p2 = math.radians(lat2)
     dlat = math.radians(lat2 - lat1)
     dlon = math.radians(lon2 - lon1)
 
-    a = math.sin(dlat / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dlon / 2) ** 2
+    a = (
+        math.sin(dlat / 2) ** 2
+        + math.cos(p1) * math.cos(p2) * math.sin(dlon / 2) ** 2
+    )
     c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
     return R * c
 
 
-def _fetch_elevation(lat_lon_list: List[tuple[float, float]]) -> List[float]:
+# ---------------------------------------------------------------------
+# COSTRUZIONE TRACCIA
+# ---------------------------------------------------------------------
+
+def _build_track_from_ctx_points(points: Iterable[Dict[str, float]]) -> List[Dict[str, float]]:
     """
-    Restituisce una lista di elevazioni per i punti dati (lat, lon).
-    Usa una API DEM globale (open-elevation).
+    Converte i punti ctx["pov_piste_points"] in una traccia con:
+      lat, lon, elev, dist (distanza cumulativa).
     """
-    if not lat_lon_list:
+    pts = list(points)
+    if len(pts) < 2:
         return []
-
-    elevations: List[float] = []
-    chunk_size = 80
-
-    for i in range(0, len(lat_lon_list), chunk_size):
-        chunk = lat_lon_list[i : i + chunk_size]
-        locations = "|".join(f"{lat},{lon}" for lat, lon in chunk)
-        try:
-            r = requests.get(
-                ELEVATION_API_URL,
-                params={"locations": locations},
-                timeout=10,
-            )
-            r.raise_for_status()
-            j = r.json() or {}
-            results = j.get("results", []) or []
-            for item in results:
-                elevations.append(float(item.get("elevation", 0.0)))
-        except Exception:
-            elevations.extend([0.0] * len(chunk))
-
-    if len(elevations) < len(lat_lon_list):
-        last = elevations[-1] if elevations else 0.0
-        elevations.extend([last] * (len(lat_lon_list) - len(elevations)))
-
-    return elevations[: len(lat_lon_list)]
-
-
-def build_track_from_feature(feature: Dict[str, Any]) -> List[Dict[str, float]]:
-    """
-    Converte una Feature GeoJSON OSM (LineString) in una traccia
-    con lat, lon, elev, dist (distanza cumulativa in m).
-
-    feature: dict con geometry.type = "LineString",
-             geometry.coordinates = [[lon, lat], ...]
-    """
-    geom = feature.get("geometry") or {}
-    coords = geom.get("coordinates") or []  # [lon, lat]
-
-    if not coords:
-        return []
-
-    lons = [float(c[0]) for c in coords]
-    lats = [float(c[1]) for c in coords]
-
-    lat_lon_list = list(zip(lats, lons))
-    elevs = _fetch_elevation(lat_lon_list)
-
-    dists = [0.0]
-    for i in range(1, len(lats)):
-        d = _haversine_dist(lats[i - 1], lons[i - 1], lats[i], lons[i])
-        dists.append(dists[-1] + d)
 
     track: List[Dict[str, float]] = []
-    for i in range(len(lats)):
+    dist = 0.0
+
+    prev_lat = float(pts[0].get("lat", 0.0))
+    prev_lon = float(pts[0].get("lon", 0.0))
+    prev_elev = float(pts[0].get("elev", 0.0))
+    track.append(
+        {
+            "lat": prev_lat,
+            "lon": prev_lon,
+            "elev": prev_elev,
+            "dist": 0.0,
+        }
+    )
+
+    for p in pts[1:]:
+        lat = float(p.get("lat", 0.0))
+        lon = float(p.get("lon", 0.0))
+        elev = float(p.get("elev", prev_elev))
+        d = _haversine_dist(prev_lat, prev_lon, lat, lon)
+        dist += d
         track.append(
             {
-                "lat": lats[i],
-                "lon": lons[i],
-                "elev": elevs[i] if i < len(elevs) else 0.0,
-                "dist": dists[i],
+                "lat": lat,
+                "lon": lon,
+                "elev": elev,
+                "dist": dist,
             }
         )
+        prev_lat, prev_lon, prev_elev = lat, lon, elev
 
     return track
 
 
-def _resample_track(track: List[Dict[str, float]], n_points: int = 400) -> List[Dict[str, float]]:
+def _build_track_from_feature(feature: Dict[str, Any]) -> List[Dict[str, float]]:
+    """
+    Back-compat: costruisce la traccia da una Feature GeoJSON
+    geometry.type = 'LineString', coords = [lon, lat, (elev?)].
+
+    Elevazione: se non presente, assume 0.
+    """
+    geom = feature.get("geometry") or {}
+    coords = geom.get("coordinates") or []
+    if not coords:
+        return []
+
+    lats = []
+    lons = []
+    elevs = []
+
+    for c in coords:
+        if len(c) >= 2:
+            lon = float(c[0])
+            lat = float(c[1])
+            lons.append(lon)
+            lats.append(lat)
+            if len(c) >= 3:
+                elevs.append(float(c[2]))
+            else:
+                elevs.append(0.0)
+
+    if len(lats) < 2:
+        return []
+
+    track: List[Dict[str, float]] = []
+    dist = 0.0
+
+    prev_lat = lats[0]
+    prev_lon = lons[0]
+    prev_elev = elevs[0]
+    track.append(
+        {
+            "lat": prev_lat,
+            "lon": prev_lon,
+            "elev": prev_elev,
+            "dist": 0.0,
+        }
+    )
+
+    for lat, lon, elev in zip(lats[1:], lons[1:], elevs[1:]):
+        d = _haversine_dist(prev_lat, prev_lon, lat, lon)
+        dist += d
+        track.append(
+            {
+                "lat": lat,
+                "lon": lon,
+                "elev": elev,
+                "dist": dist,
+            }
+        )
+        prev_lat, prev_lon, prev_elev = lat, lon, elev
+
+    return track
+
+
+def _resample_track(track: List[Dict[str, float]], n_points: int = 320) -> List[Dict[str, float]]:
     """
     Riduce / uniforma la traccia a n_points equispaziati in distanza.
     Serve per avere un POV fluido e costante.
@@ -159,9 +182,12 @@ def _resample_track(track: List[Dict[str, float]], n_points: int = 400) -> List[
 
     dists = np.array([p["dist"] for p in track], dtype=float)
     total = float(dists[-1])
-    target = np.linspace(0.0, total, n_points)
+    if total <= 0:
+        return track
 
+    target = np.linspace(0.0, total, n_points)
     resampled: List[Dict[str, float]] = []
+
     for td in target:
         idx = int(np.searchsorted(dists, td))
         if idx <= 0:
@@ -171,8 +197,7 @@ def _resample_track(track: List[Dict[str, float]], n_points: int = 400) -> List[
         else:
             p1 = track[idx - 1]
             p2 = track[idx]
-            denom = float(dists[idx] - dists[idx - 1]) + 1e-9
-            t = float(td - dists[idx - 1]) / denom
+            t = float((td - dists[idx - 1]) / (dists[idx] - dists[idx - 1] + 1e-9))
 
             lat = p1["lat"] + (p2["lat"] - p1["lat"]) * t
             lon = p1["lon"] + (p2["lon"] - p1["lon"]) * t
@@ -191,301 +216,324 @@ def _resample_track(track: List[Dict[str, float]], n_points: int = 400) -> List[
 
 
 # ---------------------------------------------------------------------
-# MAPBOX & IMMAGINE SATELLITARE
+# RENDERING POV INVERNALE
 # ---------------------------------------------------------------------
-def _get_mapbox_token() -> Optional[str]:
-    """
-    Ritorna la Mapbox API key se configurata in:
-      - st.secrets["MAPBOX_API_KEY"]
-      - variabile d'ambiente MAPBOX_API_KEY
-    Altrimenti None.
-    """
+
+def _load_fonts() -> tuple[ImageFont.ImageFont, ImageFont.ImageFont]:
+    """Carica due font (titolo + testo). Fallback: default."""
     try:
-        if "MAPBOX_API_KEY" in st.secrets:
-            token = str(st.secrets["MAPBOX_API_KEY"]).strip()
-            if token:
-                return token
+        font_title = ImageFont.truetype("arial.ttf", 40)
+        font_small = ImageFont.truetype("arial.ttf", 26)
     except Exception:
-        pass
+        font_title = ImageFont.load_default()
+        font_small = ImageFont.load_default()
+    return font_title, font_small
 
-    token = os.environ.get("MAPBOX_API_KEY", "").strip()
-    return token or None
 
-
-def _download_satellite_image(track: List[Dict[str, float]], token: Optional[str]) -> Image.Image:
+def _draw_pov_frame(track: List[Dict[str, float]], t_norm: float, pista_name: str) -> Image.Image:
     """
-    Scarica una immagine satellitare quadrata da Mapbox che copre
-    tutta la pista. Se il token non è disponibile o la richiesta fallisce,
-    restituisce un semplice gradient di fallback.
+    Crea un singolo frame POV stile "volo d'uccello" invernale:
+    - cielo blu freddo
+    - montagne innevate
+    - vallata con boschi
+    - pista in prospettiva che scende verso il basso
     """
-    if not token:
-        return _fallback_background()
+    # Setup immagine
+    img = Image.new("RGB", (WIDTH, HEIGHT), (200, 220, 240))
+    draw = ImageDraw.Draw(img)
 
-    if not track:
-        return _fallback_background()
+    # --- CIELO INVERNALE (gradiente blu freddo) ---
+    sky_h = int(HEIGHT * 0.45)
+    for y in range(sky_h):
+        blend = y / max(1, sky_h - 1)
+        r = int(40 + 20 * blend)
+        g = int(80 + 40 * blend)
+        b = int(140 + 50 * blend)
+        draw.line([(0, y), (WIDTH, y)], fill=(r, g, b))
 
-    # centro pista
-    mean_lat = float(sum(p["lat"] for p in track) / len(track))
-    mean_lon = float(sum(p["lon"] for p in track) / len(track))
+    # --- MONTAGNE INNEVATE (sfondo) ---
+    # Due strati di montagne stilizzate, leggermente sfalsati
+    mid_y = sky_h + 40
+    mountain_colors = [(220, 230, 235), (205, 215, 225)]
+    offsets = [-220, 120]
+    for offset, col in zip(offsets, mountain_colors):
+        draw.polygon(
+            [
+                (0 + offset, mid_y + 30),
+                (WIDTH * 0.25 + offset, sky_h - 40),
+                (WIDTH * 0.55 + offset, mid_y),
+                (WIDTH * 0.9 + offset, sky_h - 30),
+                (WIDTH * 1.2 + offset, mid_y + 40),
+            ],
+            fill=col,
+        )
 
-    # Zoom fisso "sicuro": 14 copre tipicamente diverse km per 1280x1280
-    zoom = 14
-    bearing = 0   # top-down
-    pitch = 0
+    # Creste rocciose più scure sotto la neve
+    ridge_y = mid_y + 15
+    draw.rectangle([0, ridge_y, WIDTH, ridge_y + 25], fill=(170, 180, 190))
 
-    url = (
-        "https://api.mapbox.com/styles/v1/mapbox/satellite-v9/static/"
-        f"{mean_lon},{mean_lat},{zoom},{bearing},{pitch}/"
-        f"{MAPBOX_IMG_SIZE}x{MAPBOX_IMG_SIZE}"
-        f"?access_token={token}"
+    # --- NEVE / PENDENZA (primo piano) ---
+    snow_top = int(HEIGHT * 0.33)
+    draw.rectangle([0, snow_top, WIDTH, HEIGHT], fill=(245, 247, 252))
+
+    # --- PARAMETRI PROSPETTIVA ---
+    center_x = WIDTH // 2
+    horizon_y = snow_top + 40
+    bottom_y = HEIGHT + 40
+
+    # Tendenza curva in funzione dell'andamento reale della pista
+    # (usiamo finestra di punti attorno alla posizione corrente)
+    idx = int(t_norm * max(1, len(track) - 1))
+    idx = max(2, min(len(track) - 3, idx))
+
+    window = track[idx - 2: idx + 3]
+    dlon = window[-1]["lon"] - window[0]["lon"]
+    curvature = max(-1.0, min(1.0, dlon * 200))  # fattore grezzo per dx / sx
+
+    # larghezza pista in prospettiva
+    width_bottom = WIDTH * 0.85
+    width_top = WIDTH * 0.08
+
+    center_shift = curvature * (WIDTH * 0.15)
+    cx_bottom = center_x + center_shift
+    cx_top = center_x + center_shift * 0.4
+
+    # Poligono pista (neve battuta)
+    pista_poly = [
+        (cx_bottom - width_bottom / 2, bottom_y),
+        (cx_bottom + width_bottom / 2, bottom_y),
+        (cx_top + width_top / 2, horizon_y),
+        (cx_top - width_top / 2, horizon_y),
+    ]
+    draw.polygon(pista_poly, fill=(235, 243, 250))
+
+    # Aggiungo leggere bande di pressione / strutture neve
+    for i in range(12):
+        f = i / 11.0
+        x1 = cx_bottom - width_bottom * 0.45 + width_bottom * 0.9 * f
+        y1 = bottom_y - (bottom_y - horizon_y) * (0.1 + 0.8 * f)
+        x2 = x1 + 30
+        y2 = y1 + 4
+        col = (220, 230, 240)
+        draw.rectangle([x1, y1, x2, y2], fill=col)
+
+    # --- BOSCO AI LATI (macchie di abeti scuri) ---
+    forest_color = (50, 90, 70)
+    for side in (-1, 1):
+        for i in range(40):
+            f = i / 40.0
+            base_x = cx_bottom + side * (width_bottom / 2 + 30 + 80 * f)
+            base_y = bottom_y - (bottom_y - snow_top) * f
+            h = 35 + 40 * (1 - f)
+            w = 18 + 10 * (1 - f)
+            x1 = base_x - w / 2
+            y1 = base_y - h
+            x2 = base_x + w / 2
+            y2 = base_y
+            draw.polygon(
+                [(x1, y2), ((x1 + x2) / 2, y1), (x2, y2)],
+                fill=forest_color,
+            )
+
+    # --- RETI LATERALI (linee rosse) ---
+    net_color = (220, 40, 40)
+    steps = 12
+    for side in (-1, 1):
+        for i in range(steps):
+            f = i / steps
+            x1 = cx_bottom + side * (width_bottom / 2) * (1 - f * 0.8)
+            y1 = bottom_y - (bottom_y - horizon_y) * f
+            x2 = x1 + side * 22
+            y2 = y1 - 32
+            draw.line([(x1, y1), (x2, y2)], fill=net_color, width=2)
+
+    # --- TRACCIA CENTRALE (linea gara) ---
+    gate_color = (160, 180, 210)
+    for i in range(32):
+        f = i / 32.0
+        x = cx_bottom + (cx_top - cx_bottom) * f
+        y = bottom_y + (horizon_y - bottom_y) * f
+        r = max(1, int(6 - 4 * f))
+        draw.ellipse([x - r, y - r, x + r, y + r], fill=gate_color)
+
+    # -----------------------------------------------------------------
+    # HUD / TESTO
+    # -----------------------------------------------------------------
+    font_title, font_small = _load_fonts()
+
+    # Barra semi-trasparente in alto
+    hud_h = 82
+    hud = Image.new("RGBA", (WIDTH, hud_h), (0, 0, 0, 130))
+    img.paste(hud, (0, 0), hud)
+
+    # Info altitudine e distanza (stimate dal track)
+    p = track[idx]
+    alt = float(p["elev"])
+    dist = float(p["dist"])
+    total_dist = float(track[-1]["dist"])
+
+    title_text = f"{pista_name} – POV 3D"
+    info_text = f"Alt: {alt:.0f} m   Distanza: {dist/1000:.2f} / {total_dist/1000:.2f} km"
+
+    draw = ImageDraw.Draw(img)
+    draw.text((26, 18), title_text, fill=(255, 255, 255), font=font_title)
+    draw.text((26, 52), info_text, fill=(235, 245, 255), font=font_small)
+
+    # Indicatore progresso a destra
+    bar_w = 16
+    bar_x = WIDTH - 60
+    bar_y1 = 20
+    bar_y2 = hud_h - 20
+    draw.rectangle([bar_x, bar_y1, bar_x + bar_w, bar_y2], outline=(255, 255, 255), width=2)
+    prog_y = bar_y2 - (bar_y2 - bar_y1) * t_norm
+    draw.rectangle(
+        [bar_x + 3, prog_y, bar_x + bar_w - 3, bar_y2 - 3],
+        fill=(255, 80, 80),
     )
 
-    try:
-        r = requests.get(url, timeout=15)
-        r.raise_for_status()
-        img = Image.open(r.raw).convert("RGB")
-        return img
-    except Exception:
-        return _fallback_background()
-
-
-def _fallback_background() -> Image.Image:
-    """
-    Sfondo di emergenza (niente Mapbox): un semplice gradiente azzurro/grigio
-    che simula un paesaggio invernale visto dall'alto.
-    """
-    img = Image.new("RGB", (MAPBOX_IMG_SIZE, MAPBOX_IMG_SIZE), (190, 200, 210))
-    draw = ImageDraw.Draw(img)
-    for y in range(MAPBOX_IMG_SIZE):
-        t = y / max(1, MAPBOX_IMG_SIZE - 1)
-        col = int(220 - 40 * t)
-        draw.line([(0, y), (MAPBOX_IMG_SIZE, y)], fill=(col, col, col))
     return img
 
 
-def _winterize_image(img: Image.Image) -> Image.Image:
-    """
-    Applica un look "invernale" all'immagine:
-      - leggero aumento luminosità
-      - riduzione saturazione
-      - overlay bianco-azzurro per simulare la neve
-    """
-    arr = np.asarray(img).astype(np.float32)
-
-    # Schiarisco un po'
-    arr = arr * 1.05 + 10.0
-
-    # Leggero "snow tint"
-    snow_tint = np.array([230.0, 236.0, 244.0], dtype=np.float32)
-    alpha = 0.45
-    arr = arr * (1.0 - alpha) + snow_tint * alpha
-
-    # Clipping
-    arr = np.clip(arr, 0.0, 255.0).astype(np.uint8)
-    return Image.fromarray(arr, mode="RGB")
-
-
-def _track_to_pixels(
-    track: List[Dict[str, float]],
-    img_size: int,
-    margin: int = 60,
-) -> List[tuple[float, float]]:
-    """
-    Proietta lat/lon su coordinate pixel dell'immagine (approssimazione lineare
-    valida per piccoli estensioni).
-    """
-    if not track:
-        return []
-
-    lats = [p["lat"] for p in track]
-    lons = [p["lon"] for p in track]
-
-    min_lat, max_lat = min(lats), max(lats)
-    min_lon, max_lon = min(lons), max(lons)
-
-    # evito divisioni per zero
-    lat_span = max(max_lat - min_lat, 1e-6)
-    lon_span = max(max_lon - min_lon, 1e-6)
-
-    usable = img_size - 2 * margin
-    px_coords: List[tuple[float, float]] = []
-
-    for p in track:
-        x_norm = (p["lon"] - min_lon) / lon_span
-        y_norm = (p["lat"] - min_lat) / lat_span
-
-        x = margin + x_norm * usable
-        # invertito perché y aumenta verso il basso
-        y = img_size - (margin + y_norm * usable)
-
-        px_coords.append((float(x), float(y)))
-
-    return px_coords
-
-
-def _draw_track_on_base(
-    base: Image.Image,
-    px_track: List[tuple[float, float]],
-) -> Image.Image:
-    """
-    Disegna la pista sull'immagine base (linea chiara + bordo leggero).
-    """
-    img = base.copy()
-    draw = ImageDraw.Draw(img)
-
-    if len(px_track) >= 2:
-        # bordo scuro
-        draw.line(px_track, fill=(180, 40, 40), width=7)
-        # centro più chiaro (neve battuta)
-        draw.line(px_track, fill=(255, 120, 80), width=4)
-
-    return img
-
-
 # ---------------------------------------------------------------------
-# GENERAZIONE FRAME POV
+# GENERAZIONE GIF
 # ---------------------------------------------------------------------
-def _make_frames_for_track(
-    bg_with_track: Image.Image,
-    px_track: List[tuple[float, float]],
-) -> List[np.ndarray]:
+
+def _safe_filename_from_name(pista_name: str) -> str:
+    safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in pista_name.lower())
+    if not safe:
+        safe = "pista"
+    return safe
+
+
+def _generate_gif_from_track(track: List[Dict[str, float]], pista_name: str) -> str:
     """
-    Genera tutti i frame del video POV:
-      - la camera segue il tracciato
-      - viene ritagliata una finestra attorno al punto attuale
-      - la finestra viene scalata alla risoluzione finale
+    Genera (o rigenera) la GIF POV da una traccia geometrica.
+    Restituisce il path locale del file GIF.
     """
-    frames: List[np.ndarray] = []
-
-    if len(px_track) < 5:
-        # fallback: frame statico
-        frame = bg_with_track.resize((OUT_WIDTH, OUT_HEIGHT), Image.LANCZOS)
-        frames = [np.asarray(frame)] * N_FRAMES
-        return frames
-
-    W, H = bg_with_track.size
-    crop_w = int(W * 0.5)
-    crop_h = int(H * 0.3)
-
-    # evito crop troppo piccoli
-    crop_w = max(crop_w, OUT_WIDTH // 2)
-    crop_h = max(crop_h, OUT_HEIGHT // 2)
-
-    # per l'HUD
-    try:
-        font = ImageFont.truetype("arial.ttf", 24)
-    except Exception:
-        font = ImageFont.load_default()
-
-    for i in range(N_FRAMES):
-        t = i / max(1, N_FRAMES - 1)
-        idx = int(t * (len(px_track) - 1))
-        cx, cy = px_track[idx]
-
-        left = int(cx - crop_w / 2)
-        top = int(cy - crop_h / 2)
-
-        # clamp ai bordi
-        left = max(0, min(left, W - crop_w))
-        top = max(0, min(top, H - crop_h))
-        right = left + crop_w
-        bottom = top + crop_h
-
-        frame_img = bg_with_track.crop((left, top, right, bottom))
-        frame_img = frame_img.resize((OUT_WIDTH, OUT_HEIGHT), Image.LANCZOS)
-
-        # piccolo marker al centro (direzione di marcia)
-        draw = ImageDraw.Draw(frame_img)
-        cx_f = OUT_WIDTH // 2
-        cy_f = int(OUT_HEIGHT * 0.6)
-        r = 6
-        draw.ellipse(
-            [cx_f - r, cy_f - r, cx_f + r, cy_f + r],
-            fill=(255, 140, 0),
-            outline=(20, 20, 20),
-            width=2,
-        )
-
-        # barra progresso semplice
-        bar_margin = 40
-        bar_y = OUT_HEIGHT - 30
-        draw.line(
-            [(bar_margin, bar_y), (OUT_WIDTH - bar_margin, bar_y)],
-            fill=(240, 240, 240),
-            width=3,
-        )
-        prog_x = bar_margin + t * (OUT_WIDTH - 2 * bar_margin)
-        draw.line(
-            [(bar_margin, bar_y), (prog_x, bar_y)],
-            fill=(255, 120, 80),
-            width=5,
-        )
-
-        frames.append(np.asarray(frame_img))
-
-    return frames
-
-
-# ---------------------------------------------------------------------
-# FUNZIONE PUBBLICA: GENERAZIONE VIDEO POV
-# ---------------------------------------------------------------------
-def generate_pov_video(feature: Dict[str, Any], pista_name: str) -> str:
-    """
-    Genera (o recupera da cache) un video POV per la pista data.
-
-    feature: Feature OSM con geometry LineString (lista [lon, lat])
-    pista_name: nome leggibile pista (usato per filename)
-
-    Ritorna: path del file MP4 generato (sempre in cartella "videos/").
-    Lancia RuntimeError se moviepy non è disponibile.
-    """
-    # Controllo MoviePy
-    if mpy is None:
-        raise RuntimeError(
-            "Modulo 'moviepy' non disponibile nell'ambiente. "
-            "Installa 'moviepy' e 'imageio[ffmpeg]' per abilitare il video POV."
-        )
-
-    # filename "pulito"
-    safe_name = "".join(
-        c if c.isalnum() or c in "-_" else "_"
-        for c in pista_name.lower().strip() or "pista"
-    )
-    out_path = VIDEO_DIR / f"{safe_name}_pov_sat_12s.mp4"
-
-    # Cache: se esiste già, lo riuso
-    if out_path.exists():
-        return str(out_path)
-
-    # 1) Traccia dalla feature
-    track = build_track_from_feature(feature)
     if len(track) < 5:
         raise ValueError("Traccia insufficiente per POV (meno di 5 punti).")
 
-    track = _resample_track(track, n_points=400)
+    track = _resample_track(track, n_points=320)
 
-    # 2) Immagine satellitare
-    token = _get_mapbox_token()
-    sat_img = _download_satellite_image(track, token)
-    winter_img = _winterize_image(sat_img)
+    safe_name = _safe_filename_from_name(pista_name)
+    out_path = VIDEO_DIR / f"{safe_name}_pov_12s.gif"
 
-    # 3) Coordinate pixel della pista
-    px_track = _track_to_pixels(track, img_size=winter_img.size[0], margin=80)
+    frames: List[Image.Image] = []
+    for i in range(N_FRAMES):
+        t_norm = i / max(1, N_FRAMES - 1)
+        frame = _draw_pov_frame(track, t_norm, pista_name)
+        frames.append(frame)
 
-    # 4) Disegno pista sulla base
-    base_with_track = _draw_track_on_base(winter_img, px_track)
-
-    # 5) Genero tutti i frame
-    frames = _make_frames_for_track(base_with_track, px_track)
-
-    # 6) Crea clip video
-    clip = mpy.ImageSequenceClip(frames, fps=FRAME_RATE)
-    clip.write_videofile(
+    duration_ms = int(1000 / GIF_FPS)  # durata per frame
+    frames[0].save(
         str(out_path),
-        codec="libx264",
-        audio=False,
-        verbose=False,
-        logger=None,
+        save_all=True,
+        append_images=frames[1:],
+        duration=duration_ms,
+        loop=0,
+        optimize=True,
     )
 
     return str(out_path)
+
+
+# ---------------------------------------------------------------------
+# API PUBBLICHE
+# ---------------------------------------------------------------------
+
+def generate_pov_video(feature: Dict[str, Any], pista_name: str) -> str:
+    """
+    Back-compat: stessa firma storica ma ora genera una GIF POV 3D.
+
+    feature: Feature OSM/GeoJSON LineString.
+    pista_name: nome leggibile pista.
+
+    Ritorna: path del file GIF.
+    """
+    track = _build_track_from_feature(feature)
+    if not track:
+        raise ValueError("Impossibile costruire la traccia dalla feature.")
+    return _generate_gif_from_track(track, pista_name)
+
+
+def generate_pov_gif_from_ctx(ctx: Dict[str, Any]) -> Optional[str]:
+    """
+    Nuova API principale per la app:
+      - legge ctx["pov_piste_points"] (lista dict lat/lon/elev)
+      - legge ctx["pov_piste_name"] o ctx["selected_piste_name"]
+      - genera la GIF POV 3D
+    """
+    raw_points = ctx.get("pov_piste_points") or ctx.get("selected_piste_points")
+    if not raw_points:
+        return None
+
+    pista_name = (
+        ctx.get("pov_piste_name")
+        or ctx.get("selected_piste_name")
+        or "pista selezionata"
+    )
+
+    track = _build_track_from_ctx_points(raw_points)
+    if not track:
+        return None
+
+    try:
+        path = _generate_gif_from_track(track, str(pista_name))
+    except Exception as e:
+        st.error(f"Errore nella generazione GIF POV: {e}")
+        return None
+
+    return path
+
+
+def render_pov_video_section(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Sezione Streamlit completa per il video POV 3D:
+
+    - Mostra titolo + pulsante "Genera / aggiorna video POV"
+    - Usa ctx["pov_piste_points"] (se presenti)
+    - Mostra la GIF in pagina (st.image)
+    """
+    st.markdown("### 🎬 Video POV 3D (GIF 12 s)")
+
+    if not ctx.get("pov_piste_points"):
+        st.info(
+            "Per generare il video POV serve una pista estratta. "
+            "Seleziona prima una pista dalla mappa."
+        )
+        return ctx
+
+    pista_name = (
+        ctx.get("pov_piste_name")
+        or ctx.get("selected_piste_name")
+        or "pista selezionata"
+    )
+    safe_name = _safe_filename_from_name(str(pista_name))
+    gif_path = VIDEO_DIR / f"{safe_name}_pov_12s.gif"
+
+    col_btn, col_info = st.columns([1, 2])
+    with col_btn:
+        do_generate = st.button("Genera / aggiorna video POV", key="btn_generate_pov_gif")
+    with col_info:
+        if gif_path.exists():
+            st.caption(f"GIF attuale: `{gif_path.name}` (clicca il bottone per rigenerarla).")
+        else:
+            st.caption("Nessuna GIF POV generata per questa pista.")
+
+    if do_generate or not gif_path.exists():
+        path = generate_pov_gif_from_ctx(ctx)
+        if path:
+            st.success("GIF POV generata con successo.")
+            gif_path = Path(path)
+        else:
+            st.error("Impossibile generare la GIF POV per questa pista.")
+
+    if gif_path.exists():
+        st.image(
+            str(gif_path),
+            caption=f"POV 3D GIF della pista {pista_name}",
+            use_column_width=True,
+        )
+        ctx["pov_gif_path"] = str(gif_path)
+
+    return ctx
