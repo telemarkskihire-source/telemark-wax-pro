@@ -12,6 +12,8 @@
 # - La pista selezionata rimane evidenziata in ROSSO finché non ne scegli
 #   un’altra. Il nome è salvato anche in st.session_state.
 # - Le piste SENZA nome non hanno label (nessuna scritta "pista senza nome").
+# - Il click viene letto sia dal risultato di st_folium sia da session_state
+#   per migliorare la reattività (meno click "persi").
 
 from __future__ import annotations
 
@@ -196,7 +198,7 @@ def render_map(T, ctx):
     unique_names = sorted({nm for _, nm in named_pairs})
 
     # -----------------------------
-    # 3) Disegno mappa (prima di leggere clicks)
+    # 3) Disegno mappa
     # -----------------------------
     with map_container:
         m = folium.Map(
@@ -218,6 +220,7 @@ def render_map(T, ctx):
         ).add_to(m)
 
         # piste (tutte blu, rossa quella selezionata)
+        label_done = set()  # per non ripetere il nome più volte
         for coords, nm in zip(polylines, names):
             is_selected = (nm is not None and nm == selected_name)
 
@@ -228,8 +231,8 @@ def render_map(T, ctx):
                 opacity=1.0 if is_selected else 0.6,
             ).add_to(m)
 
-            # etichetta SOLO se c'è un nome (niente "pista senza nome")
-            if nm and coords:
+            # etichetta SOLO se c'è un nome e non l'abbiamo già disegnata
+            if nm and nm not in label_done and coords:
                 mid_idx = len(coords) // 2
                 label_lat, label_lon = coords[mid_idx]
                 folium.Marker(
@@ -248,6 +251,7 @@ def render_map(T, ctx):
                         )
                     ),
                 ).add_to(m)
+                label_done.add(nm)
 
         # marker
         folium.Marker(
@@ -255,7 +259,7 @@ def render_map(T, ctx):
             icon=folium.Icon(color="red", icon="flag"),
         ).add_to(m)
 
-        # QUI otteniamo il click della run attuale
+        # risultato della run corrente
         result = st_folium(
             m,
             height=450,
@@ -266,36 +270,44 @@ def render_map(T, ctx):
 
     # -----------------------------
     # 4) Gestisco il click (snap immediato, un solo click)
+    #    Prendo last_clicked sia da result che da session_state per non perderlo.
     # -----------------------------
-    if result and isinstance(result, dict):
+    last_clicked = None
+    if isinstance(result, dict):
         last_clicked = result.get("last_clicked")
-        if last_clicked and polylines:
-            try:
-                c_lat = float(last_clicked["lat"])
-                c_lon = float(last_clicked["lng"])
 
-                best_nm: Optional[str] = None
-                best_lat = c_lat
-                best_lon = c_lon
-                best_d = float("inf")
+    state_map = st.session_state.get(map_key)
+    if not last_clicked and isinstance(state_map, dict):
+        lc2 = state_map.get("last_clicked")
+        if lc2:
+            last_clicked = lc2
 
-                for coords, nm in zip(polylines, names):
-                    for lat, lon in coords:
-                        d = _dist_m(c_lat, c_lon, lat, lon)
-                        if d < best_d:
-                            best_d = d
-                            best_nm = nm
-                            best_lat = lat
-                            best_lon = lon
+    if last_clicked and polylines:
+        try:
+            c_lat = float(last_clicked["lat"])
+            c_lon = float(last_clicked["lng"])
 
-                if best_d <= MAX_SNAP_M:
-                    # aggiorno marker e selezione pista
-                    marker_lat = best_lat
-                    marker_lon = best_lon
-                    if best_nm:
-                        selected_name = best_nm
-            except Exception:
-                pass
+            best_nm: Optional[str] = None
+            best_lat = c_lat
+            best_lon = c_lon
+            best_d = float("inf")
+
+            for coords, nm in zip(polylines, names):
+                for lat, lon in coords:
+                    d = _dist_m(c_lat, c_lon, lat, lon)
+                    if d < best_d:
+                        best_d = d
+                        best_nm = nm
+                        best_lat = lat
+                        best_lon = lon
+
+            if best_d <= MAX_SNAP_M:
+                marker_lat = best_lat
+                marker_lon = best_lon
+                if best_nm:
+                    selected_name = best_nm
+        except Exception:
+            pass
 
     # -----------------------------
     # 5) Switch: attiva/disattiva selezione da lista
