@@ -298,7 +298,6 @@ def render_map(T, ctx):
             m,
             height=450,
             key=map_key,
-            return_on_click=True,
         )
 
     st.caption(f"Segmenti piste downhill trovati: {segment_count}")
