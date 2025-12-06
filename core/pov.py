@@ -7,20 +7,23 @@
 # - Riusa la funzione _fetch_downhill_pistes di core.maps per recuperare
 #   i segmenti OSM (piste:type=downhill).
 # - Trova tutti i segmenti con lo stesso nome, li unisce in un'unica traccia
-#   ordinata (per ora in modo semplice).
+#   ordinata (in modo semplice).
 # - Mostra una vista 3D “tipo POV” con pydeck:
 #     · mappa satellitare
 #     · linea rossa della pista
 #     · camera inclinata (pitch) e ruotata (bearing)
 #
-# Requisiti:
-#   - pydeck deve essere disponibile (Streamlit lo include di default)
-#   - MAPBOX_API_KEY configurata nell'ambiente Streamlit
+# FUNZIONI ESPORTE:
+#   - render_pov_3d(ctx)        → nuova API
+#   - render_pov_extract(...)   → wrapper retro-compatibile per la vecchia app
 #
-# Uso dalla app:
+# Uso consigliato dalla app:
 #   from core.pov import render_pov_3d
-#   ...
 #   ctx = render_pov_3d(ctx)
+#
+# La vecchia chiamata:
+#   ctx = render_pov_extract(T, ctx)
+# continuerà a funzionare grazie al wrapper.
 
 from __future__ import annotations
 
@@ -32,9 +35,9 @@ import streamlit as st
 import pydeck as pdk
 
 try:
-    # usiamo la stessa funzione di core.maps per non duplicare la logica Overpass
+    # riusiamo la funzione del modulo mappe per non duplicare Overpass
     from core.maps import _fetch_downhill_pistes
-except Exception:
+except Exception:  # pragma: no cover - fallback se maps non è disponibile
     _fetch_downhill_pistes = None  # type: ignore[assignment]
 
 
@@ -83,7 +86,7 @@ def _get_selected_piste_coords(ctx: Dict[str, Any]) -> Optional[List[Tuple[float
     base_lat = float(ctx.get("base_lat", ctx.get("lat", default_lat)))
     base_lon = float(ctx.get("base_lon", ctx.get("lon", default_lon)))
 
-    # raggio più stretto: ci basta 5 km attorno al centro
+    # raggio 5 km attorno al centro
     _, polylines, names = _fetch_downhill_pistes(base_lat, base_lon, radius_km=5.0)
 
     # prendo tutti i segmenti che hanno esattamente quel nome
@@ -101,7 +104,7 @@ def _get_selected_piste_coords(ctx: Dict[str, Any]) -> Optional[List[Tuple[float
         return segments[0]
 
     # Se ci sono più segmenti con lo stesso nome (pista spezzata),
-    # li uniamo in modo grezzo: partiamo dal segmento più lungo e
+    # li uniamo in modo semplice: partiamo dal segmento più lungo e
     # aggiungiamo ogni volta il segmento il cui inizio è più vicino alla fine.
     segments = sorted(segments, key=len, reverse=True)
     track: List[Tuple[float, float]] = list(segments[0])
@@ -131,7 +134,7 @@ def _get_selected_piste_coords(ctx: Dict[str, Any]) -> Optional[List[Tuple[float
 
 
 # ----------------------------------------------------------------------
-# Render POV 3D con pydeck
+# Render POV 3D con pydeck (NUOVA API)
 # ----------------------------------------------------------------------
 def render_pov_3d(ctx: Dict[str, Any]) -> Dict[str, Any]:
     """
@@ -167,7 +170,7 @@ def render_pov_3d(ctx: Dict[str, Any]) -> Dict[str, Any]:
     avg_lat = sum(lat for lat, _ in coords) / len(coords)
     avg_lon = sum(lon for _, lon in coords) / len(coords)
 
-    # converto in formato [lon, lat] per pydeck
+    # convertiamo in formato [lon, lat] per pydeck
     path_lonlat: List[List[float]] = [[lon, lat] for lat, lon in coords]
 
     data = [
@@ -199,12 +202,10 @@ def render_pov_3d(ctx: Dict[str, Any]) -> Dict[str, Any]:
         layers=[layer],
         initial_view_state=view_state,
         map_style="mapbox://styles/mapbox/satellite-v9",
-        tooltip={
-            "text": "{name}"
-        },
+        tooltip={"text": "{name}"},
     )
 
-    st.subheader("Vista 3D / POV pista selezionata")
+    st.subheader("🎥 POV pista (beta)")
     st.pydeck_chart(deck)
 
     st.caption(
@@ -212,7 +213,41 @@ def render_pov_3d(ctx: Dict[str, Any]) -> Dict[str, Any]:
         "(puoi ruotare e zoomare la vista con le dita o il mouse)."
     )
 
-    # potremmo salvare la traccia nel contesto per usi futuri (es. DEM, animazione)
+    # Salviamo la traccia nel contesto per usi futuri (profilo altimetrico, animazione, ecc.)
     ctx["pov_coords"] = coords
 
     return ctx
+
+
+# ----------------------------------------------------------------------
+# Wrapper retro-compatibile: render_pov_extract
+# ----------------------------------------------------------------------
+def render_pov_extract(*args, **kwargs) -> Dict[str, Any]:
+    """
+    Wrapper di compatibilità per il vecchio nome `render_pov_extract`.
+
+    Accetta sia:
+      - render_pov_extract(ctx)
+      - render_pov_extract(T, ctx)
+      - render_pov_extract(ctx=ctx)
+
+    e inoltra sempre a render_pov_3d(ctx).
+    """
+    ctx: Optional[Dict[str, Any]] = None
+
+    # pattern più comuni:
+    #   (ctx,)
+    #   (T, ctx)
+    if args:
+        if len(args) == 1:
+            ctx = args[0]
+        elif len(args) >= 2:
+            ctx = args[1]
+
+    if ctx is None:
+        ctx = kwargs.get("ctx")
+
+    if ctx is None:
+        ctx = {}
+
+    return render_pov_3d(ctx)
