@@ -1,22 +1,13 @@
 # core/maps.py
-# Mappa & piste per Telemark · Pro Wax & Tune
-#
-# - Carica piste:type=downhill da Overpass in un raggio di 5 km
-#   attorno alla località base (ctx["lat"], ctx["lon"] / base_lat, base_lon).
-# - La località base resta FISSA: i click sulla mappa spostano solo il marker
-#   e selezionano la pista più vicina, ma non cambiano il centro della query.
-# - Selezione pista:
-#     · CLICK mappa -> snap alla pista più vicina con raggio dinamico
-#     · (opzionale) lista piste con nomi, sotto la mappa
-# - La pista selezionata rimane evidenziata in rosso finché non ne scegli
-#   un’altra. Il nome è salvato anche in st.session_state.
-# - Nessuna “pista senza nome”: le piste senza name/ref/piste:name non
-#   vengono etichettate.
+# Mappa & piste Telemark – versione FULL CORRETTA
+# - Snap dinamico
+# - Zoom iniziale vicino (15)
+# - Nessuna duplicazione nomi
+# - Sempre esporta pov_piste_points per POV 2D/3D
 
 from __future__ import annotations
 
 from typing import Dict, Any, List, Tuple, Optional
-
 import math
 import requests
 import streamlit as st
@@ -25,31 +16,53 @@ import folium
 
 UA = {"User-Agent": "telemark-wax-pro/3.0"}
 
-# raggio di snap "base" usato sugli zoom alti (mappa molto vicina)
-BASE_MAX_SNAP_M: float = 300.0
+BASE_SNAP = 300.0    # raggio snap quando sei vicino
 
 
 # ----------------------------------------------------------------------
-# Overpass: fetch piste downhill (segmenti grezzi)
+# Utility distanza
 # ----------------------------------------------------------------------
-@st.cache_data(ttl=1800, show_spinner=False)
-def _fetch_downhill_pistes(
-    lat: float,
-    lon: float,
-    radius_km: float = 5.0,
-) -> Tuple[int, List[List[Tuple[float, float]]], List[Optional[str]]]:
-    """
-    Scarica le piste di discesa (piste:type=downhill) via Overpass attorno
-    a (lat, lon) con raggio in km.
+def _dist_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    R = 6371000.0
+    p1 = math.radians(lat1)
+    p2 = math.radians(lat2)
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    a = (
+        math.sin(dlat / 2)**2
+        + math.cos(p1) * math.cos(p2) * math.sin(dlon / 2)**2
+    )
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+    return R * c
 
-    Ritorna:
-      - numero di segmenti (ways/relations)
-      - lista di polilinee, ciascuna come lista di (lat, lon)
-      - lista nomi (stessa lunghezza delle polilinee, può contenere None)
-    """
+
+# ----------------------------------------------------------------------
+# Snap dinamico basato sullo zoom
+# ----------------------------------------------------------------------
+def _snap_radius(prev: Optional[Dict[str, Any]]) -> float:
+    if not isinstance(prev, dict):
+        return BASE_SNAP
+    z = prev.get("zoom")
+    if not isinstance(z, (int, float)):
+        return BASE_SNAP
+
+    if z <= 10:
+        return 2500
+    if z <= 12:
+        return 1500
+    if z <= 14:
+        return 600
+    return BASE_SNAP
+
+
+# ----------------------------------------------------------------------
+# Fetch piste da Overpass
+# ----------------------------------------------------------------------
+@st.cache_data(ttl=1800)
+def _fetch_pistes(lat: float, lon: float, radius_km: float = 5.0):
     radius_m = int(radius_km * 1000)
 
-    query = f"""
+    q = f"""
     [out:json][timeout:25];
     (
       way["piste:type"="downhill"](around:{radius_m},{lat},{lon});
@@ -62,7 +75,7 @@ def _fetch_downhill_pistes(
     try:
         r = requests.post(
             "https://overpass-api.de/api/interpreter",
-            data=query.encode("utf-8"),
+            data=q.encode("utf8"),
             headers=UA,
             timeout=25,
         )
@@ -72,20 +85,19 @@ def _fetch_downhill_pistes(
         return 0, [], []
 
     elements = js.get("elements", [])
-    nodes = {el["id"]: el for el in elements if el.get("type") == "node"}
+    nodes = {e["id"]: e for e in elements if e.get("type") == "node"}
 
-    polylines: List[List[Tuple[float, float]]] = []
-    names: List[Optional[str]] = []
-    segment_count = 0
+    polylines = []
+    names = []
+    count = 0
 
-    def _name_from_tags(tags: Dict[str, Any]) -> Optional[str]:
+    def _nm(tags):
         if not tags:
             return None
-        for key in ("name", "piste:name", "ref"):
-            if key in tags:
-                val = str(tags[key]).strip()
-                if val:
-                    return val
+        for k in ("name", "piste:name", "ref"):
+            v = tags.get(k)
+            if v:
+                return str(v).strip()
         return None
 
     for el in elements:
@@ -95,302 +107,197 @@ def _fetch_downhill_pistes(
         if tags.get("piste:type") != "downhill":
             continue
 
-        coords: List[Tuple[float, float]] = []
+        coords = []
 
         if el["type"] == "way":
             for nid in el.get("nodes", []):
                 nd = nodes.get(nid)
                 if nd:
                     coords.append((nd["lat"], nd["lon"]))
-        else:  # relation
+        else:
             for mem in el.get("members", []):
                 if mem.get("type") != "way":
                     continue
                 wid = mem.get("ref")
                 way = next(
-                    (e for e in elements if e.get("type") == "way" and e.get("id") == wid),
-                    None,
+                    (w for w in elements if w.get("type") == "way" and w.get("id") == wid),
+                    None
                 )
-                if not way:
-                    continue
-                for nid in way.get("nodes", []):
-                    nd = nodes.get(nid)
-                    if nd:
-                        coords.append((nd["lat"], nd["lon"]))
+                if way:
+                    for nid in way.get("nodes", []):
+                        nd = nodes.get(nid)
+                        if nd:
+                            coords.append((nd["lat"], nd["lon"]))
 
         if len(coords) >= 2:
             polylines.append(coords)
-            names.append(_name_from_tags(tags))
-            segment_count += 1
+            names.append(_nm(tags))
+            count += 1
 
-    return segment_count, polylines, names
-
-
-# ----------------------------------------------------------------------
-# Distanza approssimata in metri
-# ----------------------------------------------------------------------
-def _dist_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    R = 6371000.0
-    phi1 = math.radians(lat1)
-    phi2 = math.radians(lat2)
-    dphi = math.radians(lat2 - lat1)
-    dlambda = math.radians(lon2 - lon1)
-
-    a = (
-        math.sin(dphi / 2.0) ** 2
-        + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2.0) ** 2
-    )
-    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
-    return R * c
+    return count, polylines, names
 
 
 # ----------------------------------------------------------------------
-# Calcolo raggio snap dinamico in base allo zoom
+# RENDER MAPPA COMPLETA
 # ----------------------------------------------------------------------
-def _dynamic_snap_radius(prev_state: Optional[Dict[str, Any]]) -> float:
-    """
-    Restituisce il raggio in metri per lo snap alla pista più vicina,
-    in base al livello di zoom salvato da st_folium.
+def render_map(T, ctx: Dict[str, Any]) -> Dict[str, Any]:
+    map_id = str(ctx.get("map_context", "default"))
+    map_key = f"map_{map_id}"
+    sel_key = f"selected_piste_{map_id}"
 
-    Idee:
-      - zoom molto lontano (<= 10)  -> raggio grande (2.5 km)
-      - zoom medio (11–12)         -> raggio 1.5 km
-      - zoom "normale" (13–14)     -> raggio 600 m
-      - zoom vicino (>= 15)        -> raggio base 300 m
-    """
-    zoom = None
-    if isinstance(prev_state, dict):
-        z = prev_state.get("zoom")
-        if isinstance(z, (int, float)):
-            zoom = float(z)
-
-    if zoom is None:
-        return BASE_MAX_SNAP_M  # fallback
-
-    if zoom <= 10:
-        return 2500.0
-    if zoom <= 12:
-        return 1500.0
-    if zoom <= 14:
-        return 600.0
-    return BASE_MAX_SNAP_M
-
-
-# ----------------------------------------------------------------------
-# Funzione principale chiamata dalla app
-# ----------------------------------------------------------------------
-def render_map(T: Dict[str, Any], ctx: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Mappa Telemark:
-      - click mappa → snap a pista più vicina (raggio dinamico)
-      - lista piste opzionale (non rompe la selezione da click)
-    """
-    map_context = str(ctx.get("map_context", "default"))
-    map_key = f"map_{map_context}"
-    sel_key = f"selected_piste_{map_context}"
-
-    # -----------------------------
-    # 1) Località base (centro fisso per Overpass)
-    # -----------------------------
-    default_lat = 45.83333
-    default_lon = 7.73333
-
-    base_lat = float(ctx.get("base_lat", ctx.get("lat", default_lat)))
-    base_lon = float(ctx.get("base_lon", ctx.get("lon", default_lon)))
+    # Località base (centro piste)
+    base_lat = float(ctx.get("base_lat", ctx.get("lat", 45.83333)))
+    base_lon = float(ctx.get("base_lon", ctx.get("lon", 7.73333)))
 
     ctx["base_lat"] = base_lat
     ctx["base_lon"] = base_lon
 
-    # marker attuale
+    # Marker visuale
     marker_lat = float(ctx.get("marker_lat", base_lat))
     marker_lon = float(ctx.get("marker_lon", base_lon))
 
-    # stato selezione pista: prima da session_state, poi da ctx
-    selected_name = st.session_state.get(sel_key)
-    if not isinstance(selected_name, str):
-        v = ctx.get("selected_piste_name")
-        selected_name = v if isinstance(v, str) else None
+    # Nome pista selezionata
+    selected = st.session_state.get(sel_key, ctx.get("selected_piste_name"))
 
-    # -----------------------------
-    # 2) Carico piste grezze
-    # -----------------------------
-    segment_count, polylines, names = _fetch_downhill_pistes(
-        base_lat,
-        base_lon,
-        radius_km=5.0,
-    )
+    # Carica piste
+    count, polylines, names = _fetch_pistes(base_lat, base_lon)
 
-    # per la lista piste: solo quelle con nome
-    named_pairs = [(coords, nm) for coords, nm in zip(polylines, names) if nm]
-    unique_names = sorted({nm for _, nm in named_pairs})
+    # Lista piste con nome
+    named = [(c, n) for c, n in zip(polylines, names) if n]
+    unique_names = sorted({n for _, n in named})
 
-    # -----------------------------
-    # 3) Snap al click precedente (se esiste)
-    # -----------------------------
-    prev_state = st.session_state.get(map_key)
-    snap_radius = _dynamic_snap_radius(prev_state)
+    # Snap dinamico
+    prev = st.session_state.get(map_key)
+    radius = _snap_radius(prev)
 
-    if isinstance(prev_state, dict):
-        last_clicked = prev_state.get("last_clicked")
-        if last_clicked and polylines:
-            try:
-                c_lat = float(last_clicked["lat"])
-                c_lon = float(last_clicked["lng"])
+    # Se c'è un click → snap
+    if isinstance(prev, dict) and polylines:
+        click = prev.get("last_clicked")
+        if click:
+            c_lat = float(click["lat"])
+            c_lon = float(click["lng"])
+            best_d = 1e12
+            best_nm = None
+            best_lat = c_lat
+            best_lon = c_lon
 
-                best_nm: Optional[str] = None
-                best_lat = c_lat
-                best_lon = c_lon
-                best_d = float("inf")
+            for coords, nm in zip(polylines, names):
+                for lat, lon in coords:
+                    d = _dist_m(c_lat, c_lon, lat, lon)
+                    if d < best_d:
+                        best_d = d
+                        best_lat = lat
+                        best_lon = lon
+                        best_nm = nm
 
-                for coords, nm in zip(polylines, names):
-                    for lat, lon in coords:
-                        d = _dist_m(c_lat, c_lon, lat, lon)
-                        if d < best_d:
-                            best_d = d
-                            best_nm = nm
-                            best_lat = lat
-                            best_lon = lon
+            if best_d <= radius:
+                marker_lat = best_lat
+                marker_lon = best_lon
+                if best_nm:
+                    selected = best_nm
 
-                if best_d <= snap_radius:
-                    marker_lat = best_lat
-                    marker_lon = best_lon
-                    if best_nm:
-                        selected_name = best_nm
-            except Exception:
-                pass
+    # Zoom iniziale
+    zoom = 15
+    if isinstance(prev, dict) and isinstance(prev.get("zoom"), (int, float)):
+        zoom = float(prev["zoom"])
 
-    # -----------------------------
-    # 4) Zoom iniziale
-    # -----------------------------
-    zoom_start = 15.0  # zoom di partenza "vicino"
-    if isinstance(prev_state, dict):
-        z = prev_state.get("zoom")
-        if isinstance(z, (int, float)):
-            zoom_start = float(z)
-
-    # -----------------------------
-    # 5) Disegno mappa
-    # -----------------------------
+    # Mappa Folium
     m = folium.Map(
         location=[marker_lat, marker_lon],
-        zoom_start=zoom_start,
+        zoom_start=zoom,
         tiles=None,
         control_scale=True,
     )
 
-    folium.TileLayer("OpenStreetMap", name="Strade", control=True).add_to(m)
+    folium.TileLayer("OpenStreetMap", name="Strade").add_to(m)
     folium.TileLayer(
-        tiles=(
-            "https://server.arcgisonline.com/ArcGIS/rest/services/"
-            "World_Imagery/MapServer/tile/{z}/{y}/{x}"
-        ),
-        attr="Esri World Imagery",
+        tiles="https://server.arcgisonline.com/ArcGIS/rest/services/"
+              "World_Imagery/MapServer/tile/{z}/{y}/{x}",
+        attr="Esri",
         name="Satellite",
-        control=True,
     ).add_to(m)
 
-    # piste (tutte blu, rossa quella selezionata)
-    label_done = set()
+    # Disegno piste
+    added_labels = set()
     for coords, nm in zip(polylines, names):
-        is_selected = (nm is not None and nm == selected_name)
+        is_sel = (nm == selected)
 
         folium.PolyLine(
             locations=coords,
-            color="red" if is_selected else "blue",
-            weight=6 if is_selected else 3,
-            opacity=1.0 if is_selected else 0.6,
+            color="red" if is_sel else "blue",
+            weight=6 if is_sel else 3,
+            opacity=1 if is_sel else 0.6,
         ).add_to(m)
 
-        # etichetta SOLO se c'è un nome e non l'abbiamo già disegnata
-        if nm and nm not in label_done and coords:
-            mid_idx = len(coords) // 2
-            label_lat, label_lon = coords[mid_idx]
+        # Nome pista una sola volta
+        if nm and nm not in added_labels:
+            mid = coords[len(coords)//2]
             folium.Marker(
-                location=[label_lat, label_lon],
+                location=[mid[0], mid[1]],
                 icon=folium.DivIcon(
                     html=(
-                        f"<div style='"
-                        "font-size:10px;"
-                        "color:white;"
-                        "text-shadow:0 0 3px black;"
-                        "white-space:nowrap;"
-                        "background:rgba(0,0,0,0.3);"
-                        "padding:1px 3px;"
-                        "border-radius:3px;"
-                        f"'>{nm}</div>"
+                        "<div style='font-size:10px;color:white;"
+                        "text-shadow:0 0 3px black; background:rgba(0,0,0,.3);"
+                        "padding:1px 3px;border-radius:3px;'>"
+                        f"{nm}</div>"
                     )
                 ),
             ).add_to(m)
-            label_done.add(nm)
+            added_labels.add(nm)
 
-    # marker
+    # Marker utente
     folium.Marker(
         location=[marker_lat, marker_lon],
         icon=folium.Icon(color="red", icon="flag"),
     ).add_to(m)
 
-    # firma "classica" di st_folium compatibile con versioni 0.13+ e 1.x
-    _ = st_folium(
-        m,
-        height=450,
-        width=None,
-        key=map_key,
-    )
+    # Render mappa
+    st_folium(m, height=450, key=map_key)
 
-    st.caption(
-        f"Segmenti piste downhill trovati: {segment_count} — raggio snap attuale ≈ {int(snap_radius)} m"
-    )
+    st.caption(f"Piste trovate: {count} — Snap ≈ {int(radius)} m")
 
-    # -----------------------------
-    # 6) Switch + lista piste (OPZIONALE, sotto la mappa)
-    # -----------------------------
+    # Selettore da lista piste
     use_list = st.checkbox(
         "Attiva selezione da lista piste",
         value=False,
-        key=f"use_piste_list_{map_context}",
+        key=f"use_list_{map_id}",
     )
 
     if use_list and unique_names:
-        # default: se ho già una pista selezionata, la uso; altrimenti la prima
-        if selected_name in unique_names:
-            default_index = unique_names.index(selected_name)
-        else:
-            default_index = 0
-
-        with st.expander(
-            T.get("piste_select_label", "Seleziona pista dalla lista"),
-            expanded=False,
-        ):
-            chosen_name: str = st.selectbox(
-                "Pista",
-                options=unique_names,
-                index=default_index,
-                key=f"piste_select_{map_context}",
+        default = unique_names.index(selected) if selected in unique_names else 0
+        with st.expander("Seleziona pista dalla lista"):
+            chosen = st.selectbox(
+                "Pista", unique_names, index=default, key=f"list_{map_id}"
             )
-
-        # se l'utente cambia pista dalla lista, aggiorno selezione + marker
-        if chosen_name != selected_name:
-            selected_name = chosen_name
-            for coords, nm in named_pairs:
-                if nm == selected_name and coords:
-                    mid_idx = len(coords) // 2
-                    marker_lat, marker_lon = coords[mid_idx]
+        if chosen != selected:
+            selected = chosen
+            for coords, nm in named:
+                if nm == selected:
+                    mid = coords[len(coords)//2]
+                    marker_lat, marker_lon = mid
                     break
 
-    # -----------------------------
-    # 7) Salvo stato in ctx + session_state
-    # -----------------------------
+    # Salvo in ctx e sessione
     ctx["marker_lat"] = marker_lat
     ctx["marker_lon"] = marker_lon
     ctx["lat"] = marker_lat
     ctx["lon"] = marker_lon
-    ctx["selected_piste_name"] = selected_name
-    st.session_state[sel_key] = selected_name
+    ctx["selected_piste_name"] = selected
+    st.session_state[sel_key] = selected
 
-    # info utente
-    if selected_name:
-        st.markdown(f"**Pista selezionata:** {selected_name}")
-    else:
-        st.markdown("**Pista selezionata:** nessuna (clicca sulla mappa o usa la lista)")
+    st.markdown(f"**Pista selezionata:** {selected or 'Nessuna'}")
+
+    # ------------------------------------------------------------------
+    # ESPORTAZIONE PER POV 2D/3D
+    # ------------------------------------------------------------------
+    pov_points = None
+    if selected:
+        for coords, nm in zip(polylines, names):
+            if nm == selected:
+                pov_points = [{"lat": lat, "lon": lon, "elev": 0.0} for lat, lon in coords]
+                break
+
+    ctx["pov_piste_name"] = selected
+    ctx["pov_piste_points"] = pov_points
 
     return ctx
