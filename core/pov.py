@@ -177,11 +177,17 @@ def render_pov_3d(ctx: Dict[str, Any]) -> Dict[str, Any]:
     # Mapbox token
     token = _get_mapbox_token()
     if token:
-        pdk.settings.mapbox_api_key = token  # per sicurezza
+    if token:
+        # forza uso Mapbox satellite (la key è già in pdk.settings.mapbox_api_key)
+        deck_kwargs.update(
+            map_provider="mapbox",
+            map_style="mapbox://styles/mapbox/satellite-v9",
+        )
     else:
-        st.info(
-            "Mapbox API key non trovata: viene mostrato solo il tracciato, "
-            "senza sfondo satellitare."
+        # fallback minimale (senza sfondo)
+        deck_kwargs.update(
+            map_provider=None,
+            map_style=None,
         )
 
     # piccolo debug visivo (puoi toglierlo dopo)
