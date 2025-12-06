@@ -13,6 +13,8 @@ import pandas as pd
 import streamlit as st
 import altair as alt
 
+import core.pov_3d as pov3d_check
+st.sidebar.write("POV3D file path:", pov3d_check.__file__)
 # --- assicura che la root del progetto sia in testa al sys.path ---
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 if PROJECT_ROOT not in sys.path:
