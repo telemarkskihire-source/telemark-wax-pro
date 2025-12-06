@@ -9,17 +9,14 @@
 # - Trova tutti i segmenti con lo stesso nome, li unisce in un'unica traccia
 #   ordinata (in modo semplice).
 # - Mostra una vista 3D “tipo POV” con pydeck:
-#     · mappa satellitare
+#     · BASEMAP SATELLITARE (se è presente MAPBOX_API_KEY / MAPBOX_ACCESS_TOKEN)
 #     · linea rossa della pista
-#     · camera inclinata (pitch) e ruotata (bearing)
+#     · marker START (verde) e FINISH (rosso)
+#     · camera molto inclinata e zoomata → effetto più realistico
 #
 # FUNZIONI ESPORTE:
 #   - render_pov_3d(ctx)        → nuova API
 #   - render_pov_extract(...)   → wrapper retro-compatibile per la vecchia app
-#
-# Uso consigliato dalla app:
-#   from core.pov import render_pov_3d
-#   ctx = render_pov_3d(ctx)
 #
 # La vecchia chiamata:
 #   ctx = render_pov_extract(T, ctx)
@@ -30,6 +27,7 @@ from __future__ import annotations
 from typing import Dict, Any, List, Tuple, Optional
 
 import math
+import os
 
 import streamlit as st
 import pydeck as pdk
@@ -39,6 +37,45 @@ try:
     from core.maps import _fetch_downhill_pistes
 except Exception:  # pragma: no cover - fallback se maps non è disponibile
     _fetch_downhill_pistes = None  # type: ignore[assignment]
+
+
+# ----------------------------------------------------------------------
+# Configurazione Mapbox per avere il SATELLITE
+# ----------------------------------------------------------------------
+def _configure_mapbox_token() -> None:
+    """
+    Imposta la API key Mapbox per pydeck, se disponibile.
+    Cerca nell'ordine:
+      - st.secrets["MAPBOX_API_KEY"]
+      - st.secrets["MAPBOX_ACCESS_TOKEN"]
+      - variabili d'ambiente MAPBOX_API_KEY / MAPBOX_ACCESS_TOKEN
+    """
+    token = None
+
+    # st.secrets (se disponibile)
+    try:
+        if "MAPBOX_API_KEY" in st.secrets:
+            token = st.secrets["MAPBOX_API_KEY"]
+        elif "MAPBOX_ACCESS_TOKEN" in st.secrets:
+            token = st.secrets["MAPBOX_ACCESS_TOKEN"]
+    except Exception:
+        pass
+
+    # env vars
+    if not token:
+        token = (
+            os.environ.get("MAPBOX_API_KEY")
+            or os.environ.get("MAPBOX_ACCESS_TOKEN")
+        )
+
+    if token:
+        pdk.settings.mapbox_api_key = token
+    else:
+        # nessun errore duro, ma avvisiamo che senza token la resa sarà scarsa
+        st.info(
+            "Per una vista 3D più realistica (satellite), configura "
+            "`MAPBOX_API_KEY` o `MAPBOX_ACCESS_TOKEN` su Streamlit."
+        )
 
 
 # ----------------------------------------------------------------------
@@ -166,51 +203,88 @@ def render_pov_3d(ctx: Dict[str, Any]) -> Dict[str, Any]:
         )
         return ctx
 
+    # Configuriamo Mapbox per avere il satellite se possibile
+    _configure_mapbox_token()
+
     # centro della pista per la camera
     avg_lat = sum(lat for lat, _ in coords) / len(coords)
     avg_lon = sum(lon for _, lon in coords) / len(coords)
 
-    # convertiamo in formato [lon, lat] per pydeck
+    # punti di start/finish (inizio e fine della traccia)
+    start_lat, start_lon = coords[0]
+    finish_lat, finish_lon = coords[-1]
+
+    # convertiamo la traccia in formato [lon, lat] per pydeck
     path_lonlat: List[List[float]] = [[lon, lat] for lat, lon in coords]
 
-    data = [
+    path_data = [
         {
             "name": piste_name,
             "path": path_lonlat,
         }
     ]
 
-    # View "POV": camera inclinata e leggermente ruotata
+    points_data = [
+        {
+            "type": "start",
+            "name": f"{piste_name} · START",
+            "position": [start_lon, start_lat],
+        },
+        {
+            "type": "finish",
+            "name": f"{piste_name} · FINISH",
+            "position": [finish_lon, finish_lat],
+        },
+    ]
+
+    # View "POV": camera molto inclinata e zoomata
     view_state = pdk.ViewState(
         latitude=avg_lat,
         longitude=avg_lon,
-        zoom=15,      # abbastanza vicino per vedere bene la pista
-        pitch=60,     # inclinazione in gradi (0 = vista dall'alto)
-        bearing=-45,  # rotazione orizzontale
+        zoom=15.5,   # un filo più vicino
+        pitch=70,    # più inclinato → effetto più "discesa"
+        bearing=-35, # leggera rotazione
     )
 
-    layer = pdk.Layer(
+    # Layer pista
+    path_layer = pdk.Layer(
         "PathLayer",
-        data=data,
+        data=path_data,
         get_path="path",
-        get_color=[255, 0, 0],
-        width_scale=4,
-        width_min_pixels=3,
+        get_color=[255, 70, 40],
+        width_scale=6,
+        width_min_pixels=4,
     )
 
+    # Layer start/finish
+    points_layer = pdk.Layer(
+        "ScatterplotLayer",
+        data=points_data,
+        get_position="position",
+        get_radius=12,
+        get_fill_color=[
+            "255 * (type == 'finish')",
+            "255 * (type == 'start')",
+            0,
+        ],
+        pickable=True,
+    )
+
+    # Deck completo
     deck = pdk.Deck(
-        layers=[layer],
+        layers=[path_layer, points_layer],
         initial_view_state=view_state,
         map_style="mapbox://styles/mapbox/satellite-v9",
         tooltip={"text": "{name}"},
     )
 
     st.subheader("🎥 POV pista (beta)")
+
     st.pydeck_chart(deck)
 
     st.caption(
-        f"POV 3D statico della pista **{piste_name}** "
-        "(puoi ruotare e zoomare la vista con le dita o il mouse)."
+        f"POV 3D della pista **{piste_name}** "
+        "(satellite + start/finish; puoi ruotare e zoomare con le dita o il mouse)."
     )
 
     # Salviamo la traccia nel contesto per usi futuri (profilo altimetrico, animazione, ecc.)
