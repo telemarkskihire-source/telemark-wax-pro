@@ -9,7 +9,7 @@
 # - Trova tutti i segmenti con lo stesso nome, li unisce in un'unica traccia
 #   ordinata (in modo semplice).
 # - Mostra una vista 3D “tipo POV” con pydeck:
-#     · BASEMAP SATELLITARE (se è presente MAPBOX_API_KEY / MAPBOX_ACCESS_TOKEN)
+#     · BASEMAP SATELLITARE (se è presente una API key Mapbox)
 #     · linea rossa della pista
 #     · marker START (verde) e FINISH (rosso)
 #     · camera molto inclinata e zoomata → effetto più realistico
@@ -17,10 +17,6 @@
 # FUNZIONI ESPORTE:
 #   - render_pov_3d(ctx)        → nuova API
 #   - render_pov_extract(...)   → wrapper retro-compatibile per la vecchia app
-#
-# La vecchia chiamata:
-#   ctx = render_pov_extract(T, ctx)
-# continuerà a funzionare grazie al wrapper.
 
 from __future__ import annotations
 
@@ -40,41 +36,95 @@ except Exception:  # pragma: no cover - fallback se maps non è disponibile
 
 
 # ----------------------------------------------------------------------
-# Configurazione Mapbox per avere il SATELLITE
+# Configurazione Mapbox per avere il SATELLITE (lettura robusta)
 # ----------------------------------------------------------------------
 def _configure_mapbox_token() -> None:
     """
     Imposta la API key Mapbox per pydeck, se disponibile.
-    Cerca nell'ordine:
-      - st.secrets["MAPBOX_API_KEY"]
-      - st.secrets["MAPBOX_ACCESS_TOKEN"]
-      - variabili d'ambiente MAPBOX_API_KEY / MAPBOX_ACCESS_TOKEN
-    """
-    token = None
 
-    # st.secrets (se disponibile)
+    Cerca nell'ordine:
+      1) se pdk.settings.mapbox_api_key è già settato → non fa nulla
+      2) st.secrets:
+         - "MAPBOX_API_KEY", "MAPBOX_ACCESS_TOKEN", "MAPBOX_TOKEN"
+         - varianti minuscole
+         - eventuali sezioni nidificate che contengono un token che inizia
+           con "pk." (tipico dei token Mapbox pubblici)
+      3) variabili d'ambiente:
+         - MAPBOX_API_KEY, MAPBOX_ACCESS_TOKEN, MAPBOX_TOKEN
+
+    Mostra un messaggio informativo SOLO se, dopo tutti i tentativi,
+    non trova nessuna API key.
+    """
+    # se è già configurato da qualche altra parte, non tocchiamo niente
+    if getattr(pdk.settings, "mapbox_api_key", None):
+        return
+
+    token: Optional[str] = None
+
+    # --- 1) st.secrets: chiavi dirette ---
     try:
-        if "MAPBOX_API_KEY" in st.secrets:
-            token = st.secrets["MAPBOX_API_KEY"]
-        elif "MAPBOX_ACCESS_TOKEN" in st.secrets:
-            token = st.secrets["MAPBOX_ACCESS_TOKEN"]
+        direct_keys = [
+            "MAPBOX_API_KEY",
+            "MAPBOX_ACCESS_TOKEN",
+            "MAPBOX_TOKEN",
+            "mapbox_api_key",
+            "mapbox_access_token",
+            "mapbox_token",
+        ]
+        for key in direct_keys:
+            if key in st.secrets:
+                val = st.secrets[key]
+                if isinstance(val, str) and val.strip():
+                    token = val.strip()
+                    break
     except Exception:
+        # se st.secrets non è disponibile, ignoriamo
         pass
 
-    # env vars
+    # --- 2) st.secrets: sezioni nidificate / valori che "assomigliano" a un token Mapbox ---
     if not token:
-        token = (
-            os.environ.get("MAPBOX_API_KEY")
-            or os.environ.get("MAPBOX_ACCESS_TOKEN")
-        )
+        try:
+            def _search_in_obj(obj: Any) -> Optional[str]:
+                # stringa diretta
+                if isinstance(obj, str):
+                    v = obj.strip()
+                    # i token Mapbox pubblici di solito iniziano con "pk."
+                    if v.startswith("pk."):
+                        return v
+                    # comunque, se è abbastanza lungo, ci proviamo
+                    if len(v) > 30:
+                        return v
+                    return None
+                # mapping/dict
+                if isinstance(obj, dict):
+                    for v in obj.values():
+                        found = _search_in_obj(v)
+                        if found:
+                            return found
+                return None
 
+            candidate = _search_in_obj(st.secrets)  # type: ignore[arg-type]
+            if candidate:
+                token = candidate
+        except Exception:
+            pass
+
+    # --- 3) variabili d'ambiente ---
+    if not token:
+        env_keys = ["MAPBOX_API_KEY", "MAPBOX_ACCESS_TOKEN", "MAPBOX_TOKEN"]
+        for key in env_keys:
+            val = os.environ.get(key)
+            if isinstance(val, str) and val.strip():
+                token = val.strip()
+                break
+
+    # --- 4) se finalmente abbiamo un token, configuriamo pydeck ---
     if token:
         pdk.settings.mapbox_api_key = token
     else:
-        # nessun errore duro, ma avvisiamo che senza token la resa sarà scarsa
         st.info(
-            "Per una vista 3D più realistica (satellite), configura "
-            "`MAPBOX_API_KEY` o `MAPBOX_ACCESS_TOKEN` su Streamlit."
+            "Per una vista 3D più realistica (satellite), configura una API key "
+            "Mapbox (`MAPBOX_API_KEY`) in *Secrets* o come variabile d'ambiente."
         )
 
 
