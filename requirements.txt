@@ -10,3 +10,5 @@ beautifulsoup4
 lxml
 html5lib
 requests
+moviepy
+imageio[ffmpeg]
