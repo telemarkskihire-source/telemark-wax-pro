@@ -54,6 +54,10 @@ from core import pov_3d as pov3d_mod     # POV 3D
 
 import core.search as search_mod  # debug / uso interno
 
+
+st.write("DEBUG secrets:", "MAPBOX_API_KEY" in st.secrets)
+if "MAPBOX_API_KEY" in st.secrets:
+    st.write("Token prefix:", st.secrets["MAPBOX_API_KEY"][:4])
 # ---------------------- THEME ----------------------
 PRIMARY = "#06b6d4"
 ACCENT = "#f97316"
