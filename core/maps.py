@@ -6,7 +6,8 @@
 # - La località base (centro ricerca piste) resta FISSA: i click sulla mappa
 #   muovono solo il marker, non il centro della query → le piste non spariscono.
 # - Selezione pista:
-#     · CLICK su mappa: snap alla pista più vicina (entro MAX_SNAP_M).
+#     · CLICK su mappa: snap alla pista più vicina, con raggio DINAMICO
+#       in base allo zoom (lontano = raggio grande, vicino = preciso).
 #     · Lista piste opzionale (switch + selectbox sotto la mappa).
 # - La pista selezionata rimane evidenziata in ROSSO finché non ne scegli
 #   un’altra. Il nome è salvato anche in st.session_state.
@@ -26,8 +27,8 @@ import folium
 
 UA = {"User-Agent": "telemark-wax-pro/3.0"}
 
-# distanza massima per agganciare il click alla pista più vicina (metri)
-MAX_SNAP_M: float = 300.0  # un po' più permissivo per i tap da mobile
+# raggio di snap "base" usato sugli zoom alti (mappa molto vicina)
+BASE_MAX_SNAP_M: float = 300.0
 
 
 # ----------------------------------------------------------------------
@@ -146,12 +147,44 @@ def _dist_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
 
 
 # ----------------------------------------------------------------------
+# Calcolo raggio snap dinamico in base allo zoom
+# ----------------------------------------------------------------------
+def _dynamic_snap_radius(prev_state: Optional[Dict[str, Any]]) -> float:
+    """
+    Restituisce il raggio in metri per lo snap alla pista più vicina,
+    in base al livello di zoom salvato da st_folium.
+
+    Idee:
+      - zoom molto lontano (<= 9–10)  -> raggio molto grande (2.5 km)
+      - zoom medio (11–12)            -> raggio 1.5 km
+      - zoom "normale" (13–14)        -> raggio 600 m
+      - zoom vicino (>= 15)           -> raggio base 300 m
+    """
+    zoom = None
+    if isinstance(prev_state, dict):
+        z = prev_state.get("zoom")
+        if isinstance(z, (int, float)):
+            zoom = float(z)
+
+    if zoom is None:
+        return BASE_MAX_SNAP_M  # fallback
+
+    if zoom <= 10:
+        return 2500.0
+    if zoom <= 12:
+        return 1500.0
+    if zoom <= 14:
+        return 600.0
+    return BASE_MAX_SNAP_M
+
+
+# ----------------------------------------------------------------------
 # Funzione principale chiamata dalla app
 # ----------------------------------------------------------------------
 def render_map(T, ctx):
     """
     Mappa Telemark:
-      - click mappa → snap a pista più vicina
+      - click mappa → snap a pista più vicina (raggio dinamico)
       - lista piste opzionale (non rompe la selezione da click)
     """
     map_context = str(ctx.get("map_context", "default"))
@@ -194,9 +227,12 @@ def render_map(T, ctx):
     unique_names = sorted({nm for _, nm in named_pairs})
 
     # -----------------------------
-    # 3) Se c'è un click memorizzato, applico lo snap PRIMA di ridisegnare
+    # 3) Se c'è un click memorizzato, applico lo snap PRIMA di ridisegnare.
+    #    Uso un raggio dinamico in base allo zoom.
     # -----------------------------
     prev_state = st.session_state.get(map_key)
+    snap_radius = _dynamic_snap_radius(prev_state)
+
     if isinstance(prev_state, dict):
         last_clicked = prev_state.get("last_clicked")
         if last_clicked and polylines:
@@ -218,7 +254,7 @@ def render_map(T, ctx):
                             best_lat = lat
                             best_lon = lon
 
-                if best_d <= MAX_SNAP_M:
+                if best_d <= snap_radius:
                     marker_lat = best_lat
                     marker_lon = best_lon
                     if best_nm:
@@ -295,7 +331,9 @@ def render_map(T, ctx):
         key=map_key,
     )
 
-    st.caption(f"Segmenti piste downhill trovati: {segment_count}")
+    st.caption(
+        f"Segmenti piste downhill trovati: {segment_count} — raggio snap attuale ≈ {int(snap_radius)} m"
+    )
 
     # -----------------------------
     # 5) Switch + lista piste (OPZIONALE, sotto la mappa)
