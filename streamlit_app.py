@@ -55,7 +55,14 @@ from core import pov as pov_mod
 from core import pov_3d as pov3d_mod
 
 import core.search as search_mod  # debug / uso interno
+import importlib
+import sys
 
+# 🔥 forza reload completo di core.* ad ogni esecuzione
+importlib.invalidate_caches()
+for name in list(sys.modules.keys()):
+    if name.startswith("core.pov"):
+        del sys.modules[name]
 
 # ---------------------- THEME ----------------------
 PRIMARY = "#06b6d4"
