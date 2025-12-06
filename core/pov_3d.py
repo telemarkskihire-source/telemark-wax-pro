@@ -1,184 +1,159 @@
 # core/pov_3d.py
-# POV 3D pista (beta) per Telemark · Pro Wax & Tune
-#
-# - Usa i punti estratti da core.pov (ctx["pov_piste_points"])
-# - Se trova una MAPBOX_API_KEY (env o st.secrets) usa stile satellite Mapbox
-# - Altrimenti mostra solo il tracciato su sfondo semplice
-#
-# Richiede: pydeck
+# POV 3D pista con pydeck + Mapbox (satellite se disponibile)
 
 from __future__ import annotations
 
-from typing import Any, Dict, List
+from typing import Dict, Any, List, Optional
 
 import os
 
 import streamlit as st
-
-try:
-    import pydeck as pdk
-except Exception:  # pydeck non disponibile
-    pdk = None  # type: ignore[assignment]
+import pydeck as pdk
 
 
-def _get_mapbox_token() -> str:
+def _get_mapbox_token() -> Optional[str]:
     """
-    Ritorna la Mapbox API key se disponibile.
-    - Prima guarda in os.environ["MAPBOX_API_KEY"]
-    - Poi in st.secrets["MAPBOX_API_KEY"]
-    Se la trova, la rimette in os.environ per pydeck.
+    Ritorna la Mapbox API key se configurata in:
+      - st.secrets["MAPBOX_API_KEY"]
+      - variabile d'ambiente MAPBOX_API_KEY
+    Altrimenti None.
     """
-    token = os.getenv("MAPBOX_API_KEY", "")
-
+    # 1) Streamlit secrets
     try:
-        if (not token) and ("MAPBOX_API_KEY" in st.secrets):
-            token = st.secrets["MAPBOX_API_KEY"]
+        if "MAPBOX_API_KEY" in st.secrets:
+            token = str(st.secrets["MAPBOX_API_KEY"]).strip()
+            if token:
+                return token
     except Exception:
-        # st.secrets potrebbe non essere disponibile in alcuni contesti
         pass
 
-    if token:
-        os.environ["MAPBOX_API_KEY"] = token
+    # 2) Environment
+    token = os.environ.get("MAPBOX_API_KEY", "").strip()
+    return token or None
 
-    return token
 
-
-def _normalize_points(raw_points: Any) -> List[Dict[str, float]]:
+def _build_pov_dataframe(points: List[Dict[str, float]]):
     """
-    Normalizza ctx["pov_piste_points"] in una lista di dict:
-      [{ "lat": ..., "lon": ..., "elev": ...}, ...]
-    Supporta:
-      - lista di dict con chiavi lat/lon/elev_m
-      - lista di tuple/list [lat, lon] o [lat, lon, elev] o [lon, lat, elev]
+    Converte i punti della pista in una lista per PathLayer:
+      [{"path": [[lon, lat, z], ...]}]
+    dove z è una quota normalizzata per dare un minimo effetto 3D.
     """
-    if not raw_points:
+    if not points:
         return []
 
-    out: List[Dict[str, float]] = []
+    # Normalizziamo la quota: se non presente, usiamo 0.
+    lats = [p.get("lat", 0.0) for p in points]
+    lons = [p.get("lon", 0.0) for p in points]
+    elevs = [p.get("elev", 0.0) for p in points]
 
-    for p in raw_points:
-        lat = lon = elev = None
+    # Rescale semplice della quota così da non "sparare" in alto la traccia
+    min_elev = min(elevs)
+    max_elev = max(elevs) if elevs else min_elev
+    span = max(max_elev - min_elev, 1.0)
 
-        # Caso dict
-        if isinstance(p, dict):
-            lat = p.get("lat") or p.get("latitude")
-            lon = p.get("lon") or p.get("longitude")
-            elev = p.get("elev_m") or p.get("elevation") or 0.0
+    scaled = []
+    for p, e in zip(points, elevs):
+        z = (e - min_elev) / span  # 0–1
+        z *= 200  # scala verticale (200 m max)
+        scaled.append([p.get("lon", 0.0), p.get("lat", 0.0), z])
 
-        # Caso lista/tuple
-        elif isinstance(p, (list, tuple)) and len(p) >= 2:
-            a, b = float(p[0]), float(p[1])
-
-            # euristica: lon ha modulo > 90 tipicamente
-            if abs(a) > 90 and abs(b) <= 90:
-                lon, lat = a, b
-            else:
-                lat, lon = a, b
-
-            elev = float(p[2]) if len(p) > 2 else 0.0
-
-        if lat is None or lon is None:
-            continue
-
-        try:
-            out.append(
-                {
-                    "lat": float(lat),
-                    "lon": float(lon),
-                    "elev": float(elev or 0.0),
-                }
-            )
-        except Exception:
-            continue
-
-    return out
+    return [{"path": scaled}]
 
 
 def render_pov3d_view(T: Dict[str, str], ctx: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Mostra un POV 3D della pista corrente usando pydeck.
-    Richiede che ctx contenga:
-      - "pov_piste_points": lista di punti (vedi _normalize_points)
-      - "pov_piste_name": nome pista (opzionale)
+    Mostra una vista 3D della pista corrente (se ctx contiene 'pov_piste_points').
+
+    Richiede:
+      ctx["pov_piste_points"] = [
+        {"lat": float, "lon": float, "elev": float}, ...
+      ]
+      ctx["pov_piste_name"] (opzionale)
     """
-    if pdk is None:
-        st.info("POV 3D non disponibile: il modulo pydeck non è installato.")
+    points: List[Dict[str, float]] = ctx.get("pov_piste_points") or []
+    if not points:
+        # Niente pista: non alziamo errori, semplicemente non facciamo nulla.
+        st.info("POV 3D non disponibile: nessun tracciato pista estratto.")
         return ctx
 
-    raw_points = ctx.get("pov_piste_points")
-    norm_points = _normalize_points(raw_points)
-
-    if not norm_points:
-        st.info("POV 3D non disponibile per questa località (nessun tracciato estratto).")
-        return ctx
-
-    piste_name = (
-        ctx.get("pov_piste_name")
-        or ctx.get("selected_piste_name")
-        or T.get("selected_slope", "pista")
-    )
-
-    # Path 3D: lista di [lon, lat, elev]
-    path = [[p["lon"], p["lat"], p["elev"]] for p in norm_points]
-
-    # ------------------- MAPBOX TOKEN & STILE -------------------
     token = _get_mapbox_token()
-    use_mapbox = bool(token)
+    mapbox_active = bool(token)
 
-    if use_mapbox:
-        st.caption(f"Mapbox key attiva: True (prefisso: {token[:4]})")
-        map_style = "mapbox://styles/mapbox/satellite-streets-v12"
-    else:
-        st.caption(
-            "Mapbox API key non trovata: viene mostrato solo il tracciato, "
-            "senza sfondo satellitare."
-        )
-        # stile di default pydeck (basemap vettoriale)
-        map_style = "light"
+    # Configuriamo pydeck col token SOLO se presente
+    if mapbox_active:
+        try:
+            pdk.settings.mapbox_api_key = token
+        except Exception:
+            mapbox_active = False
 
-    # ------------------- LAYER 3D -------------------
-    line_layer = pdk.PathLayer(
-        "pista_3d",
-        data=[{"path": path}],
+    # Centroid per il view_state
+    mid_idx = len(points) // 2
+    mid = points[mid_idx]
+    center_lat = float(mid.get("lat", 0.0))
+    center_lon = float(mid.get("lon", 0.0))
+
+    # Prepara dati per PathLayer
+    path_data = _build_pov_dataframe(points)
+
+    # Layer linea pista
+    line_layer = pdk.Layer(
+        "PathLayer",
+        data=path_data,
         get_path="path",
-        get_color=[255, 80, 60],
-        width_scale=3,
-        width_min_pixels=2,
-        get_width=3,
+        get_color=[255, 80, 40],
+        width_scale=4,
+        width_min_pixels=3,
+        pickable=False,
     )
 
-    # Punto di partenza (marker verde)
-    start = norm_points[0]
-    start_layer = pdk.ScatterplotLayer(
-        "start_point",
-        data=[{"lon": start["lon"], "lat": start["lat"]}],
+    # Layer punto di partenza evidenziato
+    start = points[0]
+    start_layer = pdk.Layer(
+        "ScatterplotLayer",
+        data=[{"lon": start.get("lon", center_lon), "lat": start.get("lat", center_lat)}],
         get_position="[lon, lat]",
-        get_color=[0, 255, 80],
-        get_radius=20,
-        radius_min_pixels=6,
+        get_radius=40,
+        get_fill_color=[0, 255, 100],
+        pickable=False,
     )
 
-    # View state centrato circa a metà pista
-    mid = norm_points[len(norm_points) // 2]
+    # Vista 3D: inclinata e leggermente ruotata
     view_state = pdk.ViewState(
-        longitude=mid["lon"],
-        latitude=mid["lat"],
+        latitude=center_lat,
+        longitude=center_lon,
         zoom=13,
         pitch=60,
-        bearing=0,
+        bearing=-45,
     )
+
+    # Stile mappa: satellite se token attivo, altrimenti base "light"
+    if mapbox_active:
+        map_style = "mapbox://styles/mapbox/satellite-v9"
+    else:
+        # stile generico senza bisogno di chiave (dipende dalla versione di pydeck)
+        map_style = "light"
 
     deck = pdk.Deck(
         layers=[line_layer, start_layer],
         initial_view_state=view_state,
-        tooltip={"text": piste_name},
         map_style=map_style,
+        tooltip={"text": "Tracciato POV pista"},
     )
 
     st.pydeck_chart(deck)
-    st.caption(
-        f"POV 3D della pista {piste_name} "
-        "(satellite se disponibile; puoi ruotare e zoomare la vista con le dita o il mouse)."
-    )
+
+    piste_name = ctx.get("pov_piste_name") or ctx.get("piste_name") or "pista selezionata"
+
+    if mapbox_active:
+        prefix = token[:3] + "…" if len(token) >= 3 else "pk…"
+        st.caption(
+            f"POV 3D della pista {piste_name} "
+            f"(satellite · Mapbox key attiva, prefisso: {prefix})."
+        )
+    else:
+        st.caption(
+            f"POV 3D della pista {piste_name} "
+            f"(tracciato su base map generica, senza sfondo satellite Mapbox)."
+        )
 
     return ctx
