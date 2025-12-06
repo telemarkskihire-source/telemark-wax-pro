@@ -9,10 +9,10 @@
 # - Trova tutti i segmenti con lo stesso nome, li unisce in un'unica traccia
 #   ordinata (in modo semplice).
 # - Mostra una vista 3D “tipo POV” con pydeck:
-#     · BASEMAP SATELLITARE (se è presente una API key Mapbox)
-#     · linea rossa della pista
+#     · BASEMAP SATELLITARE Mapbox (se è presente una API key)
+#     · linea rossa 3D della pista (con quota finta che scende)
 #     · marker START (verde) e FINISH (rosso)
-#     · camera molto inclinata e zoomata → effetto più realistico
+#     · camera molto inclinata e zoomata → effetto “discesa”
 #
 # FUNZIONI ESPORTE:
 #   - render_pov_3d(ctx)        → nuova API
@@ -64,7 +64,6 @@ def _configure_mapbox_token() -> None:
     # --- 1) st.secrets: chiavi dirette + oggetto completo convertito in dict ---
     secrets_dict: Dict[str, Any] = {}
     try:
-        # Streamlit Secrets supporta .to_dict(), se no facciamo cast
         if hasattr(st.secrets, "to_dict"):
             secrets_dict = st.secrets.to_dict()  # type: ignore[assignment]
         else:
@@ -85,7 +84,6 @@ def _configure_mapbox_token() -> None:
                     token = val.strip()
                     break
     except Exception:
-        # se st.secrets non è disponibile, ignoriamo
         secrets_dict = {}
 
     # --- 2) st.secrets: sezioni nidificate / valori che "assomigliano" a un token Mapbox ---
@@ -95,10 +93,8 @@ def _configure_mapbox_token() -> None:
             # stringa diretta
             if isinstance(obj, str):
                 v = obj.strip()
-                # i token Mapbox pubblici di solito iniziano con "pk."
                 if v.startswith("pk."):
                     return v
-                # comunque, se è abbastanza lungo, ci proviamo
                 if len(v) > 30:
                     return v
                 return None
@@ -133,7 +129,6 @@ def _configure_mapbox_token() -> None:
     if token:
         pdk.settings.mapbox_api_key = token
     else:
-        # Messaggio solo se proprio non troviamo niente
         st.info(
             "Per una vista 3D più realistica (satellite), configura una API key "
             "Mapbox (`MAPBOX_API_KEY`) in *Secrets* o come variabile d'ambiente."
@@ -276,8 +271,15 @@ def render_pov_3d(ctx: Dict[str, Any]) -> Dict[str, Any]:
     start_lat, start_lon = coords[0]
     finish_lat, finish_lon = coords[-1]
 
-    # convertiamo la traccia in formato [lon, lat] per pydeck
-    path_lonlat: List[List[float]] = [[lon, lat] for lat, lon in coords]
+    # --- costruiamo un path 3D: lon, lat, alt ---
+    # quota finta: partiamo alto alla partenza e scendiamo verso il traguardo
+    n = len(coords)
+    max_drop_m = 250.0  # dislivello "virtuale" in metri per l'effetto 3D
+    path_lonlat: List[List[float]] = []
+    for i, (lat, lon) in enumerate(coords):
+        t = i / max(1, n - 1)  # 0 → 1
+        alt = max_drop_m * (1.0 - t)  # partenza più alta, arrivo più basso
+        path_lonlat.append([lon, lat, alt])
 
     path_data = [
         {
@@ -290,12 +292,12 @@ def render_pov_3d(ctx: Dict[str, Any]) -> Dict[str, Any]:
         {
             "type": "start",
             "name": f"{piste_name} · START",
-            "position": [start_lon, start_lat],
+            "position": [start_lon, start_lat, max_drop_m],
         },
         {
             "type": "finish",
             "name": f"{piste_name} · FINISH",
-            "position": [finish_lon, finish_lat],
+            "position": [finish_lon, finish_lat, 0.0],
         },
     ]
 
@@ -303,12 +305,12 @@ def render_pov_3d(ctx: Dict[str, Any]) -> Dict[str, Any]:
     view_state = pdk.ViewState(
         latitude=avg_lat,
         longitude=avg_lon,
-        zoom=15.5,   # un filo più vicino
-        pitch=70,    # più inclinato → effetto più "discesa"
+        zoom=14.8,   # un po' più lontano per vedere la discesa 3D
+        pitch=70,    # inclinato → effetto "discesa"
         bearing=-35, # leggera rotazione
     )
 
-    # Layer pista
+    # Layer pista 3D
     path_layer = pdk.Layer(
         "PathLayer",
         data=path_data,
@@ -316,6 +318,8 @@ def render_pov_3d(ctx: Dict[str, Any]) -> Dict[str, Any]:
         get_color=[255, 70, 40],
         width_scale=6,
         width_min_pixels=4,
+        # usa la terza coordinata (alt) per l'elevazione
+        get_width=4,
     )
 
     # Layer start/finish
@@ -323,7 +327,7 @@ def render_pov_3d(ctx: Dict[str, Any]) -> Dict[str, Any]:
         "ScatterplotLayer",
         data=points_data,
         get_position="position",
-        get_radius=12,
+        get_radius=20,
         get_fill_color=[
             "255 * (type == 'finish')",
             "255 * (type == 'start')",
@@ -336,7 +340,8 @@ def render_pov_3d(ctx: Dict[str, Any]) -> Dict[str, Any]:
     deck = pdk.Deck(
         layers=[path_layer, points_layer],
         initial_view_state=view_state,
-        map_style="mapbox://styles/mapbox/satellite-v9",
+        map_provider="mapbox",
+        map_style="mapbox://styles/mapbox/satellite-streets-v12",
         tooltip={"text": "{name}"},
     )
 
