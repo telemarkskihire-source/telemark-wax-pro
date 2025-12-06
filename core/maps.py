@@ -5,15 +5,15 @@
 # - Carica le piste da Overpass (piste:type=downhill) in raggio 5 km
 #   intorno alla località (ctx["lat"], ctx["lon"]) iniziale.
 # - Località base (centro ricerca piste) resta fissa: i click sulla mappa
-#   MUOVONO solo il marker, non il centro della query → le piste non spariscono.
+#   muovono solo il marker, non il centro della query → le piste non spariscono.
 # - Selezione pista:
 #     · CLICK su mappa: snap alla pista più vicina (entro MAX_SNAP_M).
 #     · OPZIONALE: lista piste in un expander, attivabile con uno switch.
 # - La pista selezionata rimane evidenziata in ROSSO finché non ne scegli
 #   un’altra. Il nome è salvato anche in st.session_state.
 # - Le piste SENZA nome non hanno label (nessuna scritta "pista senza nome").
-# - Il click viene letto sia dal risultato di st_folium sia da session_state
-#   per migliorare la reattività (meno click "persi").
+# - Il click viene letto da session_state PRIMA del disegno mappa per avere
+#   il comportamento "un click = un aggiornamento visibile".
 
 from __future__ import annotations
 
@@ -28,7 +28,7 @@ import folium
 UA = {"User-Agent": "telemark-wax-pro/3.0"}
 
 # distanza massima per agganciare il click alla pista più vicina (metri)
-MAX_SNAP_M: float = 200.0
+MAX_SNAP_M: float = 350.0
 
 
 # ----------------------------------------------------------------------
@@ -198,7 +198,41 @@ def render_map(T, ctx):
     unique_names = sorted({nm for _, nm in named_pairs})
 
     # -----------------------------
-    # 3) Disegno mappa
+    # 3) Gestisco il CLICK della run precedente (prima di disegnare la mappa)
+    #    → così il click che ha scatenato questo rerun è già visibile ora.
+    # -----------------------------
+    prev_state = st.session_state.get(map_key)
+    if isinstance(prev_state, dict):
+        last_clicked = prev_state.get("last_clicked")
+        if last_clicked and polylines:
+            try:
+                c_lat = float(last_clicked["lat"])
+                c_lon = float(last_clicked["lng"])
+
+                best_nm: Optional[str] = None
+                best_lat = c_lat
+                best_lon = c_lon
+                best_d = float("inf")
+
+                for coords, nm in zip(polylines, names):
+                    for lat, lon in coords:
+                        d = _dist_m(c_lat, c_lon, lat, lon)
+                        if d < best_d:
+                            best_d = d
+                            best_nm = nm
+                            best_lat = lat
+                            best_lon = lon
+
+                if best_d <= MAX_SNAP_M:
+                    marker_lat = best_lat
+                    marker_lon = best_lon
+                    if best_nm:
+                        selected_name = best_nm
+            except Exception:
+                pass
+
+    # -----------------------------
+    # 4) Disegno mappa (dopo aver applicato lo snap)
     # -----------------------------
     with map_container:
         m = folium.Map(
@@ -259,55 +293,15 @@ def render_map(T, ctx):
             icon=folium.Icon(color="red", icon="flag"),
         ).add_to(m)
 
-        # risultato della run corrente
-        result = st_folium(
+        # disegno widget mappa; return_on_click per avere il rerun immediato
+        st_folium(
             m,
             height=450,
             key=map_key,
+            return_on_click=True,
         )
 
     st.caption(f"Segmenti piste downhill trovati: {segment_count}")
-
-    # -----------------------------
-    # 4) Gestisco il click (snap immediato, un solo click)
-    #    Prendo last_clicked sia da result che da session_state per non perderlo.
-    # -----------------------------
-    last_clicked = None
-    if isinstance(result, dict):
-        last_clicked = result.get("last_clicked")
-
-    state_map = st.session_state.get(map_key)
-    if not last_clicked and isinstance(state_map, dict):
-        lc2 = state_map.get("last_clicked")
-        if lc2:
-            last_clicked = lc2
-
-    if last_clicked and polylines:
-        try:
-            c_lat = float(last_clicked["lat"])
-            c_lon = float(last_clicked["lng"])
-
-            best_nm: Optional[str] = None
-            best_lat = c_lat
-            best_lon = c_lon
-            best_d = float("inf")
-
-            for coords, nm in zip(polylines, names):
-                for lat, lon in coords:
-                    d = _dist_m(c_lat, c_lon, lat, lon)
-                    if d < best_d:
-                        best_d = d
-                        best_nm = nm
-                        best_lat = lat
-                        best_lon = lon
-
-            if best_d <= MAX_SNAP_M:
-                marker_lat = best_lat
-                marker_lon = best_lon
-                if best_nm:
-                    selected_name = best_nm
-        except Exception:
-            pass
 
     # -----------------------------
     # 5) Switch: attiva/disattiva selezione da lista
