@@ -1,19 +1,17 @@
 # core/maps.py
 # Mappa & piste per Telemark · Pro Wax & Tune
 #
-# - Carica le piste da Overpass (piste:type=downhill) in raggio 5 km
-#   intorno alla località (ctx["lat"], ctx["lon"]) iniziale.
-# - La località base (centro ricerca piste) resta FISSA: i click sulla mappa
-#   muovono solo il marker, non il centro della query → le piste non spariscono.
+# - Carica piste:type=downhill da Overpass in un raggio di 5 km
+#   attorno alla località base (ctx["lat"], ctx["lon"] / base_lat, base_lon).
+# - La località base resta FISSA: i click sulla mappa spostano solo il marker
+#   e selezionano la pista più vicina, ma non cambiano il centro della query.
 # - Selezione pista:
-#     · CLICK su mappa: snap alla pista più vicina, con raggio DINAMICO
-#       in base allo zoom (lontano = raggio grande, vicino = preciso).
-#     · Lista piste opzionale (switch + selectbox sotto la mappa).
-# - La pista selezionata rimane evidenziata in ROSSO finché non ne scegli
+#     · CLICK mappa -> snap alla pista più vicina con raggio dinamico
+#     · (opzionale) lista piste con nomi, sotto la mappa
+# - La pista selezionata rimane evidenziata in rosso finché non ne scegli
 #   un’altra. Il nome è salvato anche in st.session_state.
-# - Le piste SENZA nome non hanno label (niente "pista senza nome").
-# - La chiamata a st_folium usa la FIRMA che sul progetto funzionava:
-#   st_folium(m, height=..., width=None, key=...).
+# - Nessuna “pista senza nome”: le piste senza name/ref/piste:name non
+#   vengono etichettate.
 
 from __future__ import annotations
 
@@ -155,10 +153,10 @@ def _dynamic_snap_radius(prev_state: Optional[Dict[str, Any]]) -> float:
     in base al livello di zoom salvato da st_folium.
 
     Idee:
-      - zoom molto lontano (<= 9–10)  -> raggio molto grande (2.5 km)
-      - zoom medio (11–12)            -> raggio 1.5 km
-      - zoom "normale" (13–14)        -> raggio 600 m
-      - zoom vicino (>= 15)           -> raggio base 300 m
+      - zoom molto lontano (<= 10)  -> raggio grande (2.5 km)
+      - zoom medio (11–12)         -> raggio 1.5 km
+      - zoom "normale" (13–14)     -> raggio 600 m
+      - zoom vicino (>= 15)        -> raggio base 300 m
     """
     zoom = None
     if isinstance(prev_state, dict):
@@ -181,7 +179,7 @@ def _dynamic_snap_radius(prev_state: Optional[Dict[str, Any]]) -> float:
 # ----------------------------------------------------------------------
 # Funzione principale chiamata dalla app
 # ----------------------------------------------------------------------
-def render_map(T, ctx):
+def render_map(T: Dict[str, Any], ctx: Dict[str, Any]) -> Dict[str, Any]:
     """
     Mappa Telemark:
       - click mappa → snap a pista più vicina (raggio dinamico)
@@ -227,8 +225,7 @@ def render_map(T, ctx):
     unique_names = sorted({nm for _, nm in named_pairs})
 
     # -----------------------------
-    # 3) Se c'è un click memorizzato, applico lo snap PRIMA di ridisegnare.
-    #    Uso un raggio dinamico in base allo zoom.
+    # 3) Snap al click precedente (se esiste)
     # -----------------------------
     prev_state = st.session_state.get(map_key)
     snap_radius = _dynamic_snap_radius(prev_state)
@@ -263,9 +260,7 @@ def render_map(T, ctx):
                 pass
 
     # -----------------------------
-    # 4) Determino lo zoom iniziale
-    #    - se c'è già uno zoom salvato, lo riuso
-    #    - altrimenti parto bello vicino (zoom 15)
+    # 4) Zoom iniziale
     # -----------------------------
     zoom_start = 15.0  # zoom di partenza "vicino"
     if isinstance(prev_state, dict):
@@ -334,7 +329,7 @@ def render_map(T, ctx):
         icon=folium.Icon(color="red", icon="flag"),
     ).add_to(m)
 
-    # firma "sicura" di st_folium
+    # firma "classica" di st_folium compatibile con versioni 0.13+ e 1.x
     _ = st_folium(
         m,
         height=450,
@@ -391,21 +386,7 @@ def render_map(T, ctx):
     ctx["lon"] = marker_lon
     ctx["selected_piste_name"] = selected_name
     st.session_state[sel_key] = selected_name
-# ----------------------------------------------------
-# 8) SALVA I PUNTI DELLA PISTA SELEZIONATA PER MODULO POV
-# ----------------------------------------------------
-selected_points = None
 
-if selected_name:
-    for coords, nm in zip(polylines, names):
-        if nm == selected_name:
-            # coords è una lista di (lat, lon)
-            selected_points = [{"lat": lat, "lon": lon, "elev": 0.0} for (lat, lon) in coords]
-            break
-
-# salva per modulo POV 2D + 3D
-ctx["selected_piste_points"] = selected_points
-ctx["pov_piste_points"] = selected_points
     # info utente
     if selected_name:
         st.markdown(f"**Pista selezionata:** {selected_name}")
