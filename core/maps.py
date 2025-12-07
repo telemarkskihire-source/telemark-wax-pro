@@ -148,7 +148,7 @@ def render_map(T, ctx: Dict[str, Any]) -> Dict[str, Any]:
     map_id = str(ctx.get("map_context", "default"))
     map_key = f"map_{map_id}"
     sel_key = f"selected_piste_{map_id}"
-    base_key = f"base_center_{map_id}"
+    init_key = f"map_initialized_{map_id}"
 
     # Località base (centro piste)
     base_lat = float(ctx.get("base_lat", ctx.get("lat", 45.83333)))
@@ -157,21 +157,17 @@ def render_map(T, ctx: Dict[str, Any]) -> Dict[str, Any]:
     ctx["base_lat"] = base_lat
     ctx["base_lon"] = base_lon
 
-    # --- reset selezione se cambio località (es. Courmayeur dopo Champoluc) ---
-    this_center = (round(base_lat, 5), round(base_lon, 5))
-    prev_center = st.session_state.get(base_key)
-    if prev_center != this_center:
-        # nuova località → nessuna pista pre-selezionata
-        st.session_state[sel_key] = None
-        ctx["selected_piste_name"] = None
-    st.session_state[base_key] = this_center
-
     # Marker visuale
     marker_lat = float(ctx.get("marker_lat", base_lat))
     marker_lon = float(ctx.get("marker_lon", base_lon))
 
-    # Nome pista selezionata (NON pre-selezioniamo niente di default)
-    selected = st.session_state.get(sel_key) or ctx.get("selected_piste_name") or None
+    # Primo load: nessuna pista selezionata.
+    initialized = bool(st.session_state.get(init_key, False))
+
+    if initialized:
+        selected = st.session_state.get(sel_key) or ctx.get("selected_piste_name") or None
+    else:
+        selected = None  # niente blob rosso al primo giro
 
     # Carica piste
     count, polylines, names = _fetch_pistes(base_lat, base_lon)
@@ -209,6 +205,7 @@ def render_map(T, ctx: Dict[str, Any]) -> Dict[str, Any]:
                 marker_lon = best_lon
                 if best_nm:
                     selected = best_nm
+                    initialized = True
 
     # Zoom iniziale
     zoom = 15
@@ -288,6 +285,7 @@ def render_map(T, ctx: Dict[str, Any]) -> Dict[str, Any]:
             )
         if chosen != selected:
             selected = chosen
+            initialized = True
             for coords, nm in named:
                 if nm == selected:
                     mid = coords[len(coords) // 2]
@@ -301,6 +299,7 @@ def render_map(T, ctx: Dict[str, Any]) -> Dict[str, Any]:
     ctx["lon"] = marker_lon
     ctx["selected_piste_name"] = selected
     st.session_state[sel_key] = selected
+    st.session_state[init_key] = initialized
 
     st.markdown(f"**Pista selezionata:** {selected or 'Nessuna'}")
 
