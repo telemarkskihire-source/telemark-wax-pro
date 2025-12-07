@@ -3,8 +3,8 @@
 #
 # - Usa satellite Mapbox con camera bassa (tipo sciatore)
 # - Durata ~12 s, FPS 25
-# - Limite duro: max 60 punti nel path → niente 422
-# - Output MP4 (fallback automatico a GIF se qualcosa va storto)
+# - Limite adattivo: max ~16 punti nel path, ridotti finché la URL è breve
+# - Output MP4 (fallback GIF se qualcosa va storto)
 
 from __future__ import annotations
 
@@ -34,7 +34,8 @@ LINE_COLOR = "ff4422"             # arancione/rosso per la pista
 LINE_WIDTH = 4
 LINE_OPACITY = 0.9                # 0–1
 
-MAX_PATH_POINTS = 60              # limite duro per il path static API
+# Limite iniziale di punti per il path; poi verrà eventualmente ridotto
+MAX_PATH_POINTS = 16
 
 
 # -----------------------------------------------------
@@ -117,9 +118,24 @@ def _smooth_bearings(bearings: List[float], window: int = 5) -> List[float]:
 
 
 def _build_path_param(points: List[Dict[str, float]]) -> str:
-    """Costruisce il parametro path-... per la Static API, con limite duro a MAX_PATH_POINTS."""
-    pts = _resample_even(points, max_points=MAX_PATH_POINTS)
-    coord_str = ";".join(f"{p['lon']:.5f},{p['lat']:.5f}" for p in pts)
+    """
+    Costruisce il parametro path-... per la Static API, con
+    un limite *adattivo* sul numero di punti per evitare errori 422.
+    """
+    # partiamo da un massimo ragionevole
+    max_pts = max(2, min(MAX_PATH_POINTS, len(points)))
+
+    while True:
+        pts = _resample_even(points, max_pts)
+        coord_str = ";".join(f"{p['lon']:.5f},{p['lat']:.5f}" for p in pts)
+
+        # 500 caratteri è un margine molto prudente per la parte coordinate
+        if len(coord_str) <= 500 or max_pts <= 4:
+            break
+
+        # se è ancora lunga, dimezziamo il numero di punti e riproviamo
+        max_pts = max(4, max_pts // 2)
+
     # path-{width}+{color}-{opacity}(...)
     return f"path-{LINE_WIDTH}+{LINE_COLOR}-{LINE_OPACITY}({coord_str})"
 
