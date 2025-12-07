@@ -1,11 +1,10 @@
 # core/pov_video.py
-# Generatore POV 3D (~12 s) da traccia pista + Mapbox Static API
+# Generatore POV 3D da traccia pista + Mapbox Static API
 #
-# - Usa stile "mapbox/satellite-v9"
-# - Camera bassa (zoom 16.3, pitch 72°) orientata lungo la pista
-# - Limite sui punti del path per evitare errori 422
-# - Limite sui frame per non saturare le chiamate a Mapbox
-# - Output: GIF animata 1280x720 in ./videos/<slug>_pov_12s.gif
+# - Usa satellite Mapbox con camera bassa (tipo sciatore)
+# - Durata ~12 s, FPS 25
+# - Limite duro: max 60 punti nel path → niente 422
+# - Output MP4 (fallback automatico a GIF se qualcosa va storto)
 
 from __future__ import annotations
 
@@ -18,7 +17,7 @@ from pathlib import Path
 import numpy as np
 import requests
 from PIL import Image
-import imageio
+import imageio.v2 as imageio
 import streamlit as st
 
 # -----------------------------------------------------
@@ -27,27 +26,19 @@ import streamlit as st
 
 WIDTH = 1280
 HEIGHT = 720
+DURATION_S = 12.0
+FPS = 25  # movimento più fluido
 
-DURATION_S = 12.0       # durata target del POV
-FPS = 14                # compromesso: abbastanza fluido, meno richieste
-
-MIN_FRAMES = 40         # per non avere video troppo corti/scattosi
-MAX_FRAMES = 140        # cap duro: evita troppe chiamate Mapbox
-
-STYLE_ID = "mapbox/satellite-v9"  # satellite 3D standard Mapbox
-LINE_COLOR = "ff4422"             # arancione/rosso pista
+STYLE_ID = "mapbox/satellite-v9"  # stile base
+LINE_COLOR = "ff4422"             # arancione/rosso per la pista
 LINE_WIDTH = 4
+LINE_OPACITY = 0.9                # 0–1
 
-MAX_PATH_POINTS = 60    # max vertici nella path-... → evita 422
-
-# filtro neve disattivato (hook futuro)
-ENABLE_SNOW_FILTER = False
-
-UA = {"User-Agent": "telemark-wax-pro/POV-1.0"}
+MAX_PATH_POINTS = 60              # limite duro per il path static API
 
 
 # -----------------------------------------------------
-# Utilità base
+# Utilità
 # -----------------------------------------------------
 
 def _get_mapbox_token() -> str:
@@ -58,26 +49,16 @@ def _get_mapbox_token() -> str:
             return token
     except Exception:
         pass
-
     token = os.environ.get("MAPBOX_API_KEY", "").strip()
     if not token:
-        raise RuntimeError(
-            "MAPBOX_API_KEY non configurata in st.secrets o nelle variabili d'ambiente."
-        )
+        raise RuntimeError("MAPBOX_API_KEY non configurata in secrets o variabili d'ambiente.")
     return token
 
 
-def _as_points(
-    track: Union[Dict[str, Any], Sequence[Dict[str, Any]]]
-) -> List[Dict[str, float]]:
-    """
-    Normalizza l'input in lista di dict con chiavi 'lat'/'lon'.
-    Supporta:
-      - GeoJSON Feature LineString
-      - lista di dict {"lat": ..., "lon": ...}
-    """
-    # GeoJSON Feature
+def _as_points(track: Union[Dict[str, Any], Sequence[Dict[str, Any]]]) -> List[Dict[str, float]]:
+    """Normalizza l'input in lista di dict con lat/lon."""
     if isinstance(track, dict) and track.get("type") == "Feature":
+        # GeoJSON LineString
         geom = track.get("geometry") or {}
         if geom.get("type") != "LineString":
             raise ValueError("GeoJSON non è una LineString.")
@@ -87,35 +68,30 @@ def _as_points(
             pts.append({"lat": float(lat), "lon": float(lon)})
         return pts
 
-    # Lista di punti
     pts: List[Dict[str, float]] = []
-    for p in track:  # type: ignore[assignment]
+    for p in track:  # type: ignore[arg-type]
         lat = float(p.get("lat"))  # type: ignore[arg-type]
         lon = float(p.get("lon"))  # type: ignore[arg-type]
         pts.append({"lat": lat, "lon": lon})
     return pts
 
 
-def _resample(points: List[Dict[str, float]], max_points: int) -> List[Dict[str, float]]:
+def _resample_even(points: List[Dict[str, float]], max_points: int) -> List[Dict[str, float]]:
     """
-    Limita il numero di punti del path per non esplodere la URL
-    (evita errori 422 da Mapbox).
+    Riduce la lista di punti a max_points sample distribuiti uniformemente.
+    Garantisce: len(out) <= max_points e include primo/ultimo.
     """
     n = len(points)
     if n <= max_points:
         return points
 
-    step = max(1, n // max_points)
-    out: List[Dict[str, float]] = []
-    for i in range(0, n, step):
-        out.append(points[i])
-    if out[-1] is not points[-1]:
-        out.append(points[-1])
+    idxs = np.linspace(0, n - 1, max_points).astype(int)
+    out = [points[i] for i in idxs]
     return out
 
 
 def _bearing(a: Dict[str, float], b: Dict[str, float]) -> float:
-    """Azimut (0–360°) da punto a → b (gradi Mapbox: 0 = Nord, 90 = Est)."""
+    """Azimut (0–360°) da a → b."""
     lat1 = math.radians(a["lat"])
     lat2 = math.radians(b["lat"])
     dlon = math.radians(b["lon"] - a["lon"])
@@ -125,14 +101,27 @@ def _bearing(a: Dict[str, float], b: Dict[str, float]) -> float:
     return (brng + 360.0) % 360.0
 
 
+def _smooth_bearings(bearings: List[float], window: int = 5) -> List[float]:
+    """
+    Piccolo smoothing sulle rotazioni per evitare scatti di camera.
+    """
+    if len(bearings) <= window:
+        return bearings
+
+    arr = np.array(bearings, dtype=float)
+    pad = window // 2
+    padded = np.pad(arr, (pad, pad), mode="edge")
+    kernel = np.ones(window) / float(window)
+    sm = np.convolve(padded, kernel, mode="valid")
+    return sm.tolist()
+
+
 def _build_path_param(points: List[Dict[str, float]]) -> str:
-    """
-    Costruisce il parametro path-... per la Static API.
-    Niente opacity esplicita (lasciamo default 1.0) per accorciare la URL.
-    """
-    pts = _resample(points, max_points=MAX_PATH_POINTS)
+    """Costruisce il parametro path-... per la Static API, con limite duro a MAX_PATH_POINTS."""
+    pts = _resample_even(points, max_points=MAX_PATH_POINTS)
     coord_str = ";".join(f"{p['lon']:.5f},{p['lat']:.5f}" for p in pts)
-    return f"path-{LINE_WIDTH}+{LINE_COLOR}({coord_str})"
+    # path-{width}+{color}-{opacity}(...)
+    return f"path-{LINE_WIDTH}+{LINE_COLOR}-{LINE_OPACITY}({coord_str})"
 
 
 def _fetch_frame(
@@ -146,7 +135,7 @@ def _fetch_frame(
     """
     Scarica un singolo frame statico da Mapbox.
 
-    zoom ≈ 16.3 + pitch 72° → camera bassa, vista tipo POV sciata.
+    zoom 16.3 + pitch 72° → camera bassa, tipo POV sciatore.
     """
     url = (
         f"https://api.mapbox.com/styles/v1/{STYLE_ID}/static/"
@@ -155,30 +144,10 @@ def _fetch_frame(
         f"{WIDTH}x{HEIGHT}"
         f"?access_token={token}"
     )
-    r = requests.get(url, headers=UA, timeout=25)
+    r = requests.get(url, timeout=25)
     r.raise_for_status()
     img = Image.open(io.BytesIO(r.content)).convert("RGB")
     return img
-
-
-def _apply_snow_filter(img: Image.Image) -> Image.Image:
-    """
-    Hook per un eventuale filtro neve.
-    Per ora è disattivato per non degradare troppo le immagini.
-    """
-    if not ENABLE_SNOW_FILTER:
-        return img
-
-    arr = np.asarray(img).astype("float32") / 255.0
-
-    # leggero boost contrasto + tono appena più freddo
-    arr = (arr - 0.5) * 1.05 + 0.5
-    arr[..., 0] *= 0.98  # meno rosso
-    arr[..., 2] *= 1.03  # un filo più blu
-    arr = np.clip(arr, 0.0, 1.0)
-
-    arr = (arr * 255.0).astype("uint8")
-    return Image.fromarray(arr, mode="RGB")
 
 
 # -----------------------------------------------------
@@ -192,14 +161,10 @@ def generate_pov_video(
     fps: int = FPS,
 ) -> str:
     """
-    Genera una GIF POV 3D di ~duration_s secondi.
+    Genera un POV 3D in formato MP4 (fallback GIF) di circa duration_s secondi.
 
-    track:
-      - GeoJSON Feature LineString
-      - oppure lista di punti {lat, lon, ...}
-
-    Ritorna:
-      percorso file GIF in ./videos/<slug>_pov_12s.gif
+    track: GeoJSON Feature LineString oppure lista di punti {lat, lon, ...}
+    Ritorna: percorso del file creato in ./videos/<nome>_pov_12s.(mp4|gif)
     """
     token = _get_mapbox_token()
 
@@ -207,15 +172,15 @@ def generate_pov_video(
     if len(points) < 2:
         raise ValueError("Traccia pista troppo corta per generare un POV.")
 
-    # Parametro path per mostrare tutta la pista in rosso
+    # path completo (per avere la pista disegnata nel frame)
     path_param = _build_path_param(points)
 
-    # Numero frame: clamp fra MIN_FRAMES e MAX_FRAMES
+    # timeline frame: ci muoviamo lungo la pista
     n_frames = int(duration_s * fps)
-    n_frames = max(MIN_FRAMES, min(n_frames, MAX_FRAMES))
+    if n_frames < 2:
+        n_frames = 2
 
-    # Indici "float" lungo i segmenti (0 → n-2)
-    idx_float = np.linspace(0, len(points) - 2, n_frames)
+    idx_float = np.linspace(0.0, len(points) - 2.0, n_frames)
 
     centers: List[Dict[str, float]] = []
     bearings: List[float] = []
@@ -233,23 +198,31 @@ def generate_pov_video(
         centers.append({"lat": lat, "lon": lon})
         bearings.append(_bearing(a, b))
 
-    # Scarico i frame da Mapbox
-    frames: List[np.ndarray] = []
+    bearings = _smooth_bearings(bearings, window=7)
 
+    frames: List[np.ndarray] = []
     for c, brng in zip(centers, bearings):
         img = _fetch_frame(token, c, brng, path_param)
-        img = _apply_snow_filter(img)
         frames.append(np.asarray(img))
 
-    # Salvataggio GIF
+    # salvataggio file
     out_dir = Path("videos")
     out_dir.mkdir(parents=True, exist_ok=True)
 
     safe_name = "".join(
         ch if ch.isalnum() or ch in "-_" else "_" for ch in str(pista_name).lower()
-    ) or "pista"
-    out_path = out_dir / f"{safe_name}_pov_{int(duration_s)}s.gif"
+    )
+    mp4_path = out_dir / f"{safe_name}_pov_12s.mp4"
 
-    imageio.mimsave(str(out_path), frames, fps=fps)
-
-    return str(out_path)
+    try:
+        # MP4 H.264
+        writer = imageio.get_writer(str(mp4_path), fps=fps, codec="libx264")
+        for frame in frames:
+            writer.append_data(frame)
+        writer.close()
+        return str(mp4_path)
+    except Exception:
+        # Fallback: GIF animata
+        gif_path = out_dir / f"{safe_name}_pov_12s.gif"
+        imageio.mimsave(str(gif_path), frames, fps=fps)
+        return str(gif_path)
