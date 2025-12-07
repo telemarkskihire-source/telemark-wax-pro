@@ -2,16 +2,19 @@
 # POV VIDEO 3D con Mapbox Static API -> GIF animata
 #
 # - Nessuna dipendenza da moviepy (usa solo requests + Pillow + imageio).
-# - Prende i punti pista (ctx["pov_piste_points"] o GeoJSON Feature) e
-#   genera una GIF di ~12s in stile "volo d'uccello" sulla pista.
-# - Camera bassa (zoom alto + pitch 60°) e movimento più fluido
-#   grazie a frame più numerosi e time-easing.
+# - Usa i punti pista (lat, lon, elev) per calcolare la pendenza locale.
+# - Modula il pitch della camera in base alla pendenza per dare l'idea
+#   di muro / traverso / falsopiano.
+# - Aggiunge un piccolo HUD con la pendenza istantanea in alto a sinistra.
 #
 # Output: videos/<nome_pista>_pov_12s.gif
 #
 # Uso:
 #   from core import pov_video as pov_video_mod
-#   path = pov_video_mod.generate_pov_video(points_or_feature, "Del Bosco")
+#   path = pov_video_mod.generate_pov_video(points, "Del Bosco")
+#
+# Dove "points" è una lista di dict:
+#   [{"lat": float, "lon": float, "elev": float}, ...]
 
 from __future__ import annotations
 
@@ -19,12 +22,13 @@ from pathlib import Path
 from typing import Any, Dict, List, Sequence, Tuple, Union, Optional
 import math
 import io
+import os
 
 import requests
 import numpy as np
-from PIL import Image
-import imageio.v2 as imageio  # v2 API compatibile
-import streamlit as st  # solo per leggere st.secrets
+from PIL import Image, ImageDraw
+import imageio.v2 as imageio
+import streamlit as st
 
 
 # ------------------------------------------------------------
@@ -35,16 +39,19 @@ UA = {"User-Agent": "telemark-wax-pro/2.0"}
 # Durata target del POV
 TOTAL_SECONDS = 12.0
 # Numero frame (più alto = più fluido)
-TOTAL_FRAMES = 120  # circa 10 fps su 12 s
+TOTAL_FRAMES = 120  # ~10 fps
 
 # Dimensioni GIF
 FRAME_WIDTH = 800
 FRAME_HEIGHT = 450
 
-# Parametri camera (visuale bassa + effetto 3D)
-CAMERA_ZOOM = 16.0   # zoom alto -> vicino al terreno
-CAMERA_PITCH = 60.0  # massimo consentito da Mapbox Static (più "prima persona")
-ROLL_AMPLITUDE_DEG = 3.0  # piccolo roll sinusoidale per effetto cinema (simulato via bearing)
+# Camera: zoom fisso abbastanza vicino al terreno
+CAMERA_ZOOM = 16.0          # vicino al suolo
+PITCH_MIN = 30.0            # falsopiano
+PITCH_MAX = 60.0            # muro ripido
+
+# Piccola oscillazione cinematografica sul bearing
+ROLL_AMPLITUDE_DEG = 3.0
 
 
 # ------------------------------------------------------------
@@ -64,8 +71,6 @@ def _get_mapbox_token() -> Optional[str]:
                 return token
     except Exception:
         pass
-
-    import os
 
     token = os.environ.get("MAPBOX_API_KEY", "").strip()
     return token or None
@@ -110,8 +115,6 @@ def _pick_main_segment(
     """
     Dato un elenco di punti [{lat, lon, elev}, ...] prende il segmento continuo
     più lungo, dove la distanza fra due punti consecutivi non supera max_jump_m.
-
-    Serve per eliminare salti assurdi (tipo Italia → Francia).
     """
     if len(points) < 2:
         return points
@@ -172,6 +175,7 @@ def _normalize_input(
     Accetta:
     - lista di dict con chiavi "lat", "lon" (e opz. "elev")
     - Feature GeoJSON {"type": "Feature", "geometry": {"type": "LineString", ...}}
+      con eventuale quota in posizione [2].
     Restituisce lista di dict {"lat": float, "lon": float, "elev": float}.
     """
     points: List[Dict[str, float]] = []
@@ -228,37 +232,46 @@ def _build_path_overlay(points: List[Dict[str, float]]) -> str:
 
 
 # ------------------------------------------------------------
-# RESAMPLING E TRAIETTORIA CAMERA (EFFETTO CINEMA)
+# RESAMPLING & PENDENZA
 # ------------------------------------------------------------
 def _resample_along_path(
     points: List[Dict[str, float]],
     n_frames: int,
-) -> List[Tuple[float, float, float]]:
+) -> List[Tuple[float, float, float, float]]:
     """
-    Restituisce per ogni frame: (lat, lon, bearing).
-    Usa un easing cosinusoidale per avere partenza/arrivo lenti
-    e velocità maggiore a metà pista (effetto più cinematografico).
+    Restituisce per ogni frame: (lat, lon, bearing, slope_deg).
+    Usa un easing cosinusoidale per avere partenza/arrivo lenti.
     """
     if len(points) < 2:
         p = points[0]
-        return [(p["lat"], p["lon"], 0.0)] * n_frames
+        return [(p["lat"], p["lon"], 0.0, 0.0)] * n_frames
 
-    # distanze cumulate
+    # distanze cumulate e pendenze dei segmenti
     dists = [0.0]
+    slopes_deg: List[float] = []
+
     for i in range(1, len(points)):
         a = points[i - 1]
         b = points[i]
-        d = _dist_m(a["lat"], a["lon"], b["lat"], b["lon"])
-        dists.append(dists[-1] + d)
+        horiz = max(_dist_m(a["lat"], a["lon"], b["lat"], b["lon"]), 1e-3)
+        dz = float(b.get("elev", 0.0)) - float(a.get("elev", 0.0))
+
+        # vogliamo pendenza positiva in discesa
+        slope_rad = math.atan2(-dz, horiz)
+        slope = math.degrees(slope_rad)
+        if slope < 0:
+            slope = 0.0  # niente pendenza "in salita" nel POV
+        slopes_deg.append(slope)
+
+        dists.append(dists[-1] + horiz)
 
     total = dists[-1] or 1.0
 
-    # funzione easing: s(t) in [0,1]
     def ease(t: float) -> float:
         # smooth cos easing (slow start & end)
         return 0.5 * (1 - math.cos(math.pi * t))
 
-    frames: List[Tuple[float, float, float]] = []
+    frames: List[Tuple[float, float, float, float]] = []
 
     for i in range(n_frames):
         t = i / max(n_frames - 1, 1)
@@ -284,8 +297,9 @@ def _resample_along_path(
         lon = p1["lon"] + alpha * (p2["lon"] - p1["lon"])
 
         bearing = _bearing_deg(p1["lat"], p1["lon"], p2["lat"], p2["lon"])
+        slope_here = slopes_deg[j - 1] if j - 1 < len(slopes_deg) else 0.0
 
-        frames.append((lat, lon, bearing))
+        frames.append((lat, lon, bearing, slope_here))
 
     return frames
 
@@ -299,21 +313,20 @@ def _fetch_frame(
     lat: float,
     lon: float,
     bearing: float,
+    pitch: float,
     width: int,
     height: int,
-    zoom: float,
-    pitch: float,
 ) -> Image.Image:
     """
     Scarica un singolo frame dalla Mapbox Static API.
     """
-    # bearing con piccolo roll sinusoidale per "cinema"
     bearing = bearing % 360.0
+    pitch = max(0.0, min(60.0, pitch))
 
     url = (
         "https://api.mapbox.com/styles/v1/mapbox/satellite-v9/static/"
         f"{path_overlay}/"
-        f"{lon:.6f},{lat:.6f},{zoom:.2f},{bearing:.1f},{pitch:.1f}/"
+        f"{lon:.6f},{lat:.6f},{CAMERA_ZOOM:.2f},{bearing:.1f},{pitch:.1f}/"
         f"{width}x{height}"
         f"?access_token={token}"
     )
@@ -335,12 +348,15 @@ def generate_pov_video(
     """
     Genera (o rigenera) una GIF POV 3D 12s per la pista.
     Restituisce il path del file GIF sul disco.
+
+    "data" può essere:
+      - lista di punti {"lat", "lon", "elev"}
+      - Feature GeoJSON LineString con coords [lon, lat, elev?]
     """
     token = _get_mapbox_token()
     if not token:
         raise RuntimeError("MAPBOX_API_KEY non configurata (st.secrets o env).")
 
-    # directory output
     out_dir = Path("videos")
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -363,16 +379,21 @@ def generate_pov_video(
             "Segmento pista troppo corto dopo pulizia; impossibile generare POV."
         )
 
-    # overlay della pista (path ridotto per URL)
+    # overlay ridotto per evitare URL 422
     path_overlay = _build_path_overlay(cleaned)
 
-    # traiettoria camera con easing (effetto cinema)
+    # traiettoria camera con pendenze
     cam_frames = _resample_along_path(cleaned, TOTAL_FRAMES)
 
     imgs: List[Image.Image] = []
 
-    for idx, (lat, lon, bearing_base) in enumerate(cam_frames):
-        # piccolo roll sinusoidale ±ROLL_AMPLITUDE_DEG
+    for idx, (lat, lon, bearing_base, slope_deg) in enumerate(cam_frames):
+        # pitch in base alla pendenza (0–40° -> PITCH_MIN–PITCH_MAX)
+        slope_clamped = max(0.0, min(slope_deg, 40.0))
+        t_pitch = slope_clamped / 40.0
+        pitch = PITCH_MIN + (PITCH_MAX - PITCH_MIN) * t_pitch
+
+        # piccolo roll sinusoidale sul bearing per effetto cinema
         phase = 2.0 * math.pi * idx / max(TOTAL_FRAMES - 1, 1)
         roll = ROLL_AMPLITUDE_DEG * math.sin(phase)
         bearing = (bearing_base + roll) % 360.0
@@ -383,16 +404,23 @@ def generate_pov_video(
             lat=lat,
             lon=lon,
             bearing=bearing,
+            pitch=pitch,
             width=FRAME_WIDTH,
             height=FRAME_HEIGHT,
-            zoom=CAMERA_ZOOM,
-            pitch=CAMERA_PITCH,
         )
+
+        # HUD pendenza in alto a sinistra
+        draw = ImageDraw.Draw(img)
+        hud_text = f"{slope_deg:.0f}°"
+        # piccolo box scuro semi-trasparente (simulato)
+        box_w, box_h = 60, 28
+        draw.rectangle((8, 8, 8 + box_w, 8 + box_h), fill=(0, 0, 0, 128))
+        draw.text((14, 12), hud_text, fill=(255, 255, 255))
+
         imgs.append(img)
 
-    # converte in numpy array per imageio
     frames_np = [np.asarray(im) for im in imgs]
-    frame_duration = TOTAL_SECONDS / max(len(frames_np), 1)  # secondi per frame
+    frame_duration = TOTAL_SECONDS / max(len(frames_np), 1)
 
     imageio.mimsave(str(out_path), frames_np, duration=frame_duration)
 
