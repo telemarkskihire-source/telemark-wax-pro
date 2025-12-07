@@ -1,59 +1,278 @@
 # core/pov_video.py
-# POV 3D realistico: volo lungo la pista su sfondo Mapbox satellitare
+# Generatore POV video 3D con Mapbox Static Images
 #
-# - usa i punti di ctx["pov_piste_points"] (lat, lon, elev)
-# - segue la pista con una camera inclinata (pitch) e orientata (bearing)
-# - sfondo: immagini statiche Mapbox stile satellite-v9
-# - output: GIF 12 s salvata in videos/<safe_name>_pov_12s.gif
-#
-# Richiede:
-#   - MAPBOX_API_KEY in st.secrets["MAPBOX_API_KEY"] oppure in
-#     variabile d'ambiente MAPBOX_API_KEY.
+# - Input: lista di punti pista [{lat, lon, elev}, ...]
+# - Pulizia salti folli, scelta segmento principale
+# - Resample in ~180 frame (12 s a 15 fps)
+# - Per ogni frame:
+#     * chiama Mapbox Static API (satellite, pitch alto, zoom "basso")
+#     * centra la camera sul punto corrente
+#     * bearing allineato alla direzione della pista
+#     * path rosso della pista intera
+#     * applica filtro "inverno"
+# - Output: MP4 in videos/<safe_name>_pov_12s.mp4
 
 from __future__ import annotations
 
 from typing import List, Dict, Any, Optional
-import math
 import os
+import math
 from pathlib import Path
-from io import BytesIO
+from urllib.parse import quote
 
 import requests
-from PIL import Image, ImageDraw
+import numpy as np
+from PIL import Image, ImageEnhance
+import streamlit as st  # per leggere st.secrets
+from moviepy.editor import ImageSequenceClip
 
-WIDTH = 800
-HEIGHT = 450
-FRAME_RATE = 12          # fps
-VIDEO_DURATION = 12      # secondi
-N_FRAMES = FRAME_RATE * VIDEO_DURATION
+UA = {"User-Agent": "telemark-wax-pro/2.0"}
 
 
-# -------------------------------------------------------------
+# ---------------------------------------------------------------------
+# MAPBOX TOKEN
+# ---------------------------------------------------------------------
+def _get_mapbox_token() -> Optional[str]:
+    """
+    Cerca la MAPBOX_API_KEY in:
+      - st.secrets["MAPBOX_API_KEY"]
+      - variabile d'ambiente MAPBOX_API_KEY
+    """
+    try:
+        if "MAPBOX_API_KEY" in st.secrets:
+            token = str(st.secrets["MAPBOX_API_KEY"]).strip()
+            if token:
+                return token
+    except Exception:
+        pass
+
+    token = os.environ.get("MAPBOX_API_KEY", "").strip()
+    return token or None
+
+
+# ---------------------------------------------------------------------
 # GEO UTILS
-# -------------------------------------------------------------
-def _haversine_dist(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    """Distanza in metri tra due coordinate lat/lon."""
+# ---------------------------------------------------------------------
+def _dist_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Distanza in metri tra due punti lat/lon (haversine semplificata)."""
     R = 6371000.0
-    p1 = math.radians(lat1)
-    p2 = math.radians(lat2)
-    dlat = math.radians(lat2 - lat1)
-    dlon = math.radians(lon2 - lon1)
-    a = math.sin(dlat / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dlon / 2) ** 2
+    phi1 = math.radians(lat1)
+    phi2 = math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlambda = math.radians(lon2 - lon1)
+
+    a = (
+        math.sin(dphi / 2.0) ** 2
+        + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2.0) ** 2
+    )
     c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
     return R * c
 
 
-def build_track(points: List[Dict[str, float]]) -> List[Dict[str, float]]:
-    """
-    Converte i punti in una traccia continua con distanza cumulata.
+def _bearing_deg(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Bearing (gradi) da (lat1,lon1) a (lat2,lon2)."""
+    phi1 = math.radians(lat1)
+    phi2 = math.radians(lat2)
+    dlambda = math.radians(lon2 - lon1)
+    y = math.sin(dlambda) * math.cos(phi2)
+    x = math.cos(phi1) * math.sin(phi2) - math.sin(phi1) * math.cos(phi2) * math.cos(
+        dlambda
+    )
+    brng = math.degrees(math.atan2(y, x))
+    return (brng + 360.0) % 360.0
 
-    points: [{"lat": ..., "lon": ..., "elev": ...}, ...]
-    ritorna: [{"lat", "lon", "elev", "dist"}, ...] dove dist è in metri.
-    """
-    track: List[Dict[str, float]] = []
-    dist = 0.0
-    prev: Optional[Dict[str, float]] = None
 
+def _pick_main_segment(points: List[Dict[str, float]], max_jump_m: float = 2000.0) -> List[Dict[str, float]]:
+    """
+    Tiene solo il segmento continuo più lungo,
+    eliminando salti assurdi (> max_jump_m).
+    """
+    if len(points) < 2:
+        return points
+
+    segments: List[List[Dict[str, float]]] = []
+    current: List[Dict[str, float]] = [points[0]]
+
+    for i in range(1, len(points)):
+        p_prev = points[i - 1]
+        p = points[i]
+        d = _dist_m(
+            float(p_prev.get("lat", 0.0)),
+            float(p_prev.get("lon", 0.0)),
+            float(p.get("lat", 0.0)),
+            float(p.get("lon", 0.0)),
+        )
+        if d <= max_jump_m:
+            current.append(p)
+        else:
+            if len(current) >= 2:
+                segments.append(current)
+            current = [p]
+
+    if len(current) >= 2:
+        segments.append(current)
+
+    if not segments:
+        return points
+
+    def seg_length(seg: List[Dict[str, float]]) -> float:
+        tot = 0.0
+        for i in range(1, len(seg)):
+            a = seg[i - 1]
+            b = seg[i]
+            tot += _dist_m(
+                float(a.get("lat", 0.0)),
+                float(a.get("lon", 0.0)),
+                float(b.get("lat", 0.0)),
+                float(b.get("lon", 0.0)),
+            )
+        return tot
+
+    return max(segments, key=seg_length)
+
+
+def _resample_by_distance(points: List[Dict[str, float]], n_samples: int) -> List[Dict[str, float]]:
+    """
+    Resample della pista su distanza cumulativa (step costante).
+    """
+    if len(points) <= n_samples:
+        return points
+
+    # distanza cumulativa
+    dists = [0.0]
+    for i in range(1, len(points)):
+        p_prev = points[i - 1]
+        p = points[i]
+        dists.append(
+            dists[-1]
+            + _dist_m(
+                float(p_prev["lat"]),
+                float(p_prev["lon"]),
+                float(p["lat"]),
+                float(p["lon"]),
+            )
+        )
+
+    total = dists[-1]
+    if total <= 0:
+        return points
+
+    step = total / (n_samples - 1)
+    targets = [i * step for i in range(n_samples)]
+
+    resampled: List[Dict[str, float]] = []
+    j = 0
+    for t in targets:
+        while j < len(dists) - 2 and dists[j + 1] < t:
+            j += 1
+        d0, d1 = dists[j], dists[j + 1]
+        if d1 == d0:
+            alpha = 0.0
+        else:
+            alpha = (t - d0) / (d1 - d0)
+        p0, p1 = points[j], points[j + 1]
+        lat = float(p0["lat"]) + alpha * (float(p1["lat"]) - float(p0["lat"]))
+        lon = float(p0["lon"]) + alpha * (float(p1["lon"]) - float(p0["lon"]))
+        elev = float(p0.get("elev", 0.0)) + alpha * (
+            float(p1.get("elev", 0.0)) - float(p0.get("elev", 0.0))
+        )
+        resampled.append({"lat": lat, "lon": lon, "elev": elev})
+    return resampled
+
+
+# ---------------------------------------------------------------------
+# MAPBOX STATIC FRAME
+# ---------------------------------------------------------------------
+def _build_path_overlay(points: List[Dict[str, float]]) -> str:
+    """
+    Costruisce la stringa 'path-5+ff4422-1(lon,lat;lon,lat;...)'
+    downsamplando per non esagerare con la lunghezza dell'URL.
+    """
+    if len(points) > 80:
+        # downsample per path overlay
+        step = max(1, len(points) // 80)
+        pts = points[::step]
+    else:
+        pts = points
+
+    coords = ";".join(f"{p['lon']},{p['lat']}" for p in pts)
+    return f"path-5+ff4422-1({coords})"
+
+
+def _fetch_mapbox_frame(
+    token: str,
+    path_overlay: str,
+    center_lat: float,
+    center_lon: float,
+    bearing: float,
+    zoom: float = 16.8,
+    pitch: float = 60.0,
+    size: str = "800x450",
+) -> Image.Image:
+    """
+    Scarica un frame dal Mapbox Static Images API (satellite, 3D-like).
+    """
+    style = "mapbox/satellite-v9"
+
+    overlay_encoded = quote(path_overlay, safe="():,;+-")
+    # center: lon,lat,zoom,bearing,pitch
+    center = f"{center_lon},{center_lat},{zoom},{bearing},{pitch}"
+
+    url = (
+        f"https://api.mapbox.com/styles/v1/{style}/static/"
+        f"{overlay_encoded}/{center}/{size}"
+        f"?access_token={token}"
+    )
+
+    resp = requests.get(url, headers=UA, timeout=15)
+    resp.raise_for_status()
+    img = Image.open(io.BytesIO(resp.content)).convert("RGB")  # type: ignore[name-defined]
+    return img
+
+
+# ---------------------------------------------------------------------
+# WINTER FILTER
+# ---------------------------------------------------------------------
+def _apply_winter_filter(img: Image.Image) -> Image.Image:
+    """
+    Semplice look "invernale":
+    - leggermente desaturato
+    - più freddo (canale blu)
+    - velo bianco semi-trasparente
+    """
+    # desatura leggermente
+    enhancer = ImageEnhance.Color(img)
+    img = enhancer.enhance(0.85)
+
+    # piccolo boost di blu
+    r, g, b = img.split()
+    b = ImageEnhance.Brightness(b).enhance(1.1)
+    img = Image.merge("RGB", (r, g, b))
+
+    # velo neve
+    overlay = Image.new("RGBA", img.size, (230, 240, 255, 70))
+    img_rgba = img.convert("RGBA")
+    img_rgba = Image.alpha_composite(img_rgba, overlay)
+
+    return img_rgba.convert("RGB")
+
+
+# ---------------------------------------------------------------------
+# ENTRY POINT
+# ---------------------------------------------------------------------
+def generate_pov_video(points: List[Dict[str, Any]], pista_name: str) -> str:
+    """
+    Genera un video POV 3D (12 s) con Mapbox e ritorna il path del file MP4.
+    """
+    if not points or len(points) < 4:
+        raise ValueError("Traccia pista insufficiente per creare un POV video.")
+
+    token = _get_mapbox_token()
+    if not token:
+        raise RuntimeError("MAPBOX_API_KEY non configurata per il POV video.")
+
+    # 1) normalizza e pulisce i punti
+    clean_pts: List[Dict[str, float]] = []
     for p in points:
         try:
             lat = float(p.get("lat"))
@@ -61,245 +280,88 @@ def build_track(points: List[Dict[str, float]]) -> List[Dict[str, float]]:
             elev = float(p.get("elev", 0.0))
         except Exception:
             continue
+        clean_pts.append({"lat": lat, "lon": lon, "elev": elev})
 
-        if prev is not None:
-            dist += _haversine_dist(prev["lat"], prev["lon"], lat, lon)
+    if len(clean_pts) < 4:
+        raise ValueError("Traccia pista troppo corta dopo la pulizia.")
 
-        d = {"lat": lat, "lon": lon, "elev": elev, "dist": dist}
-        track.append(d)
-        prev = d
+    main_seg = _pick_main_segment(clean_pts, max_jump_m=2000.0)
+    if len(main_seg) < 4:
+        raise ValueError("Segmento principale pista troppo corto per POV video.")
 
-    return track
+    # 2) resample per avere più frame (12 s @ 15 fps ≈ 180 frame)
+    duration_s = 12
+    fps = 15
+    n_frames = duration_s * fps  # 180
 
+    frames_pts = _resample_by_distance(main_seg, n_frames)
 
-def _resample_track(track: List[Dict[str, float]], n_points: int) -> List[Dict[str, float]]:
-    """
-    Ridistribuisce la traccia su n_points punti equidistanti lungo la distanza.
-    Serve per avere esattamente N_FRAMES frame uniformi.
-    """
-    if len(track) <= n_points:
-        return track
+    # 3) path overlay per l'intera pista
+    path_overlay = _build_path_overlay(main_seg)
 
-    total = track[-1]["dist"]
-    if total <= 0:
-        return track
+    # 4) scarica frame con camera bassa e pitch alto
+    frames: List[np.ndarray] = []
 
-    result: List[Dict[str, float]] = []
-    j = 1
+    # altezza "percepita": aggiustiamo slightly con zoom (16.8 ≈ 20–30 m)
+    zoom = 16.8
+    pitch = 60.0
 
-    for i in range(n_points):
-        td = total * i / (n_points - 1)  # distanza target per questo frame
+    # import qui per non creare dipendenza globale di io se non serve
+    import io  # noqa: E402
 
-        while j < len(track) and track[j]["dist"] < td:
-            j += 1
+    for i in range(len(frames_pts)):
+        p = frames_pts[i]
+        lat = float(p["lat"])
+        lon = float(p["lon"])
 
-        if j <= 0:
-            result.append(track[0])
-        elif j >= len(track):
-            result.append(track[-1])
+        # direzione lungo pista (usa punto successivo o precedente)
+        if i < len(frames_pts) - 1:
+            p2 = frames_pts[i + 1]
         else:
-            p1 = track[j - 1]
-            p2 = track[j]
-            span = p2["dist"] - p1["dist"] or 1e-9
-            t = (td - p1["dist"]) / span
-            lat = p1["lat"] + (p2["lat"] - p1["lat"]) * t
-            lon = p1["lon"] + (p2["lon"] - p1["lon"]) * t
-            elev = p1["elev"] + (p2["elev"] - p1["elev"]) * t
-            result.append({"lat": lat, "lon": lon, "elev": elev, "dist": td})
-
-    return result
-
-
-def _bearing_deg(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    """
-    Azimuth (gradi) da punto 1 a punto 2.
-    0 = Nord, aumenta in senso orario (convenzione Mapbox).
-    """
-    y = math.sin(math.radians(lon2 - lon1)) * math.cos(math.radians(lat2))
-    x = (
-        math.cos(math.radians(lat1)) * math.sin(math.radians(lat2))
-        - math.sin(math.radians(lat1))
-        * math.cos(math.radians(lat2))
-        * math.cos(math.radians(lon2 - lon1))
-    )
-    brng = math.degrees(math.atan2(y, x))
-    return (brng + 360) % 360
-
-
-# -------------------------------------------------------------
-# MAPBOX TOKEN
-# -------------------------------------------------------------
-def _get_mapbox_token() -> Optional[str]:
-    """
-    Token da:
-      - variabile d'ambiente MAPBOX_API_KEY
-      - oppure st.secrets["MAPBOX_API_KEY"]
-    """
-    token = os.environ.get("MAPBOX_API_KEY", "").strip()
-    if token:
-        return token
-
-    try:
-        import streamlit as st
-
-        if "MAPBOX_API_KEY" in st.secrets:
-            t = str(st.secrets["MAPBOX_API_KEY"]).strip()
-            if t:
-                return t
-    except Exception:
-        pass
-
-    return None
-
-
-# -------------------------------------------------------------
-# FRAME RENDERING
-# -------------------------------------------------------------
-def _fetch_satellite_image(
-    lat: float,
-    lon: float,
-    bearing: float,
-    zoom: int,
-    pitch: int,
-    token: str,
-) -> Image.Image:
-    """
-    Scarica una singola immagine statica da Mapbox (stile satellite).
-    """
-    url = (
-        "https://api.mapbox.com/styles/v1/mapbox/satellite-v9/static/"
-        f"{lon:.6f},{lat:.6f},{zoom},{bearing:.1f},{pitch}/{WIDTH}x{HEIGHT}"
-        f"?access_token={token}"
-    )
-
-    r = requests.get(url, timeout=10)
-    r.raise_for_status()
-
-    img = Image.open(BytesIO(r.content)).convert("RGB")
-    img = img.resize((WIDTH, HEIGHT))
-    return img
-
-
-def _winterize(img: Image.Image) -> Image.Image:
-    """
-    Semplice "filtro neve": schiarisce e tende al bianco/azzurro
-    per dare un look invernale anche se la tile è estiva.
-    """
-    img = img.convert("RGB")
-    snow = Image.new("RGB", img.size, (230, 238, 248))
-    img = Image.blend(img, snow, 0.35)
-    return img
-
-
-def _draw_hud(
-    img: Image.Image,
-    piste_name: str,
-    elev: float,
-    dist_m: float,
-    total_m: float,
-) -> Image.Image:
-    """
-    Disegna HUD minimale: barra superiore con nome pista + quota + km,
-    e mirino centrale per l'effetto "in prima persona".
-    """
-    draw = ImageDraw.Draw(img)
-    w, h = img.size
-
-    # barra in alto
-    draw.rectangle([0, 0, w, 26], fill=(2, 10, 30))
-
-    title = f"{piste_name} POV"
-    info = f"Alt {elev:.0f} m  ·  {dist_m/1000:.2f}/{total_m/1000:.2f} km"
-
-    draw.text((8, 6), title, fill=(220, 235, 255))
-    tw = draw.textlength(info)
-    draw.text((w - tw - 8, 6), info, fill=(200, 220, 240))
-
-    # mirino
-    cx, cy = w // 2, int(h * 0.7)
-    draw.line([(cx - 12, cy), (cx + 12, cy)], fill=(255, 80, 40), width=2)
-    draw.line([(cx, cy - 8), (cx, cy + 8)], fill=(255, 80, 40), width=2)
-
-    return img
-
-
-# -------------------------------------------------------------
-# ENTRYPOINT PRINCIPALE
-# -------------------------------------------------------------
-def generate_pov_video(points: List[Dict[str, float]], pista_name: str) -> str:
-    """
-    Genera la GIF POV 3D 12 s per una pista.
-
-    points: ctx["pov_piste_points"] (lista di dict con lat, lon, elev)
-    ritorna: path stringa alla GIF salvata in videos/<nome>_pov_12s.gif
-    """
-    track = build_track(points)
-    if len(track) < 5:
-        raise RuntimeError("Traccia POV troppo corta per generare il video.")
-
-    # Esattamente N_FRAMES punti lungo la pista
-    track = _resample_track(track, N_FRAMES)
-
-    token = _get_mapbox_token()
-    if not token:
-        raise RuntimeError(
-            "MAPBOX_API_KEY non configurata (secrets o variabile d'ambiente)."
-        )
-
-    total_len = track[-1]["dist"]
-
-    # Zoom più aperto per piste lunghe
-    if total_len > 3500:
-        zoom = 13
-    elif total_len > 2500:
-        zoom = 14
-    elif total_len > 1500:
-        zoom = 15
-    else:
-        zoom = 16
-
-    pitch = 60  # inclinazione camera
-
-    frames: List[Image.Image] = []
-
-    for idx, p in enumerate(track):
-        if idx < len(track) - 3:
-            q = track[idx + 3]
-        else:
-            q = track[-1]
-
-        bearing = _bearing_deg(p["lat"], p["lon"], q["lat"], q["lon"])
+            p2 = frames_pts[i - 1]
+        brg = _bearing_deg(lat, lon, float(p2["lat"]), float(p2["lon"]))
 
         try:
-            img = _fetch_satellite_image(
-                p["lat"], p["lon"], bearing, zoom, pitch, token
+            img = _fetch_mapbox_frame(
+                token=token,
+                path_overlay=path_overlay,
+                center_lat=lat,
+                center_lon=lon,
+                bearing=brg,
+                zoom=zoom,
+                pitch=pitch,
+                size="800x450",
             )
+            img = _apply_winter_filter(img)
         except Exception:
-            # fallback: sfondo blu notte
-            img = Image.new("RGB", (WIDTH, HEIGHT), (10, 30, 60))
+            # in caso di errore, ripeti l'ultimo frame valido oppure salta
+            if frames:
+                frames.append(frames[-1].copy())
+                continue
+            else:
+                raise
 
-        img = _winterize(img)
-        img = _draw_hud(img, pista_name, p["elev"], p["dist"], total_len)
-        frames.append(img)
+        frames.append(np.array(img))
 
-    # salvataggio GIF
-    out_dir = Path("videos")
-    out_dir.mkdir(parents=True, exist_ok=True)
+    if not frames:
+        raise RuntimeError("Impossibile generare frame POV video.")
 
+    # 5) output path
     safe_name = "".join(
         c if c.isalnum() or c in "-_" else "_" for c in str(pista_name).lower()
     )
-    out_path = out_dir / f"{safe_name}_pov_12s.gif"
+    out_dir = Path("videos")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / f"{safe_name}_pov_12s.mp4"
 
-    duration_ms = int(1000 / FRAME_RATE)
-
-    frames[0].save(
-        out_path,
-        save_all=True,
-        append_images=frames[1:],
-        duration=duration_ms,
-        loop=0,
-        disposal=2,
+    # 6) crea video MP4
+    clip = ImageSequenceClip(frames, fps=fps)
+    clip.write_videofile(
+        str(out_path),
+        codec="libx264",
+        audio=False,
+        verbose=False,
+        logger=None,
     )
 
     return str(out_path)
