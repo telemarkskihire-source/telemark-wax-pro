@@ -1,14 +1,15 @@
 # core/pov_video.py
-# POV 3D in stile "sciatore" da traccia pista + Mapbox Static API
+# Generatore POV 3D (~12 s) da traccia pista + Mapbox Static API
 #
-# - Usa Mapbox Static Images (satellite-v9)
-# - Usa Mapbox Terrain-RGB per stimare altitudine e pendenza
-# - Camera bassa, puntata in avanti lungo la pista
-# - Salva un MP4 12 s in ./videos/<nome>_pov_12s.mp4
+# - Usa stile "mapbox/satellite-v9"
+# - Camera bassa (zoom 16.3, pitch 72°) orientata lungo la pista
+# - Limite sui punti del path per evitare errori 422
+# - Limite sui frame per non saturare le chiamate a Mapbox
+# - Output: GIF animata 1280x720 in ./videos/<slug>_pov_12s.gif
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Sequence, Tuple, Union
+from typing import Any, Dict, List, Sequence, Union
 import io
 import math
 import os
@@ -17,7 +18,7 @@ from pathlib import Path
 import numpy as np
 import requests
 from PIL import Image
-import imageio.v2 as imageio
+import imageio
 import streamlit as st
 
 # -----------------------------------------------------
@@ -26,29 +27,31 @@ import streamlit as st
 
 WIDTH = 1280
 HEIGHT = 720
-DURATION_S = 12.0
-FPS = 24  # movimento più fluido
+
+DURATION_S = 12.0       # durata target del POV
+FPS = 14                # compromesso: abbastanza fluido, meno richieste
+
+MIN_FRAMES = 40         # per non avere video troppo corti/scattosi
+MAX_FRAMES = 140        # cap duro: evita troppe chiamate Mapbox
 
 STYLE_ID = "mapbox/satellite-v9"  # satellite 3D standard Mapbox
-LINE_COLOR = "ff4422"             # arancione/rosso per la pista
+LINE_COLOR = "ff4422"             # arancione/rosso pista
 LINE_WIDTH = 4
 
-# zoom/pitch medi: poi li moduliamo leggermente
-BASE_ZOOM = 16.0        # abbastanza vicino
-MIN_PITCH = 47.0        # gradi (0 = vista dall'alto, 60 = quasi orizzonte)
-MAX_PITCH = 60.0
+MAX_PATH_POINTS = 60    # max vertici nella path-... → evita 422
 
-UA = {"User-Agent": "telemark-wax-pro/4.0"}
+# filtro neve disattivato (hook futuro)
+ENABLE_SNOW_FILTER = False
 
-# Cache in memoria per le tile Terrain-RGB
-_TERRAIN_CACHE: Dict[Tuple[int, int, int], np.ndarray] = {}
+UA = {"User-Agent": "telemark-wax-pro/POV-1.0"}
+
 
 # -----------------------------------------------------
-# Utilità generali
+# Utilità base
 # -----------------------------------------------------
 
 def _get_mapbox_token() -> str:
-    """Legge MAPBOX_API_KEY da st.secrets o da variabile d'ambiente."""
+    """Legge la MAPBOX_API_KEY da st.secrets o ENV."""
     try:
         token = str(st.secrets.get("MAPBOX_API_KEY", "")).strip()
         if token:
@@ -59,7 +62,7 @@ def _get_mapbox_token() -> str:
     token = os.environ.get("MAPBOX_API_KEY", "").strip()
     if not token:
         raise RuntimeError(
-            "MAPBOX_API_KEY non configurata (né in secrets né in variabili d'ambiente)."
+            "MAPBOX_API_KEY non configurata in st.secrets o nelle variabili d'ambiente."
         )
     return token
 
@@ -68,11 +71,12 @@ def _as_points(
     track: Union[Dict[str, Any], Sequence[Dict[str, Any]]]
 ) -> List[Dict[str, float]]:
     """
-    Normalizza l'input in una lista di dict {lat, lon}.
-    Accetta:
-      - GeoJSON Feature con LineString
-      - Lista di dict con chiavi 'lat' e 'lon'
+    Normalizza l'input in lista di dict con chiavi 'lat'/'lon'.
+    Supporta:
+      - GeoJSON Feature LineString
+      - lista di dict {"lat": ..., "lon": ...}
     """
+    # GeoJSON Feature
     if isinstance(track, dict) and track.get("type") == "Feature":
         geom = track.get("geometry") or {}
         if geom.get("type") != "LineString":
@@ -83,6 +87,7 @@ def _as_points(
             pts.append({"lat": float(lat), "lon": float(lon)})
         return pts
 
+    # Lista di punti
     pts: List[Dict[str, float]] = []
     for p in track:  # type: ignore[assignment]
         lat = float(p.get("lat"))  # type: ignore[arg-type]
@@ -91,23 +96,26 @@ def _as_points(
     return pts
 
 
-def _haversine_m(a: Dict[str, float], b: Dict[str, float]) -> float:
-    """Distanza in metri fra due punti lat/lon."""
-    R = 6371000.0
-    lat1 = math.radians(a["lat"])
-    lat2 = math.radians(b["lat"])
-    dlat = lat2 - lat1
-    dlon = math.radians(b["lon"] - a["lon"])
-    h = (
-        math.sin(dlat / 2.0) ** 2
-        + math.cos(lat1) * math.cos(lat2) * math.sin(dlon / 2.0) ** 2
-    )
-    c = 2 * math.atan2(math.sqrt(h), math.sqrt(1.0 - h))
-    return R * c
+def _resample(points: List[Dict[str, float]], max_points: int) -> List[Dict[str, float]]:
+    """
+    Limita il numero di punti del path per non esplodere la URL
+    (evita errori 422 da Mapbox).
+    """
+    n = len(points)
+    if n <= max_points:
+        return points
+
+    step = max(1, n // max_points)
+    out: List[Dict[str, float]] = []
+    for i in range(0, n, step):
+        out.append(points[i])
+    if out[-1] is not points[-1]:
+        out.append(points[-1])
+    return out
 
 
 def _bearing(a: Dict[str, float], b: Dict[str, float]) -> float:
-    """Azimut (0–360°) da a → b (0 = Nord, 90 = Est)."""
+    """Azimut (0–360°) da punto a → b (gradi Mapbox: 0 = Nord, 90 = Est)."""
     lat1 = math.radians(a["lat"])
     lat2 = math.radians(b["lat"])
     dlon = math.radians(b["lon"] - a["lon"])
@@ -117,192 +125,61 @@ def _bearing(a: Dict[str, float], b: Dict[str, float]) -> float:
     return (brng + 360.0) % 360.0
 
 
-def _resample_for_path(points: List[Dict[str, float]], max_points: int = 100) -> List[Dict[str, float]]:
-    """
-    Semplifica la traccia per il parametro 'path' di Mapbox,
-    tenendo l'ordine e i punti estremi.
-    """
-    n = len(points)
-    if n <= max_points:
-        return points
-
-    step = max(1, n // max_points)
-    out: List[Dict[str, float]] = points[::step]
-    if out[-1] is not points[-1]:
-        out.append(points[-1])
-    return out
-
-
 def _build_path_param(points: List[Dict[str, float]]) -> str:
     """
-    Costruisce il parametro path corretto per la Static API.
-    ATTENZIONE: niente opacity nel path, altrimenti 422.
+    Costruisce il parametro path-... per la Static API.
+    Niente opacity esplicita (lasciamo default 1.0) per accorciare la URL.
     """
-    pts = _resample_for_path(points, max_points=80)
+    pts = _resample(points, max_points=MAX_PATH_POINTS)
     coord_str = ";".join(f"{p['lon']:.5f},{p['lat']:.5f}" for p in pts)
     return f"path-{LINE_WIDTH}+{LINE_COLOR}({coord_str})"
 
-# -----------------------------------------------------
-# Terrain-RGB (DEM)
-# -----------------------------------------------------
-
-def _latlon_to_tile(
-    lat: float, lon: float, z: int
-) -> Tuple[int, int, float, float]:
-    """
-    Converte lat/lon in tile (x, y) a zoom z + posizione relativa dentro la tile.
-    Ritorna: x, y, fx, fy (fx, fy ∈ [0, 1])
-    """
-    lat_rad = math.radians(lat)
-    n = 2.0 ** z
-    xtile_f = (lon + 180.0) / 360.0 * n
-    ytile_f = (
-        (1.0 - math.log(math.tan(lat_rad) + 1 / math.cos(lat_rad)) / math.pi)
-        / 2.0
-        * n
-    )
-
-    xtile = int(xtile_f)
-    ytile = int(ytile_f)
-    fx = xtile_f - xtile
-    fy = ytile_f - ytile
-    return xtile, ytile, fx, fy
-
-
-def _fetch_terrain_tile(z: int, x: int, y: int, token: str) -> np.ndarray:
-    """
-    Scarica una tile Terrain-RGB e la converte in m di altitudine (array 256×256).
-    Usa cache in memoria per non rifare la stessa richiesta più volte.
-    """
-    key = (z, x, y)
-    if key in _TERRAIN_CACHE:
-        return _TERRAIN_CACHE[key]
-
-    url = (
-        f"https://api.mapbox.com/v4/mapbox.terrain-rgb/"
-        f"{z}/{x}/{y}.pngraw?access_token={token}"
-    )
-    r = requests.get(url, timeout=15, headers=UA)
-    r.raise_for_status()
-    img = Image.open(io.BytesIO(r.content)).convert("RGB")
-    arr = np.asarray(img).astype("float32")
-
-    # formula Mapbox: height(m) = -10000 + (R*256^2 + G*256 + B) * 0.1
-    R = arr[..., 0]
-    G = arr[..., 1]
-    B = arr[..., 2]
-    height_m = -10000.0 + (R * 256.0 * 256.0 + G * 256.0 + B) * 0.1
-
-    _TERRAIN_CACHE[key] = height_m
-    return height_m
-
-
-def _terrain_height(lat: float, lon: float, token: str, z: int = 13) -> float:
-    """
-    Ritorna altitudine in metri per (lat, lon) usando Terrain-RGB.
-    Usa bilinear interpolation dentro la tile.
-    Se qualcosa va storto, restituisce 0.0 (poi gestito a valle).
-    """
-    try:
-        x, y, fx, fy = _latlon_to_tile(lat, lon, z)
-        tile = _fetch_terrain_tile(z, x, y, token)
-
-        # posizioni in pixel dentro la tile
-        px = fx * 255.0
-        py = fy * 255.0
-
-        x0 = int(math.floor(px))
-        x1 = min(255, x0 + 1)
-        y0 = int(math.floor(py))
-        y1 = min(255, y0 + 1)
-
-        dx = px - x0
-        dy = py - y0
-
-        # bilinear
-        h00 = tile[y0, x0]
-        h10 = tile[y0, x1]
-        h01 = tile[y1, x0]
-        h11 = tile[y1, x1]
-
-        h0 = h00 * (1.0 - dx) + h10 * dx
-        h1 = h01 * (1.0 - dx) + h11 * dx
-        h = h0 * (1.0 - dy) + h1 * dy
-
-        return float(h)
-    except Exception:
-        return 0.0
-
-
-def _compute_altitude_profile(
-    points: List[Dict[str, float]],
-    token: str,
-) -> Tuple[np.ndarray, np.ndarray, float]:
-    """
-    Costruisce:
-      - alt_m[i]   = quota in metri del punto i
-      - slope_deg[i] ≈ pendenza del segmento i→i+1 (ultimo replicato)
-      - total_len_m = lunghezza totale pista
-    """
-    n = len(points)
-    alt = np.zeros(n, dtype="float32")
-    for i, p in enumerate(points):
-        alt[i] = _terrain_height(p["lat"], p["lon"], token, z=13)
-
-    # distanze e pendenze lungo la pista
-    dists = np.zeros(n - 1, dtype="float32")
-    slopes = np.zeros(n - 1, dtype="float32")
-
-    for i in range(n - 1):
-        a = points[i]
-        b = points[i + 1]
-        d = _haversine_m(a, b)
-        dists[i] = max(d, 0.1)  # evitiamo 0
-
-        dz = alt[i + 1] - alt[i]
-        slope_rad = math.atan2(abs(dz), dists[i])
-        slopes[i] = math.degrees(slope_rad)
-
-    if n >= 2:
-        slopes_full = np.concatenate([slopes, slopes[-1:]])
-    else:
-        slopes_full = np.zeros_like(alt)
-
-    total_len = float(np.sum(dists))
-    return alt, slopes_full, total_len
-
-# -----------------------------------------------------
-# Static frame da Mapbox
-# -----------------------------------------------------
 
 def _fetch_frame(
     token: str,
     center: Dict[str, float],
     bearing: float,
     path_param: str,
-    pitch_deg: float,
-    zoom: float,
+    zoom: float = 16.3,
+    pitch: float = 72.0,
 ) -> Image.Image:
     """
     Scarica un singolo frame statico da Mapbox.
-    pitch 45–60°: camera bassa, quasi in prima persona.
-    """
-    pitch_clamped = max(MIN_PITCH, min(MAX_PITCH, pitch_deg))
-    zoom_clamped = max(10.0, min(18.0, zoom))
 
+    zoom ≈ 16.3 + pitch 72° → camera bassa, vista tipo POV sciata.
+    """
     url = (
         f"https://api.mapbox.com/styles/v1/{STYLE_ID}/static/"
         f"{path_param}/"
-        f"{center['lon']:.5f},{center['lat']:.5f},"
-        f"{zoom_clamped:.2f},{bearing:.1f},{pitch_clamped:.1f}/"
+        f"{center['lon']:.5f},{center['lat']:.5f},{zoom:.2f},{bearing:.1f},{pitch:.1f}/"
         f"{WIDTH}x{HEIGHT}"
         f"?access_token={token}"
     )
-
-    r = requests.get(url, timeout=30, headers=UA)
+    r = requests.get(url, headers=UA, timeout=25)
     r.raise_for_status()
     img = Image.open(io.BytesIO(r.content)).convert("RGB")
     return img
+
+
+def _apply_snow_filter(img: Image.Image) -> Image.Image:
+    """
+    Hook per un eventuale filtro neve.
+    Per ora è disattivato per non degradare troppo le immagini.
+    """
+    if not ENABLE_SNOW_FILTER:
+        return img
+
+    arr = np.asarray(img).astype("float32") / 255.0
+
+    # leggero boost contrasto + tono appena più freddo
+    arr = (arr - 0.5) * 1.05 + 0.5
+    arr[..., 0] *= 0.98  # meno rosso
+    arr[..., 2] *= 1.03  # un filo più blu
+    arr = np.clip(arr, 0.0, 1.0)
+
+    arr = (arr * 255.0).astype("uint8")
+    return Image.fromarray(arr, mode="RGB")
+
 
 # -----------------------------------------------------
 # Funzione principale usata da streamlit_app
@@ -315,100 +192,64 @@ def generate_pov_video(
     fps: int = FPS,
 ) -> str:
     """
-    Genera un POV 3D in formato MP4 (~duration_s secondi).
+    Genera una GIF POV 3D di ~duration_s secondi.
 
     track:
       - GeoJSON Feature LineString
       - oppure lista di punti {lat, lon, ...}
 
     Ritorna:
-      percorso del file MP4 in ./videos/<nome>_pov_12s.mp4
+      percorso file GIF in ./videos/<slug>_pov_12s.gif
     """
     token = _get_mapbox_token()
 
-    points_raw = _as_points(track)
-    if len(points_raw) < 2:
+    points = _as_points(track)
+    if len(points) < 2:
         raise ValueError("Traccia pista troppo corta per generare un POV.")
 
-    # Semplifichiamo leggermente la traccia per il percorso camera
-    # (manteniamo comunque tutti i punti per il DEM)
-    points = points_raw
-
-    # Parametro path (disegno pista a terra)
+    # Parametro path per mostrare tutta la pista in rosso
     path_param = _build_path_param(points)
 
-    # Profilo altimetrico + pendenza
-    alt_m, slope_deg, total_len_m = _compute_altitude_profile(points, token)
-    n_points = len(points)
-
-    # Timeline: frame distribuiti uniformemente lungo la lunghezza totale
+    # Numero frame: clamp fra MIN_FRAMES e MAX_FRAMES
     n_frames = int(duration_s * fps)
-    n_frames = max(24, n_frames)  # almeno 1 s
+    n_frames = max(MIN_FRAMES, min(n_frames, MAX_FRAMES))
 
-    if total_len_m <= 0.0 or n_points < 2:
-        # fallback: nessuna informazione dem, camera costante
-        total_len_m = float(n_points - 1) or 1.0
+    # Indici "float" lungo i segmenti (0 → n-2)
+    idx_float = np.linspace(0, len(points) - 2, n_frames)
 
-    frame_pos = np.linspace(0.0, total_len_m - 1e-6, n_frames)
+    centers: List[Dict[str, float]] = []
+    bearings: List[float] = []
 
-    # distanza cumulativa per ogni punto della traccia
-    cum_dist = np.zeros(n_points, dtype="float32")
-    for i in range(1, n_points):
-        cum_dist[i] = cum_dist[i - 1] + _haversine_m(points[i - 1], points[i])
+    for t in idx_float:
+        i = int(math.floor(t))
+        frac = float(t - i)
 
-    frames: List[np.ndarray] = []
+        a = points[i]
+        b = points[i + 1]
 
-    for s in frame_pos:
-        # Trova il segmento corrispondente alla distanza s
-        idx = int(np.searchsorted(cum_dist, s, side="right") - 1)
-        idx = max(0, min(idx, n_points - 2))
-
-        # frazione lungo il segmento
-        seg_start = cum_dist[idx]
-        seg_len = max(cum_dist[idx + 1] - seg_start, 0.1)
-        frac = float((s - seg_start) / seg_len)
-        frac = max(0.0, min(1.0, frac))
-
-        a = points[idx]
-        b = points[idx + 1]
-
-        # centro camera interpolato lungo la pista
         lat = a["lat"] + (b["lat"] - a["lat"]) * frac
         lon = a["lon"] + (b["lon"] - a["lon"]) * frac
-        center = {"lat": lat, "lon": lon}
 
-        # direzione di marcia: bearing del segmento
-        brng = _bearing(a, b)
+        centers.append({"lat": lat, "lon": lon})
+        bearings.append(_bearing(a, b))
 
-        # pendenza locale
-        local_slope = float(slope_deg[idx])
-        # pitch: più ripido = più "in orizzonte"
-        pitch = MIN_PITCH + min(1.0, local_slope / 30.0) * (MAX_PITCH - MIN_PITCH)
+    # Scarico i frame da Mapbox
+    frames: List[np.ndarray] = []
 
-        # zoom: leggero zoom in sulle parti ripide
-        zoom = BASE_ZOOM + min(1.0, local_slope / 35.0) * 0.6
-
-        img = _fetch_frame(token, center, brng, path_param, pitch, zoom)
+    for c, brng in zip(centers, bearings):
+        img = _fetch_frame(token, c, brng, path_param)
+        img = _apply_snow_filter(img)
         frames.append(np.asarray(img))
 
-    # ----------------- Salvataggio MP4 -----------------
+    # Salvataggio GIF
     out_dir = Path("videos")
     out_dir.mkdir(parents=True, exist_ok=True)
 
     safe_name = "".join(
         ch if ch.isalnum() or ch in "-_" else "_" for ch in str(pista_name).lower()
-    )
-    out_path = out_dir / f"{safe_name}_pov_12s.mp4"
+    ) or "pista"
+    out_path = out_dir / f"{safe_name}_pov_{int(duration_s)}s.gif"
 
-    # H.264, qualità medio-alta
-    with imageio.get_writer(
-        str(out_path),
-        fps=fps,
-        codec="libx264",
-        quality=8,
-        ffmpeg_log_level="error",
-    ) as writer:
-        for frame in frames:
-            writer.append_data(frame)
+    imageio.mimsave(str(out_path), frames, fps=fps)
 
     return str(out_path)
