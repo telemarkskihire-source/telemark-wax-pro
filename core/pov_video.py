@@ -1,9 +1,10 @@
 # core/pov_video.py
-# Generatore POV 3D (12 s) da traccia pista + Mapbox Static API
+# Generatore POV 3D (12 s) da traccia pista con Mapbox Static Images
 #
-# - Usa stile satellitare Mapbox
-# - Muove la "camera" lungo la pista con bearing dinamico
-# - Salva una GIF 12 s in ./videos/<pista>_pov_12s.gif
+# - La camera segue la pista in modo fluido
+# - Nessun overlay "path-..." → niente errori 422
+# - Pitch alto (quasi visuale sciatore)
+# - Export MP4, con fallback automatico a GIF
 
 from __future__ import annotations
 
@@ -12,13 +13,13 @@ import io
 import math
 import os
 from pathlib import Path
-import urllib.parse
 
 import numpy as np
 import requests
 from PIL import Image
 import imageio
 import streamlit as st
+
 
 # -----------------------------------------------------
 # Config generale POV
@@ -30,14 +31,15 @@ DURATION_S = 12.0
 FPS = 20  # più frame = movimento più fluido
 
 STYLE_ID = "mapbox/satellite-v9"  # satellite standard Mapbox
-LINE_COLOR = "ff4422"             # arancione/rosso per la pista
-LINE_WIDTH = 4
-LINE_OPACITY = 0.9                # 0–1
+
+# Parametri "camera"
+ZOOM = 16.3        # abbastanza vicino
+PITCH = 72.0       # visuale molto inclinata (quasi prima persona)
+
 
 # -----------------------------------------------------
 # Utilità
 # -----------------------------------------------------
-
 
 def _get_mapbox_token() -> str:
     """Legge la MAPBOX_API_KEY da st.secrets o ENV."""
@@ -47,7 +49,6 @@ def _get_mapbox_token() -> str:
             return token
     except Exception:
         pass
-
     token = os.environ.get("MAPBOX_API_KEY", "").strip()
     if not token:
         raise RuntimeError(
@@ -59,13 +60,9 @@ def _get_mapbox_token() -> str:
 def _as_points(
     track: Union[Dict[str, Any], Sequence[Dict[str, Any]]]
 ) -> List[Dict[str, float]]:
-    """
-    Normalizza l'input in lista di dict con lat/lon:
-    - GeoJSON Feature LineString
-    - oppure lista di {lat, lon, ...}
-    """
-    # GeoJSON Feature
+    """Normalizza l'input in lista di dict con lat/lon."""
     if isinstance(track, dict) and track.get("type") == "Feature":
+        # GeoJSON LineString
         geom = track.get("geometry") or {}
         if geom.get("type") != "LineString":
             raise ValueError("GeoJSON non è una LineString.")
@@ -75,26 +72,13 @@ def _as_points(
             pts.append({"lat": float(lat), "lon": float(lon)})
         return pts
 
-    # Lista generica di punti
+    # Lista di punti {lat, lon, ...}
     pts: List[Dict[str, float]] = []
     for p in track:  # type: ignore[assignment]
         lat = float(p.get("lat"))  # type: ignore[arg-type]
         lon = float(p.get("lon"))  # type: ignore[arg-type]
         pts.append({"lat": lat, "lon": lon})
     return pts
-
-
-def _resample(points: List[Dict[str, float]], max_points: int) -> List[Dict[str, float]]:
-    """
-    Riduce il numero di punti mantenendo la forma generale della pista.
-    Usato SOLO per il path disegnato da Mapbox (non per l'animazione).
-    """
-    n = len(points)
-    if n <= max_points:
-        return points
-
-    idx = np.linspace(0, n - 1, max_points).astype(int)
-    return [points[i] for i in idx]
 
 
 def _bearing(a: Dict[str, float], b: Dict[str, float]) -> float:
@@ -111,38 +95,20 @@ def _bearing(a: Dict[str, float], b: Dict[str, float]) -> float:
     return (brng + 360.0) % 360.0
 
 
-def _build_path_param(points: List[Dict[str, float]]) -> str:
-    """
-    Costruisce il parametro path-… per la Static API e lo URL-encoda.
-    Usiamo fino a ~40 punti per disegnare la pista.
-    """
-    pts = _resample(points, max_points=40)
-
-    coord_str = ";".join(f"{p['lon']:.5f},{p['lat']:.5f}" for p in pts)
-    raw = f"path-{LINE_WIDTH}+{LINE_COLOR}-{LINE_OPACITY}({coord_str})"
-
-    # 🔥 encoding obbligatorio, altrimenti Mapbox risponde 422
-    encoded = urllib.parse.quote(raw, safe="")
-    return encoded
-
-
 def _fetch_frame(
     token: str,
     center: Dict[str, float],
     bearing: float,
-    path_param: str,
-    zoom: float = 16.3,
-    pitch: float = 72.0,
 ) -> Image.Image:
     """
     Scarica un singolo frame statico da Mapbox.
 
-    zoom 16.3 + pitch 72° → camera bassa, tipo POV sciata (non troppo dall'alto).
+    Usiamo solo il centro della camera: niente overlay → URL corto e robusto.
     """
     url = (
         f"https://api.mapbox.com/styles/v1/{STYLE_ID}/static/"
-        f"{path_param}/"
-        f"{center['lon']:.5f},{center['lat']:.5f},{zoom:.2f},{bearing:.1f},{pitch:.1f}/"
+        f"{center['lon']:.5f},{center['lat']:.5f},"
+        f"{ZOOM:.2f},{bearing:.1f},{PITCH:.1f}/"
         f"{WIDTH}x{HEIGHT}"
         f"?access_token={token}"
     )
@@ -156,7 +122,6 @@ def _fetch_frame(
 # Funzione principale usata da streamlit_app
 # -----------------------------------------------------
 
-
 def generate_pov_video(
     track: Union[Dict[str, Any], Sequence[Dict[str, Any]]],
     pista_name: str,
@@ -164,10 +129,10 @@ def generate_pov_video(
     fps: int = FPS,
 ) -> str:
     """
-    Genera una GIF POV 3D di ~duration_s secondi.
+    Genera un POV 3D di ~duration_s secondi che segue la pista.
 
     track: GeoJSON Feature LineString oppure lista di punti {lat, lon, ...}
-    Ritorna: percorso del file GIF in ./videos/<nome>_pov_12s.gif
+    Ritorna: percorso del file video in ./videos/<nome>_pov_12s.mp4 (o .gif fallback).
     """
     token = _get_mapbox_token()
 
@@ -175,15 +140,11 @@ def generate_pov_video(
     if len(points) < 2:
         raise ValueError("Traccia pista troppo corta per generare un POV.")
 
-    # Path disegnato sulla mappa (usiamo fino a ~40 punti, URL-encoded)
-    path_param = _build_path_param(points)
-
-    # Timeline: ci muoviamo lungo *tutta* la pista
     n_frames = int(duration_s * fps)
     if n_frames < 2:
         n_frames = 2
 
-    # campioniamo tra il primo e il penultimo punto (segmenti a→b)
+    # Campioniamo lungo la linea
     idx_float = np.linspace(0, len(points) - 2, n_frames)
 
     centers: List[Dict[str, float]] = []
@@ -203,20 +164,37 @@ def generate_pov_video(
         bearings.append(_bearing(a, b))
 
     frames: List[np.ndarray] = []
-
     for c, brng in zip(centers, bearings):
-        img = _fetch_frame(token, c, brng, path_param)
+        img = _fetch_frame(token, c, brng)
         frames.append(np.asarray(img))
 
-    # salvataggio GIF
     out_dir = Path("videos")
     out_dir.mkdir(parents=True, exist_ok=True)
 
     safe_name = "".join(
         ch if ch.isalnum() or ch in "-_" else "_" for ch in str(pista_name).lower()
     )
-    out_path = out_dir / f"{safe_name}_pov_12s.gif"
 
-    imageio.mimsave(str(out_path), frames, fps=fps)
+    # -------------------------------------------------
+    # Tentiamo prima MP4; se fallisce → GIF
+    # -------------------------------------------------
+    mp4_path = out_dir / f"{safe_name}_pov_12s.mp4"
+    gif_path = out_dir / f"{safe_name}_pov_12s.gif"
 
-    return str(out_path)
+    try:
+        # imageio utilizza ffmpeg; se non c'è, genererà un errore
+        writer = imageio.get_writer(
+            str(mp4_path),
+            fps=fps,
+            codec="libx264",
+            format="FFMPEG",
+            mode="I",
+        )
+        for frame in frames:
+            writer.append_data(frame)
+        writer.close()
+        return str(mp4_path)
+    except Exception:
+        # fallback sicuro
+        imageio.mimsave(str(gif_path), frames, fps=fps)
+        return str(gif_path)
