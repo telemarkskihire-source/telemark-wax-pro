@@ -1,5 +1,5 @@
 # core/pov_video.py
-# Generatore POV video 3D con Mapbox Static Images
+# Generatore POV video 3D con Mapbox Static Images (GIF)
 #
 # - Input: lista di punti pista [{lat, lon, elev}, ...]
 # - Pulizia salti folli, scelta segmento principale
@@ -10,7 +10,7 @@
 #     * bearing allineato alla direzione della pista
 #     * path rosso della pista intera
 #     * applica filtro "inverno"
-# - Output: MP4 in videos/<safe_name>_pov_12s.mp4
+# - Output: GIF in videos/<safe_name>_pov_12s.gif
 
 from __future__ import annotations
 
@@ -19,12 +19,13 @@ import os
 import math
 from pathlib import Path
 from urllib.parse import quote
+import io
 
 import requests
 import numpy as np
 from PIL import Image, ImageEnhance
+import imageio.v2 as imageio
 import streamlit as st  # per leggere st.secrets
-from moviepy.editor import ImageSequenceClip
 
 UA = {"User-Agent": "telemark-wax-pro/2.0"}
 
@@ -138,7 +139,6 @@ def _resample_by_distance(points: List[Dict[str, float]], n_samples: int) -> Lis
     if len(points) <= n_samples:
         return points
 
-    # distanza cumulativa
     dists = [0.0]
     for i in range(1, len(points)):
         p_prev = points[i - 1]
@@ -189,7 +189,6 @@ def _build_path_overlay(points: List[Dict[str, float]]) -> str:
     downsamplando per non esagerare con la lunghezza dell'URL.
     """
     if len(points) > 80:
-        # downsample per path overlay
         step = max(1, len(points) // 80)
         pts = points[::step]
     else:
@@ -215,7 +214,6 @@ def _fetch_mapbox_frame(
     style = "mapbox/satellite-v9"
 
     overlay_encoded = quote(path_overlay, safe="():,;+-")
-    # center: lon,lat,zoom,bearing,pitch
     center = f"{center_lon},{center_lat},{zoom},{bearing},{pitch}"
 
     url = (
@@ -226,7 +224,7 @@ def _fetch_mapbox_frame(
 
     resp = requests.get(url, headers=UA, timeout=15)
     resp.raise_for_status()
-    img = Image.open(io.BytesIO(resp.content)).convert("RGB")  # type: ignore[name-defined]
+    img = Image.open(io.BytesIO(resp.content)).convert("RGB")
     return img
 
 
@@ -235,21 +233,18 @@ def _fetch_mapbox_frame(
 # ---------------------------------------------------------------------
 def _apply_winter_filter(img: Image.Image) -> Image.Image:
     """
-    Semplice look "invernale":
+    Look "invernale":
     - leggermente desaturato
     - più freddo (canale blu)
     - velo bianco semi-trasparente
     """
-    # desatura leggermente
     enhancer = ImageEnhance.Color(img)
     img = enhancer.enhance(0.85)
 
-    # piccolo boost di blu
     r, g, b = img.split()
     b = ImageEnhance.Brightness(b).enhance(1.1)
     img = Image.merge("RGB", (r, g, b))
 
-    # velo neve
     overlay = Image.new("RGBA", img.size, (230, 240, 255, 70))
     img_rgba = img.convert("RGBA")
     img_rgba = Image.alpha_composite(img_rgba, overlay)
@@ -262,7 +257,7 @@ def _apply_winter_filter(img: Image.Image) -> Image.Image:
 # ---------------------------------------------------------------------
 def generate_pov_video(points: List[Dict[str, Any]], pista_name: str) -> str:
     """
-    Genera un video POV 3D (12 s) con Mapbox e ritorna il path del file MP4.
+    Genera una GIF POV 3D (12 s) con Mapbox e ritorna il path del file GIF.
     """
     if not points or len(points) < 4:
         raise ValueError("Traccia pista insufficiente per creare un POV video.")
@@ -289,10 +284,10 @@ def generate_pov_video(points: List[Dict[str, Any]], pista_name: str) -> str:
     if len(main_seg) < 4:
         raise ValueError("Segmento principale pista troppo corto per POV video.")
 
-    # 2) resample per avere più frame (12 s @ 15 fps ≈ 180 frame)
+    # 2) resample per più frame (12 s @ 15 fps ≈ 180 frame)
     duration_s = 12
     fps = 15
-    n_frames = duration_s * fps  # 180
+    n_frames = duration_s * fps
 
     frames_pts = _resample_by_distance(main_seg, n_frames)
 
@@ -302,19 +297,14 @@ def generate_pov_video(points: List[Dict[str, Any]], pista_name: str) -> str:
     # 4) scarica frame con camera bassa e pitch alto
     frames: List[np.ndarray] = []
 
-    # altezza "percepita": aggiustiamo slightly con zoom (16.8 ≈ 20–30 m)
-    zoom = 16.8
+    zoom = 16.8  # ~20–30 m sopra il terreno
     pitch = 60.0
-
-    # import qui per non creare dipendenza globale di io se non serve
-    import io  # noqa: E402
 
     for i in range(len(frames_pts)):
         p = frames_pts[i]
         lat = float(p["lat"])
         lon = float(p["lon"])
 
-        # direzione lungo pista (usa punto successivo o precedente)
         if i < len(frames_pts) - 1:
             p2 = frames_pts[i + 1]
         else:
@@ -334,7 +324,6 @@ def generate_pov_video(points: List[Dict[str, Any]], pista_name: str) -> str:
             )
             img = _apply_winter_filter(img)
         except Exception:
-            # in caso di errore, ripeti l'ultimo frame valido oppure salta
             if frames:
                 frames.append(frames[-1].copy())
                 continue
@@ -352,16 +341,14 @@ def generate_pov_video(points: List[Dict[str, Any]], pista_name: str) -> str:
     )
     out_dir = Path("videos")
     out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / f"{safe_name}_pov_12s.mp4"
+    out_path = out_dir / f"{safe_name}_pov_12s.gif"
 
-    # 6) crea video MP4
-    clip = ImageSequenceClip(frames, fps=fps)
-    clip.write_videofile(
-        str(out_path),
-        codec="libx264",
-        audio=False,
-        verbose=False,
-        logger=None,
+    # 6) crea GIF animata
+    imageio.mimsave(
+        out_path,
+        frames,
+        duration=1.0 / fps,
+        loop=0,
     )
 
     return str(out_path)
