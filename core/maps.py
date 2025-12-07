@@ -1,26 +1,22 @@
 # core/maps.py
-# Mappa & piste Telemark – versione FULL CORRETTA (v3 + POV friendly)
-#
-# - Snap dinamico in base allo zoom
+# Mappa & piste Telemark – versione FULL STABILE
+# - Snap dinamico
 # - Zoom iniziale vicino (15)
 # - Nessuna duplicazione nomi
-# - Reset selezione pista quando cambi località (niente blob rosso all'avvio)
-# - Esporta sempre ctx["pov_piste_points"] semplificato per POV 2D/3D
+# - Sempre esporta pov_piste_points per POV 2D/3D
 
 from __future__ import annotations
 
 from typing import Dict, Any, List, Tuple, Optional
 import math
-
 import requests
 import streamlit as st
 from streamlit_folium import st_folium
 import folium
 
-UA = {"User-Agent": "telemark-wax-pro/3.1"}
+UA = {"User-Agent": "telemark-wax-pro/3.0"}
 
-BASE_SNAP = 300.0          # raggio snap quando sei vicino (zoom 15+)
-MAX_POV_POINTS = 120       # limitiamo la densità della traccia esportata
+BASE_SNAP = 300.0  # raggio snap quando sei vicino
 
 
 # ----------------------------------------------------------------------
@@ -38,25 +34,6 @@ def _dist_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     )
     c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
     return R * c
-
-
-def _simplify_coords(coords: List[Tuple[float, float]], max_points: int) -> List[Tuple[float, float]]:
-    """
-    Semplifica la lista di coordinate mantenendo max_points punti,
-    distribuiti uniformemente lungo la linea.
-    """
-    n = len(coords)
-    if n <= max_points:
-        return coords
-
-    step = (n - 1) / float(max_points - 1)
-    out: List[Tuple[float, float]] = []
-    for k in range(max_points):
-        idx = int(round(k * step))
-        if idx >= n:
-            idx = n - 1
-        out.append(coords[idx])
-    return out
 
 
 # ----------------------------------------------------------------------
@@ -81,7 +58,7 @@ def _snap_radius(prev: Optional[Dict[str, Any]]) -> float:
 # ----------------------------------------------------------------------
 # Fetch piste da Overpass
 # ----------------------------------------------------------------------
-@st.cache_data(ttl=1800, show_spinner=False)
+@st.cache_data(ttl=1800)
 def _fetch_pistes(lat: float, lon: float, radius_km: float = 5.0):
     radius_m = int(radius_km * 1000)
 
@@ -98,7 +75,7 @@ def _fetch_pistes(lat: float, lon: float, radius_km: float = 5.0):
     try:
         r = requests.post(
             "https://overpass-api.de/api/interpreter",
-            data=q.encode("utf-8"),
+            data=q.encode("utf8"),
             headers=UA,
             timeout=25,
         )
@@ -114,7 +91,7 @@ def _fetch_pistes(lat: float, lon: float, radius_km: float = 5.0):
     names: List[Optional[str]] = []
     count = 0
 
-    def _nm(tags: Optional[Dict[str, Any]]) -> Optional[str]:
+    def _nm(tags):
         if not tags:
             return None
         for k in ("name", "piste:name", "ref"):
@@ -143,7 +120,11 @@ def _fetch_pistes(lat: float, lon: float, radius_km: float = 5.0):
                     continue
                 wid = mem.get("ref")
                 way = next(
-                    (w for w in elements if w.get("type") == "way" and w.get("id") == wid),
+                    (
+                        w
+                        for w in elements
+                        if w.get("type") == "way" and w.get("id") == wid
+                    ),
                     None,
                 )
                 if way:
@@ -167,11 +148,11 @@ def render_map(T, ctx: Dict[str, Any]) -> Dict[str, Any]:
     map_id = str(ctx.get("map_context", "default"))
     map_key = f"map_{map_id}"
     sel_key = f"selected_piste_{map_id}"
-    base_key = f"{map_key}_base_center"
 
     # Località base (centro piste)
     base_lat = float(ctx.get("base_lat", ctx.get("lat", 45.83333)))
     base_lon = float(ctx.get("base_lon", ctx.get("lon", 7.73333)))
+
     ctx["base_lat"] = base_lat
     ctx["base_lon"] = base_lon
 
@@ -179,28 +160,8 @@ def render_map(T, ctx: Dict[str, Any]) -> Dict[str, Any]:
     marker_lat = float(ctx.get("marker_lat", base_lat))
     marker_lon = float(ctx.get("marker_lon", base_lon))
 
-    # Se la località è cambiata significativamente → reset selezione pista
-    prev_base = st.session_state.get(base_key)
-    moved_far = False
-    if isinstance(prev_base, dict):
-        try:
-            d = _dist_m(
-                base_lat,
-                base_lon,
-                float(prev_base.get("lat", base_lat)),
-                float(prev_base.get("lon", base_lon)),
-            )
-            moved_far = d > 1500.0  # > 1.5 km consideriamo "nuova località"
-        except Exception:
-            moved_far = False
-    st.session_state[base_key] = {"lat": base_lat, "lon": base_lon}
-
-    if moved_far:
-        st.session_state[sel_key] = None
-        ctx["selected_piste_name"] = None
-
-    # Nome pista selezionata
-    selected = st.session_state.get(sel_key, ctx.get("selected_piste_name"))
+    # Nome pista selezionata (NON pre-selezioniamo niente di default)
+    selected = st.session_state.get(sel_key) or ctx.get("selected_piste_name") or None
 
     # Carica piste
     count, polylines, names = _fetch_pistes(base_lat, base_lon)
@@ -213,14 +174,14 @@ def render_map(T, ctx: Dict[str, Any]) -> Dict[str, Any]:
     prev = st.session_state.get(map_key)
     radius = _snap_radius(prev)
 
-    # Se c'è un click → snap sulla pista più vicina
+    # Se c'è un click → snap
     if isinstance(prev, dict) and polylines:
         click = prev.get("last_clicked")
         if click:
             c_lat = float(click["lat"])
             c_lon = float(click["lng"])
             best_d = 1e12
-            best_nm: Optional[str] = None
+            best_nm = None
             best_lat = c_lat
             best_lon = c_lon
 
@@ -254,8 +215,10 @@ def render_map(T, ctx: Dict[str, Any]) -> Dict[str, Any]:
 
     folium.TileLayer("OpenStreetMap", name="Strade").add_to(m)
     folium.TileLayer(
-        tiles="https://server.arcgisonline.com/ArcGIS/rest/services/"
-        "World_Imagery/MapServer/tile/{z}/{y}/{x}",
+        tiles=(
+            "https://server.arcgisonline.com/ArcGIS/rest/services/"
+            "World_Imagery/MapServer/tile/{z}/{y}/{x}"
+        ),
         attr="Esri",
         name="Satellite",
     ).add_to(m)
@@ -263,7 +226,7 @@ def render_map(T, ctx: Dict[str, Any]) -> Dict[str, Any]:
     # Disegno piste
     added_labels = set()
     for coords, nm in zip(polylines, names):
-        is_sel = (nm is not None) and (nm == selected)
+        is_sel = (nm == selected)
 
         folium.PolyLine(
             locations=coords,
@@ -272,7 +235,7 @@ def render_map(T, ctx: Dict[str, Any]) -> Dict[str, Any]:
             opacity=1 if is_sel else 0.6,
         ).add_to(m)
 
-        # Nome pista una sola volta (solo se ha nome)
+        # Nome pista una sola volta
         if nm and nm not in added_labels:
             mid = coords[len(coords) // 2]
             folium.Marker(
@@ -280,7 +243,7 @@ def render_map(T, ctx: Dict[str, Any]) -> Dict[str, Any]:
                 icon=folium.DivIcon(
                     html=(
                         "<div style='font-size:10px;color:white;"
-                        "text-shadow:0 0 3px black; background:rgba(0,0,0,.35);"
+                        "text-shadow:0 0 3px black; background:rgba(0,0,0,.3);"
                         "padding:1px 3px;border-radius:3px;'>"
                         f"{nm}</div>"
                     )
@@ -288,7 +251,7 @@ def render_map(T, ctx: Dict[str, Any]) -> Dict[str, Any]:
             ).add_to(m)
             added_labels.add(nm)
 
-    # Marker utente (centro click / snap)
+    # Marker utente
     folium.Marker(
         location=[marker_lat, marker_lon],
         icon=folium.Icon(color="red", icon="flag"),
@@ -296,6 +259,7 @@ def render_map(T, ctx: Dict[str, Any]) -> Dict[str, Any]:
 
     # Render mappa
     st_folium(m, height=450, key=map_key)
+
     st.caption(f"Piste trovate: {count} — Snap ≈ {int(radius)} m")
 
     # Selettore da lista piste
@@ -336,8 +300,9 @@ def render_map(T, ctx: Dict[str, Any]) -> Dict[str, Any]:
     if selected:
         for coords, nm in zip(polylines, names):
             if nm == selected:
-                simp = _simplify_coords(coords, MAX_POV_POINTS)
-                pov_points = [{"lat": lat, "lon": lon, "elev": 0.0} for lat, lon in simp]
+                pov_points = [
+                    {"lat": lat, "lon": lon, "elev": 0.0} for lat, lon in coords
+                ]
                 break
 
     ctx["pov_piste_name"] = selected
