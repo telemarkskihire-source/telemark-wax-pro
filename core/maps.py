@@ -1,311 +1,269 @@
-# core/maps.py
-# Mappa & piste Telemark – versione FULL STABILE
-# - Snap dinamico
-# - Zoom iniziale vicino (15)
-# - Nessuna duplicazione nomi
-# - Sempre esporta pov_piste_points per POV 2D/3D
+# core/pov_video.py
+# POV 3D “in stile sciatore” basato su Mapbox Static API
+#
+# - Input: traccia pista (GeoJSON LineString oppure lista di dict {lat, lon, ...})
+# - Output: GIF 12 s salvata in ./videos/<nome_pista>_pov_12s.gif
+#
+# Nota:
+#  - Usiamo solo la camera 3D (zoom + bearing + pitch), senza overlay path,
+#    per evitare errori 422 dovuti a URL troppo lunghi.
+#  - Pitch è tenuto <= 60° (limite Mapbox) → niente più 422.
+#  - I frame sono distribuiti a velocità costante lungo la pista (in metri).
 
 from __future__ import annotations
 
-from typing import Dict, Any, List, Tuple, Optional
+from typing import Any, Dict, List, Sequence, Union
+import io
 import math
+import os
+from pathlib import Path
+
+import numpy as np
 import requests
+from PIL import Image
+import imageio
 import streamlit as st
-from streamlit_folium import st_folium
-import folium
-
-UA = {"User-Agent": "telemark-wax-pro/3.0"}
-
-BASE_SNAP = 300.0  # raggio snap quando sei vicino
 
 
-# ----------------------------------------------------------------------
-# Utility distanza
-# ----------------------------------------------------------------------
-def _dist_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    R = 6371000.0
-    p1 = math.radians(lat1)
-    p2 = math.radians(lat2)
-    dlat = math.radians(lat2 - lat1)
-    dlon = math.radians(lon2 - lon1)
-    a = (
-        math.sin(dlat / 2) ** 2
-        + math.cos(p1) * math.cos(p2) * math.sin(dlon / 2) ** 2
-    )
-    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
-    return R * c
+# -----------------------------------------------------
+# Config POV
+# -----------------------------------------------------
+
+# Risoluzione video (consigliato <= 1280x1280 per Mapbox)
+WIDTH = 1280
+HEIGHT = 720
+
+# Durata e fluidità
+DURATION_S = 12.0
+FPS = 20  # 20 fps → 240 frame ~ fluido ma non troppo pesante
+
+# Camera “sciatore”
+STYLE_ID = "mapbox/satellite-v9"
+ZOOM = 16.3          # abbastanza vicino alla pista
+PITCH = 55.0         # <= 60° (limite Mapbox), visuale con orizzonte
+# Bearing dinamico, calcolato segmento per segmento
+
+# Eventuale filtro “freddo neve” (per ora disattivato)
+ENABLE_SNOW_FILTER = False
 
 
-# ----------------------------------------------------------------------
-# Snap dinamico basato sullo zoom
-# ----------------------------------------------------------------------
-def _snap_radius(prev: Optional[Dict[str, Any]]) -> float:
-    if not isinstance(prev, dict):
-        return BASE_SNAP
-    z = prev.get("zoom")
-    if not isinstance(z, (int, float)):
-        return BASE_SNAP
+# -----------------------------------------------------
+# Utility generali
+# -----------------------------------------------------
 
-    if z <= 10:
-        return 2500
-    if z <= 12:
-        return 1500
-    if z <= 14:
-        return 600
-    return BASE_SNAP
-
-
-# ----------------------------------------------------------------------
-# Fetch piste da Overpass
-# ----------------------------------------------------------------------
-@st.cache_data(ttl=1800)
-def _fetch_pistes(lat: float, lon: float, radius_km: float = 5.0):
-    radius_m = int(radius_km * 1000)
-
-    q = f"""
-    [out:json][timeout:25];
-    (
-      way["piste:type"="downhill"](around:{radius_m},{lat},{lon});
-      relation["piste:type"="downhill"](around:{radius_m},{lat},{lon});
-    );
-    (._;>;);
-    out body;
-    """
-
+def _get_mapbox_token() -> str:
+    """Legge MAPBOX_API_KEY da st.secrets o ENV."""
     try:
-        r = requests.post(
-            "https://overpass-api.de/api/interpreter",
-            data=q.encode("utf8"),
-            headers=UA,
-            timeout=25,
-        )
-        r.raise_for_status()
-        js = r.json()
+        token = str(st.secrets.get("MAPBOX_API_KEY", "")).strip()
+        if token:
+            return token
     except Exception:
-        return 0, [], []
+        pass
 
-    elements = js.get("elements", [])
-    nodes = {e["id"]: e for e in elements if e.get("type") == "node"}
+    token = os.environ.get("MAPBOX_API_KEY", "").strip()
+    if not token:
+        raise RuntimeError(
+            "MAPBOX_API_KEY non configurata in st.secrets o come variabile d'ambiente."
+        )
+    return token
 
-    polylines: List[List[Tuple[float, float]]] = []
-    names: List[Optional[str]] = []
-    count = 0
 
-    def _nm(tags):
-        if not tags:
-            return None
-        for k in ("name", "piste:name", "ref"):
-            v = tags.get(k)
-            if v:
-                return str(v).strip()
-        return None
+def _as_points(track: Union[Dict[str, Any], Sequence[Dict[str, Any]]]) -> List[Dict[str, float]]:
+    """Normalizza l'input in lista di dict {lat, lon}."""
+    # Caso GeoJSON Feature LineString
+    if isinstance(track, dict) and track.get("type") == "Feature":
+        geom = track.get("geometry") or {}
+        if geom.get("type") != "LineString":
+            raise ValueError("GeoJSON deve essere una LineString per il POV.")
+        coords = geom.get("coordinates") or []
+        pts: List[Dict[str, float]] = []
+        for lon, lat in coords:
+            pts.append({"lat": float(lat), "lon": float(lon)})
+        return pts
 
-    for el in elements:
-        if el.get("type") not in ("way", "relation"):
-            continue
-        tags = el.get("tags") or {}
-        if tags.get("piste:type") != "downhill":
-            continue
+    # Caso lista di punti generica
+    pts: List[Dict[str, float]] = []
+    for p in track:  # type: ignore[assignment]
+        lat = float(p.get("lat"))  # type: ignore[arg-type]
+        lon = float(p.get("lon"))  # type: ignore[arg-type]
+        pts.append({"lat": lat, "lon": lon})
+    return pts
 
-        coords: List[Tuple[float, float]] = []
 
-        if el["type"] == "way":
-            for nid in el.get("nodes", []):
-                nd = nodes.get(nid)
-                if nd:
-                    coords.append((nd["lat"], nd["lon"]))
+def _haversine_m(a: Dict[str, float], b: Dict[str, float]) -> float:
+    """Distanza geodetica in metri tra due punti lat/lon."""
+    R = 6371000.0
+    lat1 = math.radians(a["lat"])
+    lat2 = math.radians(b["lat"])
+    dlat = lat2 - lat1
+    dlon = math.radians(b["lon"] - a["lon"])
+    h = (
+        math.sin(dlat / 2.0) ** 2
+        + math.cos(lat1) * math.cos(lat2) * math.sin(dlon / 2.0) ** 2
+    )
+    return 2.0 * R * math.atan2(math.sqrt(h), math.sqrt(1.0 - h))
+
+
+def _bearing(a: Dict[str, float], b: Dict[str, float]) -> float:
+    """Azimut (0–360°) da a → b."""
+    lat1 = math.radians(a["lat"])
+    lat2 = math.radians(b["lat"])
+    dlon = math.radians(b["lon"] - a["lon"])
+    x = math.sin(dlon) * math.cos(lat2)
+    y = math.cos(lat1) * math.sin(lat2) - math.sin(lat1) * math.cos(lat2) * math.cos(dlon)
+    brng = math.degrees(math.atan2(x, y))
+    return (brng + 360.0) % 360.0
+
+
+def _build_centers_and_bearings(
+    points: List[Dict[str, float]],
+    n_frames: int,
+) -> List[Dict[str, float]]:
+    """
+    Costruisce n_frames posizioni camera lungo la pista a velocità costante.
+
+    Usiamo la distanza metrica cumulata così ogni frame avanza
+    la stessa distanza lungo la LineString (non il stesso indice).
+    La bearing del frame k è data dal segmento locale (a→b).
+    """
+    if len(points) < 2:
+        raise ValueError("Servono almeno 2 punti per calcolare un POV.")
+
+    # Distanze cumulative lungo la traccia
+    dists = [0.0]
+    for i in range(1, len(points)):
+        d = _haversine_m(points[i - 1], points[i])
+        dists.append(dists[-1] + max(d, 0.01))  # evitiamo segmenti a 0
+
+    total = dists[-1] or 1.0  # evitare divisioni per 0
+    centers: List[Dict[str, float]] = []
+    bearings: List[float] = []
+
+    # Per ogni frame, distanza target lungo la pista
+    for frame_idx in range(n_frames):
+        t = frame_idx / max(1, n_frames - 1)
+        target = t * total
+
+        # Trova il segmento in cui cade "target"
+        j = 0
+        while j < len(dists) - 2 and dists[j + 1] < target:
+            j += 1
+
+        a = points[j]
+        b = points[j + 1]
+        seg_len = dists[j + 1] - dists[j]
+        if seg_len <= 0:
+            frac = 0.0
         else:
-            for mem in el.get("members", []):
-                if mem.get("type") != "way":
-                    continue
-                wid = mem.get("ref")
-                way = next(
-                    (
-                        w
-                        for w in elements
-                        if w.get("type") == "way" and w.get("id") == wid
-                    ),
-                    None,
-                )
-                if way:
-                    for nid in way.get("nodes", []):
-                        nd = nodes.get(nid)
-                        if nd:
-                            coords.append((nd["lat"], nd["lon"]))
+            frac = (target - dists[j]) / seg_len
 
-        if len(coords) >= 2:
-            polylines.append(coords)
-            names.append(_nm(tags))
-            count += 1
+        lat = a["lat"] + (b["lat"] - a["lat"]) * frac
+        lon = a["lon"] + (b["lon"] - a["lon"]) * frac
 
-    return count, polylines, names
+        centers.append({"lat": lat, "lon": lon})
+        bearings.append(_bearing(a, b))
+
+    # Attacchiamo la bearing dentro ai dict per comodità
+    for c, br in zip(centers, bearings):
+        c["bearing"] = br
+
+    return centers
 
 
-# ----------------------------------------------------------------------
-# RENDER MAPPA COMPLETA
-# ----------------------------------------------------------------------
-def render_map(T, ctx: Dict[str, Any]) -> Dict[str, Any]:
-    map_id = str(ctx.get("map_context", "default"))
-    map_key = f"map_{map_id}"
-    sel_key = f"selected_piste_{map_id}"
+def _fetch_frame(token: str, center: Dict[str, float]) -> Image.Image:
+    """
+    Scarica un singolo frame statico da Mapbox.
 
-    # Località base (centro piste)
-    base_lat = float(ctx.get("base_lat", ctx.get("lat", 45.83333)))
-    base_lon = float(ctx.get("base_lon", ctx.get("lon", 7.73333)))
+    Usiamo solo la camera (lon,lat,zoom,bearing,pitch) senza overlay path,
+    per restare con URL corti e stabili.
+    """
+    lon = center["lon"]
+    lat = center["lat"]
+    bearing = center.get("bearing", 0.0)
 
-    ctx["base_lat"] = base_lat
-    ctx["base_lon"] = base_lon
+    # Pitch clampato a 0–60° per rispettare i vincoli Mapbox
+    pitch = max(0.0, min(PITCH, 60.0))
 
-    # Marker visuale
-    marker_lat = float(ctx.get("marker_lat", base_lat))
-    marker_lon = float(ctx.get("marker_lon", base_lon))
-
-    # Nome pista selezionata (NON pre-selezioniamo niente di default)
-    selected = st.session_state.get(sel_key) or ctx.get("selected_piste_name") or None
-
-    # Carica piste
-    count, polylines, names = _fetch_pistes(base_lat, base_lon)
-
-    # Lista piste con nome
-    named = [(c, n) for c, n in zip(polylines, names) if n]
-    unique_names = sorted({n for _, n in named})
-
-    # Snap dinamico
-    prev = st.session_state.get(map_key)
-    radius = _snap_radius(prev)
-
-    # Se c'è un click → snap
-    if isinstance(prev, dict) and polylines:
-        click = prev.get("last_clicked")
-        if click:
-            c_lat = float(click["lat"])
-            c_lon = float(click["lng"])
-            best_d = 1e12
-            best_nm = None
-            best_lat = c_lat
-            best_lon = c_lon
-
-            for coords, nm in zip(polylines, names):
-                for lat, lon in coords:
-                    d = _dist_m(c_lat, c_lon, lat, lon)
-                    if d < best_d:
-                        best_d = d
-                        best_lat = lat
-                        best_lon = lon
-                        best_nm = nm
-
-            if best_d <= radius:
-                marker_lat = best_lat
-                marker_lon = best_lon
-                if best_nm:
-                    selected = best_nm
-
-    # Zoom iniziale
-    zoom = 15
-    if isinstance(prev, dict) and isinstance(prev.get("zoom"), (int, float)):
-        zoom = float(prev["zoom"])
-
-    # Mappa Folium
-    m = folium.Map(
-        location=[marker_lat, marker_lon],
-        zoom_start=zoom,
-        tiles=None,
-        control_scale=True,
+    url = (
+        f"https://api.mapbox.com/styles/v1/{STYLE_ID}/static/"
+        f"{lon:.5f},{lat:.5f},{ZOOM:.2f},{bearing:.1f},{pitch:.1f}/"
+        f"{WIDTH}x{HEIGHT}"
+        f"?access_token={token}"
     )
 
-    folium.TileLayer("OpenStreetMap", name="Strade").add_to(m)
-    folium.TileLayer(
-        tiles=(
-            "https://server.arcgisonline.com/ArcGIS/rest/services/"
-            "World_Imagery/MapServer/tile/{z}/{y}/{x}"
-        ),
-        attr="Esri",
-        name="Satellite",
-    ).add_to(m)
+    r = requests.get(url, timeout=25)
+    r.raise_for_status()
+    img = Image.open(io.BytesIO(r.content)).convert("RGB")
+    return img
 
-    # Disegno piste
-    added_labels = set()
-    for coords, nm in zip(polylines, names):
-        is_sel = (nm == selected)
 
-        folium.PolyLine(
-            locations=coords,
-            color="red" if is_sel else "blue",
-            weight=6 if is_sel else 3,
-            opacity=1 if is_sel else 0.6,
-        ).add_to(m)
+def _apply_snow_filter(img: Image.Image) -> Image.Image:
+    """
+    Hook per un eventuale filtro “freddo/neve”.
+    Per ora è disattivato (ENABLE_SNOW_FILTER=False) per non sbiadire la pista.
+    """
+    if not ENABLE_SNOW_FILTER:
+        return img
 
-        # Nome pista una sola volta
-        if nm and nm not in added_labels:
-            mid = coords[len(coords) // 2]
-            folium.Marker(
-                location=[mid[0], mid[1]],
-                icon=folium.DivIcon(
-                    html=(
-                        "<div style='font-size:10px;color:white;"
-                        "text-shadow:0 0 3px black; background:rgba(0,0,0,.3);"
-                        "padding:1px 3px;border-radius:3px;'>"
-                        f"{nm}</div>"
-                    )
-                ),
-            ).add_to(m)
-            added_labels.add(nm)
+    arr = np.asarray(img).astype("float32") / 255.0
 
-    # Marker utente
-    folium.Marker(
-        location=[marker_lat, marker_lon],
-        icon=folium.Icon(color="red", icon="flag"),
-    ).add_to(m)
+    # Tono leggermente più freddo + un filo di contrasto
+    arr = (arr - 0.5) * 1.05 + 0.5
+    arr[..., 0] *= 0.98  # meno rosso
+    arr[..., 2] *= 1.03  # un po' più blu
+    arr = np.clip(arr, 0.0, 1.0)
 
-    # Render mappa
-    st_folium(m, height=450, key=map_key)
+    arr = (arr * 255.0).astype("uint8")
+    return Image.fromarray(arr, mode="RGB")
 
-    st.caption(f"Piste trovate: {count} — Snap ≈ {int(radius)} m")
 
-    # Selettore da lista piste
-    use_list = st.checkbox(
-        "Attiva selezione da lista piste",
-        value=False,
-        key=f"use_list_{map_id}",
+# -----------------------------------------------------
+# Funzione principale
+# -----------------------------------------------------
+
+def generate_pov_video(
+    track: Union[Dict[str, Any], Sequence[Dict[str, Any]]],
+    pista_name: str,
+    duration_s: float = DURATION_S,
+    fps: int = FPS,
+) -> str:
+    """
+    Genera una GIF POV 3D di ~duration_s secondi.
+
+    Parametri:
+        track      - GeoJSON LineString oppure lista di dict {lat, lon, ...}
+        pista_name - nome usato per il file su disco
+        duration_s - durata desiderata (default 12 s)
+        fps        - frame per secondo (default 20)
+
+    Ritorna:
+        percorso assoluto del file GIF generato in ./videos/<nome>_pov_12s.gif
+    """
+    token = _get_mapbox_token()
+
+    points = _as_points(track)
+    if len(points) < 2:
+        raise ValueError("Traccia pista troppo corta per generare un POV.")
+
+    n_frames = int(max(1, duration_s * fps))
+
+    centers = _build_centers_and_bearings(points, n_frames)
+
+    frames: List[np.ndarray] = []
+    for c in centers:
+        img = _fetch_frame(token, c)
+        img = _apply_snow_filter(img)
+        frames.append(np.asarray(img))
+
+    # Salvataggio GIF
+    out_dir = Path("videos")
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    safe_name = "".join(
+        ch if ch.isalnum() or ch in "-_" else "_" for ch in str(pista_name).lower()
     )
+    out_path = out_dir / f"{safe_name}_pov_12s.gif"
 
-    if use_list and unique_names:
-        default = unique_names.index(selected) if selected in unique_names else 0
-        with st.expander("Seleziona pista dalla lista"):
-            chosen = st.selectbox(
-                "Pista", unique_names, index=default, key=f"list_{map_id}"
-            )
-        if chosen != selected:
-            selected = chosen
-            for coords, nm in named:
-                if nm == selected:
-                    mid = coords[len(coords) // 2]
-                    marker_lat, marker_lon = mid
-                    break
+    imageio.mimsave(str(out_path), frames, fps=fps)
 
-    # Salvo in ctx e sessione
-    ctx["marker_lat"] = marker_lat
-    ctx["marker_lon"] = marker_lon
-    ctx["lat"] = marker_lat
-    ctx["lon"] = marker_lon
-    ctx["selected_piste_name"] = selected
-    st.session_state[sel_key] = selected
-
-    st.markdown(f"**Pista selezionata:** {selected or 'Nessuna'}")
-
-    # ------------------------------------------------------------------
-    # ESPORTAZIONE PER POV 2D/3D
-    # ------------------------------------------------------------------
-    pov_points = None
-    if selected:
-        for coords, nm in zip(polylines, names):
-            if nm == selected:
-                pov_points = [
-                    {"lat": lat, "lon": lon, "elev": 0.0} for lat, lon in coords
-                ]
-                break
-
-    ctx["pov_piste_name"] = selected
-    ctx["pov_piste_points"] = pov_points
-
-    return ctx
+    return str(out_path)
