@@ -1,5 +1,5 @@
 # core/pov_video.py
-# POV VIDEO 3D con Mapbox Static API -> GIF animata
+# POV VIDEO 3D con Mapbox Static API -> MP4 + GIF
 #
 # - Nessuna dipendenza da moviepy (usa solo requests + Pillow + imageio).
 # - Usa i punti pista (lat, lon, elev) per calcolare la pendenza locale.
@@ -7,7 +7,9 @@
 #   di muro / traverso / falsopiano.
 # - Aggiunge un piccolo HUD con la pendenza istantanea in alto a sinistra.
 #
-# Output: videos/<nome_pista>_pov_12s.gif
+# Output:
+#   videos/<nome_pista>_pov_12s.mp4  (principale)
+#   videos/<nome_pista>_pov_12s.gif  (opzionale / share)
 #
 # Uso:
 #   from core import pov_video as pov_video_mod
@@ -30,7 +32,6 @@ from PIL import Image, ImageDraw
 import imageio.v2 as imageio
 import streamlit as st
 
-
 # ------------------------------------------------------------
 # CONFIGURAZIONE BASE
 # ------------------------------------------------------------
@@ -41,14 +42,14 @@ TOTAL_SECONDS = 12.0
 # Numero frame (più alto = più fluido)
 TOTAL_FRAMES = 120  # ~10 fps
 
-# Dimensioni GIF
+# Dimensioni frame
 FRAME_WIDTH = 800
 FRAME_HEIGHT = 450
 
 # Camera: zoom fisso abbastanza vicino al terreno
 CAMERA_ZOOM = 16.0          # vicino al suolo
-PITCH_MIN = 30.0            # falsopiano
-PITCH_MAX = 60.0            # muro ripido
+PITCH_MIN = 28.0            # falsopiano
+PITCH_MAX = 62.0            # muro ripido
 
 # Piccola oscillazione cinematografica sul bearing
 ROLL_AMPLITUDE_DEG = 3.0
@@ -246,7 +247,6 @@ def _resample_along_path(
         p = points[0]
         return [(p["lat"], p["lon"], 0.0, 0.0)] * n_frames
 
-    # distanze cumulate e pendenze dei segmenti
     dists = [0.0]
     slopes_deg: List[float] = []
 
@@ -256,11 +256,11 @@ def _resample_along_path(
         horiz = max(_dist_m(a["lat"], a["lon"], b["lat"], b["lon"]), 1e-3)
         dz = float(b.get("elev", 0.0)) - float(a.get("elev", 0.0))
 
-        # vogliamo pendenza positiva in discesa
+        # pendenza positiva in discesa
         slope_rad = math.atan2(-dz, horiz)
         slope = math.degrees(slope_rad)
         if slope < 0:
-            slope = 0.0  # niente pendenza "in salita" nel POV
+            slope = 0.0
         slopes_deg.append(slope)
 
         dists.append(dists[-1] + horiz)
@@ -278,7 +278,6 @@ def _resample_along_path(
         s = ease(t)
         target = s * total
 
-        # trova il segmento relativo
         j = 1
         while j < len(dists) and dists[j] < target:
             j += 1
@@ -346,8 +345,9 @@ def generate_pov_video(
     overwrite: bool = True,
 ) -> str:
     """
-    Genera (o rigenera) una GIF POV 3D 12s per la pista.
-    Restituisce il path del file GIF sul disco.
+    Genera (o rigenera) un POV 3D 12s per la pista.
+    Crea sia MP4 che GIF, ma restituisce il path dell'MP4
+    (da passare a st.video).
 
     "data" può essere:
       - lista di punti {"lat", "lon", "elev"}
@@ -363,10 +363,11 @@ def generate_pov_video(
     safe_name = "".join(
         c if c.isalnum() or c in "-_" else "_" for c in str(pista_name).lower()
     )
-    out_path = out_dir / f"{safe_name}_pov_12s.gif"
+    out_gif = out_dir / f"{safe_name}_pov_12s.gif"
+    out_mp4 = out_dir / f"{safe_name}_pov_12s.mp4"
 
-    if out_path.exists() and not overwrite:
-        return str(out_path)
+    if out_mp4.exists() and not overwrite:
+        return str(out_mp4)
 
     # normalizza e pulisci punti
     raw_points = _normalize_input(data)
@@ -412,16 +413,27 @@ def generate_pov_video(
         # HUD pendenza in alto a sinistra
         draw = ImageDraw.Draw(img)
         hud_text = f"{slope_deg:.0f}°"
-        # piccolo box scuro semi-trasparente (simulato)
         box_w, box_h = 60, 28
-        draw.rectangle((8, 8, 8 + box_w, 8 + box_h), fill=(0, 0, 0, 128))
+        draw.rectangle((8, 8, 8 + box_w, 8 + box_h), fill=(0, 0, 0))
         draw.text((14, 12), hud_text, fill=(255, 255, 255))
 
         imgs.append(img)
 
     frames_np = [np.asarray(im) for im in imgs]
     frame_duration = TOTAL_SECONDS / max(len(frames_np), 1)
+    fps = len(frames_np) / TOTAL_SECONDS
 
-    imageio.mimsave(str(out_path), frames_np, duration=frame_duration)
+    # GIF (loop infinito)
+    imageio.mimsave(str(out_gif), frames_np, duration=frame_duration)
 
-    return str(out_path)
+    # MP4 per st.video
+    with imageio.get_writer(
+        str(out_mp4),
+        fps=fps,
+        codec="libx264",
+        quality=8,
+    ) as writer:
+        for fr in frames_np:
+            writer.append_data(fr)
+
+    return str(out_mp4)
