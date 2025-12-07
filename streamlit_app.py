@@ -439,7 +439,53 @@ if page == "Località & Mappa":
         st.info(f"POV non disponibile per questa località: {e}")
 
     # 3) GIF POV 3D (12 s)
-    render_pov_video_section(T, ctx, key_suffix="local")
+    def render_pov_video_section(T: Dict[str, Any], ctx: Dict[str, Any], key_suffix: str) -> None:
+    """
+    Video POV 3D (12 s) stile volo d'uccello.
+
+    Usa:
+      ctx["pov_piste_points"] = [
+        {"lat": float, "lon": float, "elev": float}, ...
+      ]
+
+    Genera una GIF 12 s salvata in /videos e la mostra con st.image.
+    """
+    points = ctx.get("pov_piste_points") or []
+    if not points:
+        st.info("Video POV non disponibile: nessuna pista estratta.")
+        return
+
+    # nome pista
+    pista_name = (
+        ctx.get("pov_piste_name")
+        or ctx.get("selected_piste_name")
+        or T.get("selected_slope", "pista")
+    )
+
+    st.markdown("#### 🎬 Video POV 3D (12 s)")
+
+    if st.button("Genera / aggiorna video POV", key=f"btn_pov_video_{key_suffix}"):
+        with st.spinner("Genero il video POV della pista…"):
+            try:
+                video_path = pov_video_mod.generate_pov_video(points, pista_name)
+                st.success("Video POV generato.")
+                # GIF animata
+                st.image(video_path)
+            except Exception as e:
+                st.error(f"Impossibile generare il video POV: {e}")
+    else:
+        # se la GIF esiste già, la mostro comunque (cache su disco)
+        try:
+            from pathlib import Path
+
+            safe_name = "".join(
+                c if c.isalnum() or c in "-_" else "_" for c in str(pista_name).lower()
+            )
+            candidate = Path("videos") / f"{safe_name}_pov_12s.gif"
+            if candidate.exists():
+                st.image(str(candidate))
+        except Exception:
+            pass
 
     # ---------------- METEO LOCALITÀ ----------------
     st.markdown("## 4) Meteo località & profilo giornata")
