@@ -1,43 +1,61 @@
 # core/pov_video.py
-# Generatore POV video 3D con Mapbox Static Images (GIF)
+# POV VIDEO 3D con Mapbox Static API -> GIF animata
 #
-# - Input: lista di punti pista [{lat, lon, elev}, ...]
-# - Pulizia salti folli, scelta segmento principale
-# - Resample in ~360 frame (12 s a 30 fps)
-# - Per ogni frame:
-#     * chiama Mapbox Static API (satellite, pitch alto, zoom molto ravvicinato)
-#     * centra la camera sul punto corrente
-#     * bearing allineato alla direzione della pista
-#     * path rosso della pista intera
-#     * applica filtro "invernale" marcato
-# - Output: GIF in videos/<safe_name>_pov_12s.gif
+# - Nessuna dipendenza da moviepy (usa solo requests + Pillow + imageio).
+# - Prende i punti pista (ctx["pov_piste_points"] o GeoJSON Feature) e
+#   genera una GIF di ~12s in stile "volo d'uccello" sulla pista.
+# - Camera bassa (zoom alto + pitch 60°) e movimento più fluido
+#   grazie a frame più numerosi e time-easing.
+#
+# Output: videos/<nome_pista>_pov_12s.gif
+#
+# Uso:
+#   from core import pov_video as pov_video_mod
+#   path = pov_video_mod.generate_pov_video(points_or_feature, "Del Bosco")
 
 from __future__ import annotations
 
-from typing import List, Dict, Any, Optional
-import os
-import math
 from pathlib import Path
-from urllib.parse import quote
+from typing import Any, Dict, List, Sequence, Tuple, Union, Optional
+import math
 import io
 
 import requests
 import numpy as np
-from PIL import Image, ImageEnhance
-import imageio.v2 as imageio
-import streamlit as st  # per leggere st.secrets
+from PIL import Image
+import imageio.v2 as imageio  # v2 API compatibile
+import streamlit as st  # solo per leggere st.secrets
 
+
+# ------------------------------------------------------------
+# CONFIGURAZIONE BASE
+# ------------------------------------------------------------
 UA = {"User-Agent": "telemark-wax-pro/2.0"}
 
+# Durata target del POV
+TOTAL_SECONDS = 12.0
+# Numero frame (più alto = più fluido)
+TOTAL_FRAMES = 120  # circa 10 fps su 12 s
 
-# ---------------------------------------------------------------------
+# Dimensioni GIF
+FRAME_WIDTH = 800
+FRAME_HEIGHT = 450
+
+# Parametri camera (visuale bassa + effetto 3D)
+CAMERA_ZOOM = 16.0   # zoom alto -> vicino al terreno
+CAMERA_PITCH = 60.0  # massimo consentito da Mapbox Static (più "prima persona")
+ROLL_AMPLITUDE_DEG = 3.0  # piccolo roll sinusoidale per effetto cinema (simulato via bearing)
+
+
+# ------------------------------------------------------------
 # MAPBOX TOKEN
-# ---------------------------------------------------------------------
+# ------------------------------------------------------------
 def _get_mapbox_token() -> Optional[str]:
     """
-    Cerca la MAPBOX_API_KEY in:
+    Ritorna la Mapbox API key se configurata in:
       - st.secrets["MAPBOX_API_KEY"]
       - variabile d'ambiente MAPBOX_API_KEY
+    Altrimenti None.
     """
     try:
         if "MAPBOX_API_KEY" in st.secrets:
@@ -47,13 +65,15 @@ def _get_mapbox_token() -> Optional[str]:
     except Exception:
         pass
 
+    import os
+
     token = os.environ.get("MAPBOX_API_KEY", "").strip()
     return token or None
 
 
-# ---------------------------------------------------------------------
-# GEO UTILS
-# ---------------------------------------------------------------------
+# ------------------------------------------------------------
+# UTILS GEO
+# ------------------------------------------------------------
 def _dist_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     """Distanza in metri tra due punti lat/lon (haversine semplificata)."""
     R = 6371000.0
@@ -71,24 +91,27 @@ def _dist_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
 
 
 def _bearing_deg(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    """Bearing (gradi) da (lat1,lon1) a (lat2,lon2)."""
+    """Bearing (gradi) da punto 1 a punto 2 (0 = nord, 90 = est)."""
     phi1 = math.radians(lat1)
     phi2 = math.radians(lat2)
     dlambda = math.radians(lon2 - lon1)
-    y = math.sin(dlambda) * math.cos(phi2)
-    x = math.cos(phi1) * math.sin(phi2) - math.sin(phi1) * math.cos(phi2) * math.cos(
+
+    x = math.sin(dlambda) * math.cos(phi2)
+    y = math.cos(phi1) * math.sin(phi2) - math.sin(phi1) * math.cos(phi2) * math.cos(
         dlambda
     )
-    brng = math.degrees(math.atan2(y, x))
-    return (brng + 360.0) % 360.0
+    b = math.degrees(math.atan2(x, y))
+    return (b + 360.0) % 360.0
 
 
 def _pick_main_segment(
     points: List[Dict[str, float]], max_jump_m: float = 2000.0
 ) -> List[Dict[str, float]]:
     """
-    Tiene solo il segmento continuo più lungo,
-    eliminando salti assurdi (> max_jump_m).
+    Dato un elenco di punti [{lat, lon, elev}, ...] prende il segmento continuo
+    più lungo, dove la distanza fra due punti consecutivi non supera max_jump_m.
+
+    Serve per eliminare salti assurdi (tipo Italia → Francia).
     """
     if len(points) < 2:
         return points
@@ -131,69 +154,71 @@ def _pick_main_segment(
             )
         return tot
 
-    return max(segments, key=seg_length)
+    best = max(segments, key=seg_length)
+    return best
 
 
-def _resample_by_distance(
-    points: List[Dict[str, float]], n_samples: int
+# ------------------------------------------------------------
+# NORMALIZZAZIONE INPUT
+# ------------------------------------------------------------
+PointSeq = Sequence[Dict[str, float]]
+GeoJSONFeature = Dict[str, Any]
+
+
+def _normalize_input(
+    data: Union[PointSeq, GeoJSONFeature]
 ) -> List[Dict[str, float]]:
     """
-    Resample della pista su distanza cumulativa (step costante).
+    Accetta:
+    - lista di dict con chiavi "lat", "lon" (e opz. "elev")
+    - Feature GeoJSON {"type": "Feature", "geometry": {"type": "LineString", ...}}
+    Restituisce lista di dict {"lat": float, "lon": float, "elev": float}.
     """
-    if len(points) <= n_samples:
+    points: List[Dict[str, float]] = []
+
+    # Caso GeoJSON Feature
+    if isinstance(data, dict) and data.get("type") == "Feature":
+        geom = data.get("geometry") or {}
+        if geom.get("type") == "LineString":
+            coords = geom.get("coordinates") or []
+            for c in coords:
+                try:
+                    lon = float(c[0])
+                    lat = float(c[1])
+                except Exception:
+                    continue
+                elev = float(c[2]) if len(c) > 2 else 0.0
+                points.append({"lat": lat, "lon": lon, "elev": elev})
         return points
 
-    dists = [0.0]
-    for i in range(1, len(points)):
-        p_prev = points[i - 1]
-        p = points[i]
-        dists.append(
-            dists[-1]
-            + _dist_m(
-                float(p_prev["lat"]),
-                float(p_prev["lon"]),
-                float(p["lat"]),
-                float(p["lon"]),
-            )
-        )
+    # Caso lista di punti "nostri"
+    for p in data:  # type: ignore[assignment]
+        try:
+            lat = float(p.get("lat"))  # type: ignore[arg-type]
+            lon = float(p.get("lon"))  # type: ignore[arg-type]
+            elev = float(p.get("elev", 0.0))  # type: ignore[arg-type]
+        except Exception:
+            continue
+        points.append({"lat": lat, "lon": lon, "elev": elev})
 
-    total = dists[-1]
-    if total <= 0:
-        return points
-
-    step = total / (n_samples - 1)
-    targets = [i * step for i in range(n_samples)]
-
-    resampled: List[Dict[str, float]] = []
-    j = 0
-    for t in targets:
-        while j < len(dists) - 2 and dists[j + 1] < t:
-            j += 1
-        d0, d1 = dists[j], dists[j + 1]
-        if d1 == d0:
-            alpha = 0.0
-        else:
-            alpha = (t - d0) / (d1 - d0)
-        p0, p1 = points[j], points[j + 1]
-        lat = float(p0["lat"]) + alpha * (float(p1["lat"]) - float(p0["lat"]))
-        lon = float(p0["lon"]) + alpha * (float(p1["lon"]) - float(p0["lon"]))
-        elev = float(p0.get("elev", 0.0)) + alpha * (
-            float(p1.get("elev", 0.0)) - float(p0.get("elev", 0.0))
-        )
-        resampled.append({"lat": lat, "lon": lon, "elev": elev})
-    return resampled
+    return points
 
 
-# ---------------------------------------------------------------------
-# MAPBOX STATIC FRAME
-# ---------------------------------------------------------------------
+# ------------------------------------------------------------
+# PATH OVERLAY PER MAPBOX (RIDOTTO!)
+# ------------------------------------------------------------
 def _build_path_overlay(points: List[Dict[str, float]]) -> str:
     """
-    Costruisce la stringa 'path-5+ff4422-1(lon,lat;lon,lat;...)'
-    downsamplando per non esagerare con la lunghezza dell'URL.
+    Per evitare URL troppo lunghi (errore 422),
+    limitiamo l’overlay a massimo 25 coordinate.
+
+    Formato:
+      path-5+ff4422-1(lon1,lat1;lon2,lat2;...)
     """
-    if len(points) > 80:
-        step = max(1, len(points) // 80)
+    max_pts = 25
+
+    if len(points) > max_pts:
+        step = max(1, len(points) // max_pts)
         pts = points[::step]
     else:
         pts = points
@@ -202,167 +227,173 @@ def _build_path_overlay(points: List[Dict[str, float]]) -> str:
     return f"path-5+ff4422-1({coords})"
 
 
-def _fetch_mapbox_frame(
+# ------------------------------------------------------------
+# RESAMPLING E TRAIETTORIA CAMERA (EFFETTO CINEMA)
+# ------------------------------------------------------------
+def _resample_along_path(
+    points: List[Dict[str, float]],
+    n_frames: int,
+) -> List[Tuple[float, float, float]]:
+    """
+    Restituisce per ogni frame: (lat, lon, bearing).
+    Usa un easing cosinusoidale per avere partenza/arrivo lenti
+    e velocità maggiore a metà pista (effetto più cinematografico).
+    """
+    if len(points) < 2:
+        p = points[0]
+        return [(p["lat"], p["lon"], 0.0)] * n_frames
+
+    # distanze cumulate
+    dists = [0.0]
+    for i in range(1, len(points)):
+        a = points[i - 1]
+        b = points[i]
+        d = _dist_m(a["lat"], a["lon"], b["lat"], b["lon"])
+        dists.append(dists[-1] + d)
+
+    total = dists[-1] or 1.0
+
+    # funzione easing: s(t) in [0,1]
+    def ease(t: float) -> float:
+        # smooth cos easing (slow start & end)
+        return 0.5 * (1 - math.cos(math.pi * t))
+
+    frames: List[Tuple[float, float, float]] = []
+
+    for i in range(n_frames):
+        t = i / max(n_frames - 1, 1)
+        s = ease(t)
+        target = s * total
+
+        # trova il segmento relativo
+        j = 1
+        while j < len(dists) and dists[j] < target:
+            j += 1
+        if j == len(dists):
+            j = len(dists) - 1
+
+        d2 = dists[j]
+        d1 = dists[j - 1] if j > 0 else d2
+        seg_len = max(d2 - d1, 1e-6)
+        alpha = (target - d1) / seg_len if seg_len > 0 else 0.0
+
+        p1 = points[j - 1]
+        p2 = points[j]
+
+        lat = p1["lat"] + alpha * (p2["lat"] - p1["lat"])
+        lon = p1["lon"] + alpha * (p2["lon"] - p1["lon"])
+
+        bearing = _bearing_deg(p1["lat"], p1["lon"], p2["lat"], p2["lon"])
+
+        frames.append((lat, lon, bearing))
+
+    return frames
+
+
+# ------------------------------------------------------------
+# DOWNLOAD FRAME DA MAPBOX
+# ------------------------------------------------------------
+def _fetch_frame(
     token: str,
     path_overlay: str,
-    center_lat: float,
-    center_lon: float,
+    lat: float,
+    lon: float,
     bearing: float,
-    zoom: float = 17.5,  # più vicino → ~20 m di altezza
-    pitch: float = 75.0,  # più “3D”
-    size: str = "800x450",
+    width: int,
+    height: int,
+    zoom: float,
+    pitch: float,
 ) -> Image.Image:
     """
-    Scarica un frame dal Mapbox Static Images API (satellite, 3D-like).
+    Scarica un singolo frame dalla Mapbox Static API.
     """
-    style = "mapbox/satellite-v9"
-
-    overlay_encoded = quote(path_overlay, safe="():,;+-")
-    center = f"{center_lon},{center_lat},{zoom},{bearing},{pitch}"
+    # bearing con piccolo roll sinusoidale per "cinema"
+    bearing = bearing % 360.0
 
     url = (
-        f"https://api.mapbox.com/styles/v1/{style}/static/"
-        f"{overlay_encoded}/{center}/{size}"
+        "https://api.mapbox.com/styles/v1/mapbox/satellite-v9/static/"
+        f"{path_overlay}/"
+        f"{lon:.6f},{lat:.6f},{zoom:.2f},{bearing:.1f},{pitch:.1f}/"
+        f"{width}x{height}"
         f"?access_token={token}"
     )
 
-    resp = requests.get(url, headers=UA, timeout=15)
+    resp = requests.get(url, headers=UA, timeout=12)
     resp.raise_for_status()
-    img = Image.open(io.BytesIO(resp.content)).convert("RGB")
-    return img
+
+    return Image.open(io.BytesIO(resp.content)).convert("RGB")
 
 
-# ---------------------------------------------------------------------
-# WINTER FILTER
-# ---------------------------------------------------------------------
-def _apply_winter_filter(img: Image.Image) -> Image.Image:
+# ------------------------------------------------------------
+# FUNZIONE PRINCIPALE
+# ------------------------------------------------------------
+def generate_pov_video(
+    data: Union[PointSeq, GeoJSONFeature],
+    pista_name: str,
+    overwrite: bool = True,
+) -> str:
     """
-    Look "invernale" marcato:
-    - desaturazione più forte
-    - viraggio al blu
-    - velo bianco/azzurro più intenso
-    - leggero sollevamento delle ombre
+    Genera (o rigenera) una GIF POV 3D 12s per la pista.
+    Restituisce il path del file GIF sul disco.
     """
-    # meno saturazione
-    enhancer = ImageEnhance.Color(img)
-    img = enhancer.enhance(0.6)
-
-    # canale blu più forte, rosso leggermente abbassato
-    r, g, b = img.split()
-    r = ImageEnhance.Brightness(r).enhance(0.9)
-    b = ImageEnhance.Brightness(b).enhance(1.25)
-    img = Image.merge("RGB", (r, g, b))
-
-    # schiarisco leggermente l'immagine
-    bright = ImageEnhance.Brightness(img)
-    img = bright.enhance(1.05)
-
-    # overlay freddo
-    overlay = Image.new("RGBA", img.size, (220, 235, 255, 110))
-    img_rgba = img.convert("RGBA")
-    img_rgba = Image.alpha_composite(img_rgba, overlay)
-
-    return img_rgba.convert("RGB")
-
-
-# ---------------------------------------------------------------------
-# ENTRY POINT
-# ---------------------------------------------------------------------
-def generate_pov_video(points: List[Dict[str, Any]], pista_name: str) -> str:
-    """
-    Genera una GIF POV 3D (12 s) con Mapbox e ritorna il path del file GIF.
-    """
-    if not points or len(points) < 4:
-        raise ValueError("Traccia pista insufficiente per creare un POV video.")
-
     token = _get_mapbox_token()
     if not token:
-        raise RuntimeError("MAPBOX_API_KEY non configurata per il POV video.")
+        raise RuntimeError("MAPBOX_API_KEY non configurata (st.secrets o env).")
 
-    # 1) normalizza e pulisce i punti
-    clean_pts: List[Dict[str, float]] = []
-    for p in points:
-        try:
-            lat = float(p.get("lat"))
-            lon = float(p.get("lon"))
-            elev = float(p.get("elev", 0.0))
-        except Exception:
-            continue
-        clean_pts.append({"lat": lat, "lon": lon, "elev": elev})
+    # directory output
+    out_dir = Path("videos")
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-    if len(clean_pts) < 4:
-        raise ValueError("Traccia pista troppo corta dopo la pulizia.")
-
-    main_seg = _pick_main_segment(clean_pts, max_jump_m=2000.0)
-    if len(main_seg) < 4:
-        raise ValueError("Segmento principale pista troppo corto per POV video.")
-
-    # 2) resample per molti frame (12 s @ 30 fps ≈ 360 frame)
-    duration_s = 12
-    fps = 30
-    n_frames = duration_s * fps
-
-    frames_pts = _resample_by_distance(main_seg, n_frames)
-
-    # 3) path overlay per l'intera pista
-    path_overlay = _build_path_overlay(main_seg)
-
-    # 4) scarica frame con camera bassa e pitch alto
-    frames: List[np.ndarray] = []
-
-    zoom = 17.5  # più vicino alla pista
-    pitch = 75.0
-
-    for i in range(len(frames_pts)):
-        p = frames_pts[i]
-        lat = float(p["lat"])
-        lon = float(p["lon"])
-
-        if i < len(frames_pts) - 1:
-            p2 = frames_pts[i + 1]
-        else:
-            p2 = frames_pts[i - 1]
-        brg = _bearing_deg(lat, lon, float(p2["lat"]), float(p2["lon"]))
-
-        try:
-            img = _fetch_mapbox_frame(
-                token=token,
-                path_overlay=path_overlay,
-                center_lat=lat,
-                center_lon=lon,
-                bearing=brg,
-                zoom=zoom,
-                pitch=pitch,
-                size="800x450",
-            )
-            img = _apply_winter_filter(img)
-        except Exception:
-            # se un frame fallisce, duplico l'ultimo per non interrompere la GIF
-            if frames:
-                frames.append(frames[-1].copy())
-                continue
-            else:
-                raise
-
-        frames.append(np.array(img))
-
-    if not frames:
-        raise RuntimeError("Impossibile generare frame POV video.")
-
-    # 5) output path
     safe_name = "".join(
         c if c.isalnum() or c in "-_" else "_" for c in str(pista_name).lower()
     )
-    out_dir = Path("videos")
-    out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / f"{safe_name}_pov_12s.gif"
 
-    # 6) crea GIF animata fluida
-    imageio.mimsave(
-        out_path,
-        frames,
-        duration=1.0 / fps,
-        loop=0,
-    )
+    if out_path.exists() and not overwrite:
+        return str(out_path)
+
+    # normalizza e pulisci punti
+    raw_points = _normalize_input(data)
+    if not raw_points or len(raw_points) < 2:
+        raise ValueError("Pochi punti per generare il POV (minimo 2).")
+
+    cleaned = _pick_main_segment(raw_points, max_jump_m=2000.0)
+    if len(cleaned) < 4:
+        raise ValueError(
+            "Segmento pista troppo corto dopo pulizia; impossibile generare POV."
+        )
+
+    # overlay della pista (path ridotto per URL)
+    path_overlay = _build_path_overlay(cleaned)
+
+    # traiettoria camera con easing (effetto cinema)
+    cam_frames = _resample_along_path(cleaned, TOTAL_FRAMES)
+
+    imgs: List[Image.Image] = []
+
+    for idx, (lat, lon, bearing_base) in enumerate(cam_frames):
+        # piccolo roll sinusoidale ±ROLL_AMPLITUDE_DEG
+        phase = 2.0 * math.pi * idx / max(TOTAL_FRAMES - 1, 1)
+        roll = ROLL_AMPLITUDE_DEG * math.sin(phase)
+        bearing = (bearing_base + roll) % 360.0
+
+        img = _fetch_frame(
+            token=token,
+            path_overlay=path_overlay,
+            lat=lat,
+            lon=lon,
+            bearing=bearing,
+            width=FRAME_WIDTH,
+            height=FRAME_HEIGHT,
+            zoom=CAMERA_ZOOM,
+            pitch=CAMERA_PITCH,
+        )
+        imgs.append(img)
+
+    # converte in numpy array per imageio
+    frames_np = [np.asarray(im) for im in imgs]
+    frame_duration = TOTAL_SECONDS / max(len(frames_np), 1)  # secondi per frame
+
+    imageio.mimsave(str(out_path), frames_np, duration=frame_duration)
 
     return str(out_path)
