@@ -7,6 +7,7 @@ import os
 import sys
 from datetime import datetime, date as Date, time as dtime, timedelta
 from typing import Optional, Dict, Any
+from pathlib import Path
 
 import requests
 import pandas as pd
@@ -51,7 +52,7 @@ from core import wax_logic as wax_mod
 from core.pages.ski_selector import recommend_skis_for_day
 from core import pov as pov_mod
 from core import pov_3d as pov3d_mod
-from core import pov_video as pov_video_mod  # VIDEO POV
+from core import pov_video as pov_video_mod  # GIF POV
 
 import core.search as search_mod  # debug / uso interno
 
@@ -267,7 +268,7 @@ def center_ctx_on_race_location(ctx: Dict[str, Any], event: RaceEvent) -> Dict[s
 def render_pov_video_section(T: Dict[str, Any], ctx: Dict[str, Any], key_suffix: str) -> None:
     """
     Se ho una pista in ctx["pov_piste_points"], permette di generare
-    un video POV 12s in stile volo d'uccello usando core.pov_video.
+    una GIF POV 12s in stile volo d'uccello usando core.pov_video.
     """
     points = ctx.get("pov_piste_points") or []
     if not points:
@@ -305,25 +306,38 @@ def render_pov_video_section(T: Dict[str, Any], ctx: Dict[str, Any], key_suffix:
 
     st.markdown("#### 🎬 Video POV 3D (12 s)")
 
+    gif_path: Optional[str] = None
+
     if st.button("Genera / aggiorna video POV", key=f"btn_pov_video_{key_suffix}"):
-        with st.spinner("Genero il video POV della pista…"):
+        with st.spinner("Genero il POV invernale della pista…"):
             try:
-                video_path = pov_video_mod.generate_pov_video(feature, pista_name)
+                gif_path = pov_video_mod.generate_pov_video(feature, pista_name)
                 st.success("Video POV generato.")
-                st.video(video_path)
             except Exception as e:
                 st.error(f"Impossibile generare il video POV: {e}")
-    else:
-        # Se il video esiste già, lo mostro comunque (cache su disco)
-        try:
-            from pathlib import Path
+                gif_path = None
 
-            safe_name = "".join(
-                c if c.isalnum() or c in "-_" else "_" for c in str(pista_name).lower()
-            )
-            candidate = Path("videos") / f"{safe_name}_pov_12s.mp4"
-            if candidate.exists():
-                st.video(str(candidate))
+    # Se non ho appena generato, provo a caricare da cache su disco
+    if gif_path is None:
+        safe_name = "".join(
+            c if c.isalnum() or c in "-_" else "_" for c in str(pista_name).lower()
+        )
+        candidate = Path("videos") / f"{safe_name}_pov_12s.gif"
+        if candidate.exists():
+            gif_path = str(candidate)
+
+    # Mostra GIF (se disponibile) + bottone download
+    if gif_path is not None and os.path.exists(gif_path):
+        st.image(gif_path)
+        try:
+            with open(gif_path, "rb") as f:
+                st.download_button(
+                    "Scarica GIF POV",
+                    data=f,
+                    file_name=os.path.basename(gif_path),
+                    mime="image/gif",
+                    key=f"dl_pov_gif_{key_suffix}",
+                )
         except Exception:
             pass
 
@@ -412,7 +426,7 @@ if page == "Località & Mappa":
     st.markdown("## 3) Esposizione & pendenza")
     render_dem(T, ctx)
 
-    # ---------------- POV LOCALITÀ (2D + 3D + VIDEO) ----------------
+    # ---------------- POV LOCALITÀ (2D + 3D + GIF POV) ----------------
     st.markdown("### 🎥 POV pista (beta)")
     try:
         # 1) estraggo pista e attivo POV 2D
@@ -424,7 +438,7 @@ if page == "Località & Mappa":
     except Exception as e:
         st.info(f"POV non disponibile per questa località: {e}")
 
-    # 3) Video POV 3D (12 s)
+    # 3) GIF POV 3D (12 s)
     render_pov_video_section(T, ctx, key_suffix="local")
 
     # ---------------- METEO LOCALITÀ ----------------
@@ -966,7 +980,7 @@ else:
         except Exception as e:
             st.info(f"POV non disponibile per questa gara: {e}")
 
-        # Video POV gara (12 s)
+        # GIF POV gara (12 s)
         render_pov_video_section(T, ctx, key_suffix="race")
 
         # ---------- Tuning WC di base (preset statico) ----------
