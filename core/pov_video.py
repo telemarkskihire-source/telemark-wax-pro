@@ -5,11 +5,12 @@
 # - Usa i punti pista (lat, lon, elev) per calcolare la pendenza locale.
 # - Modula il pitch della camera in base alla pendenza per dare l'idea
 #   di muro / traverso / falsopiano.
-# - Aggiunge un piccolo HUD con la pendenza istantanea in alto a sinistra.
+# - Smoothing su bearing e pendenza per un movimento più fluido.
+# - Camera più bassa e “in avanti” per effetto quasi prima persona.
 #
 # Output:
-#   videos/<nome_pista>_pov_12s.mp4  (principale)
-#   videos/<nome_pista>_pov_12s.gif  (opzionale / share)
+#   videos/<nome_pista>_pov_12s.mp4  (principale per st.video)
+#   videos/<nome_pista>_pov_12s.gif  (share opzionale)
 #
 # Uso:
 #   from core import pov_video as pov_video_mod
@@ -39,20 +40,23 @@ UA = {"User-Agent": "telemark-wax-pro/2.0"}
 
 # Durata target del POV
 TOTAL_SECONDS = 12.0
-# Numero frame (più alto = più fluido)
-TOTAL_FRAMES = 120  # ~10 fps
+# Più frame = più fluido (qui ~20 fps)
+TOTAL_FRAMES = 240
 
 # Dimensioni frame
 FRAME_WIDTH = 800
 FRAME_HEIGHT = 450
 
-# Camera: zoom fisso abbastanza vicino al terreno
-CAMERA_ZOOM = 16.0          # vicino al suolo
-PITCH_MIN = 28.0            # falsopiano
-PITCH_MAX = 62.0            # muro ripido
+# Camera: più vicina al terreno, pitch sempre alto (quasi first person)
+CAMERA_ZOOM = 17.4          # più alto = più vicino al suolo
+PITCH_MIN = 38.0            # falsopiano
+PITCH_MAX = 60.0            # muro ripido (max consentito dalla Static API)
 
 # Piccola oscillazione cinematografica sul bearing
-ROLL_AMPLITUDE_DEG = 3.0
+ROLL_AMPLITUDE_DEG = 2.0
+
+# Smoothing
+SMOOTH_WINDOW = 7           # numero di frame per la media mobile
 
 
 # ------------------------------------------------------------
@@ -304,6 +308,43 @@ def _resample_along_path(
 
 
 # ------------------------------------------------------------
+# SMOOTHING (PER FLUIDITÀ)
+# ------------------------------------------------------------
+def _smooth(values: List[float], window: int) -> List[float]:
+    if window <= 1 or len(values) <= 2:
+        return values[:]
+
+    k = window // 2
+    padded = [values[0]] * k + values + [values[-1]] * k
+    smoothed: List[float] = []
+
+    for i in range(k, k + len(values)):
+        window_vals = padded[i - k : i + k + 1]
+        smoothed.append(sum(window_vals) / len(window_vals))
+
+    return smoothed
+
+
+def _smooth_angles_deg(angles: List[float], window: int) -> List[float]:
+    if window <= 1 or len(angles) <= 2:
+        return angles[:]
+
+    # converto in vettori unitari su cerchio
+    rad = [math.radians(a) for a in angles]
+    xs = [math.cos(r) for r in rad]
+    ys = [math.sin(r) for r in rad]
+
+    xs_s = _smooth(xs, window)
+    ys_s = _smooth(ys, window)
+
+    out: List[float] = []
+    for x, y in zip(xs_s, ys_s):
+        ang = math.degrees(math.atan2(y, x))
+        out.append((ang + 360.0) % 360.0)
+    return out
+
+
+# ------------------------------------------------------------
 # DOWNLOAD FRAME DA MAPBOX
 # ------------------------------------------------------------
 def _fetch_frame(
@@ -386,9 +427,20 @@ def generate_pov_video(
     # traiettoria camera con pendenze
     cam_frames = _resample_along_path(cleaned, TOTAL_FRAMES)
 
+    # smoothing su bearing e pendenza per fluidità
+    lats = [c[0] for c in cam_frames]
+    lons = [c[1] for c in cam_frames]
+    bearings = [c[2] for c in cam_frames]
+    slopes = [c[3] for c in cam_frames]
+
+    bearings_s = _smooth_angles_deg(bearings, SMOOTH_WINDOW)
+    slopes_s = _smooth(slopes, SMOOTH_WINDOW)
+
     imgs: List[Image.Image] = []
 
-    for idx, (lat, lon, bearing_base, slope_deg) in enumerate(cam_frames):
+    for idx, (lat, lon, bearing_base, slope_deg) in enumerate(
+        zip(lats, lons, bearings_s, slopes_s)
+    ):
         # pitch in base alla pendenza (0–40° -> PITCH_MIN–PITCH_MAX)
         slope_clamped = max(0.0, min(slope_deg, 40.0))
         t_pitch = slope_clamped / 40.0
