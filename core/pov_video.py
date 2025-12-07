@@ -3,13 +3,13 @@
 #
 # - Input: lista di punti pista [{lat, lon, elev}, ...]
 # - Pulizia salti folli, scelta segmento principale
-# - Resample in ~180 frame (12 s a 15 fps)
+# - Resample in ~360 frame (12 s a 30 fps)
 # - Per ogni frame:
-#     * chiama Mapbox Static API (satellite, pitch alto, zoom "basso")
+#     * chiama Mapbox Static API (satellite, pitch alto, zoom molto ravvicinato)
 #     * centra la camera sul punto corrente
 #     * bearing allineato alla direzione della pista
 #     * path rosso della pista intera
-#     * applica filtro "inverno"
+#     * applica filtro "invernale" marcato
 # - Output: GIF in videos/<safe_name>_pov_12s.gif
 
 from __future__ import annotations
@@ -83,7 +83,9 @@ def _bearing_deg(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     return (brng + 360.0) % 360.0
 
 
-def _pick_main_segment(points: List[Dict[str, float]], max_jump_m: float = 2000.0) -> List[Dict[str, float]]:
+def _pick_main_segment(
+    points: List[Dict[str, float]], max_jump_m: float = 2000.0
+) -> List[Dict[str, float]]:
     """
     Tiene solo il segmento continuo più lungo,
     eliminando salti assurdi (> max_jump_m).
@@ -132,7 +134,9 @@ def _pick_main_segment(points: List[Dict[str, float]], max_jump_m: float = 2000.
     return max(segments, key=seg_length)
 
 
-def _resample_by_distance(points: List[Dict[str, float]], n_samples: int) -> List[Dict[str, float]]:
+def _resample_by_distance(
+    points: List[Dict[str, float]], n_samples: int
+) -> List[Dict[str, float]]:
     """
     Resample della pista su distanza cumulativa (step costante).
     """
@@ -204,8 +208,8 @@ def _fetch_mapbox_frame(
     center_lat: float,
     center_lon: float,
     bearing: float,
-    zoom: float = 16.8,
-    pitch: float = 60.0,
+    zoom: float = 17.5,  # più vicino → ~20 m di altezza
+    pitch: float = 75.0,  # più “3D”
     size: str = "800x450",
 ) -> Image.Image:
     """
@@ -233,19 +237,28 @@ def _fetch_mapbox_frame(
 # ---------------------------------------------------------------------
 def _apply_winter_filter(img: Image.Image) -> Image.Image:
     """
-    Look "invernale":
-    - leggermente desaturato
-    - più freddo (canale blu)
-    - velo bianco semi-trasparente
+    Look "invernale" marcato:
+    - desaturazione più forte
+    - viraggio al blu
+    - velo bianco/azzurro più intenso
+    - leggero sollevamento delle ombre
     """
+    # meno saturazione
     enhancer = ImageEnhance.Color(img)
-    img = enhancer.enhance(0.85)
+    img = enhancer.enhance(0.6)
 
+    # canale blu più forte, rosso leggermente abbassato
     r, g, b = img.split()
-    b = ImageEnhance.Brightness(b).enhance(1.1)
+    r = ImageEnhance.Brightness(r).enhance(0.9)
+    b = ImageEnhance.Brightness(b).enhance(1.25)
     img = Image.merge("RGB", (r, g, b))
 
-    overlay = Image.new("RGBA", img.size, (230, 240, 255, 70))
+    # schiarisco leggermente l'immagine
+    bright = ImageEnhance.Brightness(img)
+    img = bright.enhance(1.05)
+
+    # overlay freddo
+    overlay = Image.new("RGBA", img.size, (220, 235, 255, 110))
     img_rgba = img.convert("RGBA")
     img_rgba = Image.alpha_composite(img_rgba, overlay)
 
@@ -284,9 +297,9 @@ def generate_pov_video(points: List[Dict[str, Any]], pista_name: str) -> str:
     if len(main_seg) < 4:
         raise ValueError("Segmento principale pista troppo corto per POV video.")
 
-    # 2) resample per più frame (12 s @ 15 fps ≈ 180 frame)
+    # 2) resample per molti frame (12 s @ 30 fps ≈ 360 frame)
     duration_s = 12
-    fps = 15
+    fps = 30
     n_frames = duration_s * fps
 
     frames_pts = _resample_by_distance(main_seg, n_frames)
@@ -297,8 +310,8 @@ def generate_pov_video(points: List[Dict[str, Any]], pista_name: str) -> str:
     # 4) scarica frame con camera bassa e pitch alto
     frames: List[np.ndarray] = []
 
-    zoom = 16.8  # ~20–30 m sopra il terreno
-    pitch = 60.0
+    zoom = 17.5  # più vicino alla pista
+    pitch = 75.0
 
     for i in range(len(frames_pts)):
         p = frames_pts[i]
@@ -324,6 +337,7 @@ def generate_pov_video(points: List[Dict[str, Any]], pista_name: str) -> str:
             )
             img = _apply_winter_filter(img)
         except Exception:
+            # se un frame fallisce, duplico l'ultimo per non interrompere la GIF
             if frames:
                 frames.append(frames[-1].copy())
                 continue
@@ -343,7 +357,7 @@ def generate_pov_video(points: List[Dict[str, Any]], pista_name: str) -> str:
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / f"{safe_name}_pov_12s.gif"
 
-    # 6) crea GIF animata
+    # 6) crea GIF animata fluida
     imageio.mimsave(
         out_path,
         frames,
