@@ -2,24 +2,17 @@
 # POV VIDEO 3D con Mapbox Static API -> MP4 + GIF
 #
 # - Usa Mapbox satellite 3D per geometria e orizzonte.
-# - Camera più bassa e inclinata in avanti: effetto quasi prima persona.
-# - Pendenza locale della pista -> pitch dinamico (si sente il muro).
-# - Smoothing su direzione e pendenza -> movimento molto più fluido.
-# - "Render" neve: la vegetazione / suolo vengono trasformati in bianco neve
-#   con una desaturazione generale, senza solo mettere un filtro freddo.
+# - Camera bassa e inclinata in avanti: effetto quasi prima persona.
+# - Pendenza locale della pista -> pitch dinamico (si “sente” il muro).
+# - Smoothing su direzione e pendenza -> movimento fluido.
+# - Effetto neve:
+#     * agisce soprattutto sulla vegetazione (zone verdi)
+#     * resto della scena solo leggermente desaturato
+#     * niente filtro che “sbianca tutto”.
 #
 # Output:
-#   videos/<nome_pista>_pov_12s.mp4   (per st.video)
-#   videos/<nome_pista>_pov_12s.gif   (per share / download)
-#
-# Uso:
-#   from core import pov_video as pov_video_mod
-#   path = pov_video_mod.generate_pov_video(points_or_feature, "Del Bosco")
-#
-# Dove "points_or_feature" è:
-#   - lista di dict [{"lat": float, "lon": float, "elev": float}, ...]
-#     oppure
-#   - Feature GeoJSON LineString {"type":"Feature", "geometry":{...}}
+#   videos/<nome_pista>_pov_12s.mp4
+#   videos/<nome_pista>_pov_12s.gif
 
 from __future__ import annotations
 
@@ -42,23 +35,23 @@ UA = {"User-Agent": "telemark-wax-pro/2.0"}
 
 # Durata target del POV
 TOTAL_SECONDS = 12.0
-# ~30 fps → video fluido
-TOTAL_FRAMES = 360
+# Più frame → più fluidità
+TOTAL_FRAMES = 480  # ~40 fps
 
 # Dimensioni frame
 FRAME_WIDTH = 800
 FRAME_HEIGHT = 450
 
-# Camera: più vicina al terreno, pitch moderato per vedere l’orizzonte
-CAMERA_ZOOM = 17.0          # più alto = più vicino al suolo
-PITCH_MIN = 32.0            # falsopiano / pianetto
-PITCH_MAX = 48.0            # muro ripido
+# Camera: più bassa e molto inclinata in avanti
+CAMERA_ZOOM = 17.0          # 17 = parecchio vicino al terreno
+PITCH_MIN = 45.0            # falsopiano / pianetto
+PITCH_MAX = 60.0            # muro ripido (max Mapbox)
 
 # Piccola oscillazione cinematografica sul bearing
 ROLL_AMPLITUDE_DEG = 3.0
 
 # Smoothing
-SMOOTH_WINDOW = 9           # numero di frame per la media mobile
+SMOOTH_WINDOW = 13          # numero di frame per la media mobile
 
 
 # ------------------------------------------------------------
@@ -379,50 +372,40 @@ def _fetch_frame(
 
 
 # ------------------------------------------------------------
-# RENDERIZZAZIONE NEVE (FILTER “INTELLIGENTE”)
+# RENDERIZZAZIONE NEVE
 # ------------------------------------------------------------
 def _apply_snow_render(img: Image.Image) -> Image.Image:
     """
-    Trasforma la scena in “invernale”:
-      - vegetazione / terra -> molto più bianco (neve)
-      - desaturazione leggera globale
-      - niente tinta blu pesante: il contrasto rimane buono.
+    Trasforma la scena in “invernale” privilegiando:
+      - vegetazione (zone verdi) -> più bianco (neve)
+      - edifici/rocce/strade: quasi originali, solo un pelo desaturati.
 
-    NB: tutte le maschere sono 2D (H,W) così l'indicizzazione booleana
-    su arr (H,W,3) funziona senza errori.
+    NB: tutte le maschere sono 2D (H,W) così non ci sono errori di shape.
     """
     arr = np.asarray(img).astype(np.float32) / 255.0  # (H, W, 3)
 
-    # canali singoli (2D)
     r = arr[..., 0]
     g = arr[..., 1]
     b = arr[..., 2]
 
-    # luminanza / "bright"
     bright = (r + g + b) / 3.0  # (H, W)
 
-    # vegetazione: verde dominante
-    veg = (g > r * 1.05) & (g > b * 1.05)
-
-    # zone chiare (prati, strade chiare, rocce illuminate)
-    bright_ground = bright > 0.35
-
-    # maschera neve 2D
-    snow_mask = veg | bright_ground  # (H, W) bool
+    # vegetazione: verde dominante, non troppo scuro
+    veg = (g > r * 1.15) & (g > b * 1.15) & (bright > 0.18)
 
     snow_arr = arr.copy()
     white = np.ones_like(arr)
 
-    # portiamo le zone neve verso il bianco, lasciando texture
-    snow_arr[snow_mask] = snow_arr[snow_mask] * 0.35 + white[snow_mask] * 0.65
+    # zone neve -> verso il bianco ma manteniamo un po' di texture
+    snow_arr[veg] = snow_arr[veg] * 0.45 + white[veg] * 0.55
 
-    # desaturazione leggera globale
-    gray = bright[..., None]          # (H, W, 1)
+    # desaturazione leggera globale per rendere l'ambiente più “freddo”
+    gray = bright[..., None]                # (H, W, 1)
     gray3 = np.repeat(gray, 3, axis=2)
-    snow_arr = snow_arr * 0.75 + gray3 * 0.25
+    snow_arr = snow_arr * 0.82 + gray3 * 0.18
 
-    # leggerissimo “cool tone” neutro
-    snow_arr[..., 2] = np.clip(snow_arr[..., 2] * 1.03, 0.0, 1.0)
+    # leggerissima dominante fredda
+    snow_arr[..., 2] = np.clip(snow_arr[..., 2] * 1.04, 0.0, 1.0)
 
     snow_arr = np.clip(snow_arr, 0.0, 1.0)
     out = (snow_arr * 255.0).astype("uint8")
@@ -439,8 +422,7 @@ def generate_pov_video(
 ) -> str:
     """
     Genera (o rigenera) un POV 3D 12s per la pista.
-    Crea sia MP4 che GIF, ma restituisce il path dell'MP4
-    (da passare a st.video).
+    Crea sia MP4 che GIF, ma restituisce il path dell'MP4.
 
     "data" può essere:
       - lista di punti {"lat", "lon", "elev"}
@@ -515,7 +497,7 @@ def generate_pov_video(
             height=FRAME_HEIGHT,
         )
 
-        # effetto neve "fisico"
+        # effetto neve
         img = _apply_snow_render(img)
 
         # HUD pendenza in alto a sinistra
