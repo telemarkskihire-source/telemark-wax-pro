@@ -42,17 +42,17 @@ UA = {"User-Agent": "telemark-wax-pro/2.0"}
 
 # Durata target del POV
 TOTAL_SECONDS = 12.0
-# Più frame = più fluido (qui ~30 fps → molto più smooth)
+# ~30 fps → video fluido
 TOTAL_FRAMES = 360
 
-# Dimensioni frame (compromesso qualità / velocità)
+# Dimensioni frame
 FRAME_WIDTH = 800
 FRAME_HEIGHT = 450
 
-# Camera: più vicina al terreno, pitch moderato per vedere bene l’orizzonte
+# Camera: più vicina al terreno, pitch moderato per vedere l’orizzonte
 CAMERA_ZOOM = 17.0          # più alto = più vicino al suolo
 PITCH_MIN = 32.0            # falsopiano / pianetto
-PITCH_MAX = 48.0            # muro ripido (max consentito Static API è 60, ma qui restiamo realistici)
+PITCH_MAX = 48.0            # muro ripido
 
 # Piccola oscillazione cinematografica sul bearing
 ROLL_AMPLITUDE_DEG = 3.0
@@ -387,15 +387,19 @@ def _apply_snow_render(img: Image.Image) -> Image.Image:
       - vegetazione / terra -> molto più bianco (neve)
       - desaturazione leggera globale
       - niente tinta blu pesante: il contrasto rimane buono.
+
+    NB: tutte le maschere sono 2D (H,W) così l'indicizzazione booleana
+    su arr (H,W,3) funziona senza errori.
     """
-    arr = np.asarray(img).astype(np.float32) / 255.0  # [0,1]
-    # canali
-    r = arr[..., 0:1]
-    g = arr[..., 1:2]
-    b = arr[..., 2:3]
+    arr = np.asarray(img).astype(np.float32) / 255.0  # (H, W, 3)
+
+    # canali singoli (2D)
+    r = arr[..., 0]
+    g = arr[..., 1]
+    b = arr[..., 2]
 
     # luminanza / "bright"
-    bright = (r + g + b) / 3.0  # shape (H,W,1)
+    bright = (r + g + b) / 3.0  # (H, W)
 
     # vegetazione: verde dominante
     veg = (g > r * 1.05) & (g > b * 1.05)
@@ -403,17 +407,19 @@ def _apply_snow_render(img: Image.Image) -> Image.Image:
     # zone chiare (prati, strade chiare, rocce illuminate)
     bright_ground = bright > 0.35
 
-    snow_mask = veg | bright_ground
+    # maschera neve 2D
+    snow_mask = veg | bright_ground  # (H, W) bool
 
     snow_arr = arr.copy()
     white = np.ones_like(arr)
 
-    # portiamo le zone neve verso il bianco, ma lasciando un po’ di texture
+    # portiamo le zone neve verso il bianco, lasciando texture
     snow_arr[snow_mask] = snow_arr[snow_mask] * 0.35 + white[snow_mask] * 0.65
 
     # desaturazione leggera globale
-    gray = bright.repeat(3, axis=2)
-    snow_arr = snow_arr * 0.75 + gray * 0.25
+    gray = bright[..., None]          # (H, W, 1)
+    gray3 = np.repeat(gray, 3, axis=2)
+    snow_arr = snow_arr * 0.75 + gray3 * 0.25
 
     # leggerissimo “cool tone” neutro
     snow_arr[..., 2] = np.clip(snow_arr[..., 2] * 1.03, 0.0, 1.0)
