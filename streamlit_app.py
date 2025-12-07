@@ -52,7 +52,7 @@ from core import wax_logic as wax_mod
 from core.pages.ski_selector import recommend_skis_for_day
 from core import pov as pov_mod
 from core import pov_3d as pov3d_mod
-from core import pov_video as pov_video_mod  # GIF POV
+from core import pov_video as pov_video_mod  # POV video / GIF
 
 import core.search as search_mod  # debug / uso interno
 
@@ -267,36 +267,21 @@ def center_ctx_on_race_location(ctx: Dict[str, Any], event: RaceEvent) -> Dict[s
 
 def render_pov_video_section(T: Dict[str, Any], ctx: Dict[str, Any], key_suffix: str) -> None:
     """
-    Se ho una pista in ctx["pov_piste_points"], permette di generare
-    una GIF POV 12s in stile volo d'uccello usando core.pov_video.
+    Video POV 3D (12 s) stile volo d'uccello.
+
+    Usa:
+      ctx["pov_piste_points"] = [
+        {"lat": float, "lon": float, "elev": float}, ...
+      ]
+
+    La funzione core.pov_video.generate_pov_video deve accettare
+    questa lista di punti e restituire il percorso del file generato
+    (.gif o .mp4).
     """
     points = ctx.get("pov_piste_points") or []
     if not points:
         st.info("Video POV non disponibile: nessuna pista estratta.")
         return
-
-    # Costruisco una Feature GeoJSON minimale a partire dai punti
-    coords = []
-    for p in points:
-        try:
-            lat = float(p.get("lat"))
-            lon = float(p.get("lon"))
-        except Exception:
-            continue
-        coords.append([lon, lat])  # GeoJSON vuole [lon, lat]
-
-    if len(coords) < 2:
-        st.info("Video POV non disponibile: traccia troppo corta.")
-        return
-
-    feature = {
-        "type": "Feature",
-        "geometry": {
-            "type": "LineString",
-            "coordinates": coords,
-        },
-        "properties": {},
-    }
 
     pista_name = (
         ctx.get("pov_piste_name")
@@ -306,37 +291,48 @@ def render_pov_video_section(T: Dict[str, Any], ctx: Dict[str, Any], key_suffix:
 
     st.markdown("#### 🎬 Video POV 3D (12 s)")
 
-    gif_path: Optional[str] = None
+    video_path: Optional[str] = None
 
     if st.button("Genera / aggiorna video POV", key=f"btn_pov_video_{key_suffix}"):
         with st.spinner("Genero il POV invernale della pista…"):
             try:
-                gif_path = pov_video_mod.generate_pov_video(feature, pista_name)
+                # generate_pov_video deve creare il file e restituire il path
+                video_path = pov_video_mod.generate_pov_video(points, pista_name)
                 st.success("Video POV generato.")
             except Exception as e:
                 st.error(f"Impossibile generare il video POV: {e}")
-                gif_path = None
+                video_path = None
 
     # Se non ho appena generato, provo a caricare da cache su disco
-    if gif_path is None:
+    if video_path is None:
         safe_name = "".join(
             c if c.isalnum() or c in "-_" else "_" for c in str(pista_name).lower()
         )
-        candidate = Path("videos") / f"{safe_name}_pov_12s.gif"
-        if candidate.exists():
-            gif_path = str(candidate)
+        # Provo entrambe le estensioni, gif e mp4
+        candidate_gif = Path("videos") / f"{safe_name}_pov_12s.gif"
+        candidate_mp4 = Path("videos") / f"{safe_name}_pov_12s.mp4"
+        if candidate_gif.exists():
+            video_path = str(candidate_gif)
+        elif candidate_mp4.exists():
+            video_path = str(candidate_mp4)
 
-    # Mostra GIF (se disponibile) + bottone download
-    if gif_path is not None and os.path.exists(gif_path):
-        st.image(gif_path)
+    # Mostra video / GIF se disponibile
+    if video_path is not None and os.path.exists(video_path):
+        if video_path.lower().endswith(".gif"):
+            st.image(video_path)
+        else:
+            st.video(video_path)
+
+        # bottone download
         try:
-            with open(gif_path, "rb") as f:
+            with open(video_path, "rb") as f:
+                mime = "image/gif" if video_path.lower().endswith(".gif") else "video/mp4"
                 st.download_button(
-                    "Scarica GIF POV",
+                    "Scarica POV",
                     data=f,
-                    file_name=os.path.basename(gif_path),
-                    mime="image/gif",
-                    key=f"dl_pov_gif_{key_suffix}",
+                    file_name=os.path.basename(video_path),
+                    mime=mime,
+                    key=f"dl_pov_{key_suffix}",
                 )
         except Exception:
             pass
@@ -426,7 +422,7 @@ if page == "Località & Mappa":
     st.markdown("## 3) Esposizione & pendenza")
     render_dem(T, ctx)
 
-    # ---------------- POV LOCALITÀ (2D + 3D + GIF POV) ----------------
+    # ---------------- POV LOCALITÀ (2D + 3D + POV VIDEO) ----------------
     st.markdown("### 🎥 POV pista (beta)")
     try:
         # 1) estraggo pista e attivo POV 2D
@@ -438,54 +434,8 @@ if page == "Località & Mappa":
     except Exception as e:
         st.info(f"POV non disponibile per questa località: {e}")
 
-    # 3) GIF POV 3D (12 s)
-    def render_pov_video_section(T: Dict[str, Any], ctx: Dict[str, Any], key_suffix: str) -> None:
-    """
-    Video POV 3D (12 s) stile volo d'uccello.
-
-    Usa:
-      ctx["pov_piste_points"] = [
-        {"lat": float, "lon": float, "elev": float}, ...
-      ]
-
-    Genera una GIF 12 s salvata in /videos e la mostra con st.image.
-    """
-    points = ctx.get("pov_piste_points") or []
-    if not points:
-        st.info("Video POV non disponibile: nessuna pista estratta.")
-        return
-
-    # nome pista
-    pista_name = (
-        ctx.get("pov_piste_name")
-        or ctx.get("selected_piste_name")
-        or T.get("selected_slope", "pista")
-    )
-
-    st.markdown("#### 🎬 Video POV 3D (12 s)")
-
-    if st.button("Genera / aggiorna video POV", key=f"btn_pov_video_{key_suffix}"):
-        with st.spinner("Genero il video POV della pista…"):
-            try:
-                video_path = pov_video_mod.generate_pov_video(points, pista_name)
-                st.success("Video POV generato.")
-                # GIF animata
-                st.image(video_path)
-            except Exception as e:
-                st.error(f"Impossibile generare il video POV: {e}")
-    else:
-        # se la GIF esiste già, la mostro comunque (cache su disco)
-        try:
-            from pathlib import Path
-
-            safe_name = "".join(
-                c if c.isalnum() or c in "-_" else "_" for c in str(pista_name).lower()
-            )
-            candidate = Path("videos") / f"{safe_name}_pov_12s.gif"
-            if candidate.exists():
-                st.image(str(candidate))
-        except Exception:
-            pass
+    # 3) Video/GIF POV 3D (12 s)
+    render_pov_video_section(T, ctx, key_suffix="local")
 
     # ---------------- METEO LOCALITÀ ----------------
     st.markdown("## 4) Meteo località & profilo giornata")
@@ -1026,7 +976,7 @@ else:
         except Exception as e:
             st.info(f"POV non disponibile per questa gara: {e}")
 
-        # GIF POV gara (12 s)
+        # Video/GIF POV gara (12 s)
         render_pov_video_section(T, ctx, key_suffix="race")
 
         # ---------- Tuning WC di base (preset statico) ----------
