@@ -28,7 +28,7 @@ import streamlit as st
 # Config POV
 # -----------------------------------------------------
 
-# limiti Static API: max 1280 px per lato
+# Limiti Static API: max 1280 px per lato
 WIDTH = 1280
 HEIGHT = 720
 
@@ -46,12 +46,14 @@ TERRAIN_TILESET = "mapbox.terrain-rgb"
 TERRAIN_ZOOM = 13
 SLOPE_WINDOW = 2  # punti prima/dopo per pendenza locale
 
-# camera
-PITCH_BASE_DEG = 60.0
-PITCH_SLOPE_GAIN = 0.4
-ZOOM_LEVEL = 16.3
+# Camera: più bassa e più “POV sciatore”
+PITCH_BASE_DEG = 72.0     # base già molto inclinata
+PITCH_SLOPE_GAIN = 0.9    # quanto la pendenza influisce sul pitch
+ZOOM_LEVEL = 17.2         # più vicino al terreno
+PITCH_MIN = 55.0          # non più alta di così
+PITCH_MAX = 85.0          # quasi prima persona
 
-# neve/filtro (disattivato)
+# neve/filtro (per ora disattivato)
 ENABLE_SNOW_FILTER = False
 
 
@@ -255,7 +257,7 @@ def _fetch_frame(
     pitch_deg: float,
     path_param: str,
 ) -> Image.Image:
-    pitch_clamped = max(0.0, min(60.0, pitch_deg))
+    pitch_clamped = max(PITCH_MIN, min(PITCH_MAX, pitch_deg))
 
     url = (
         f"https://api.mapbox.com/styles/v1/{STYLE_ID}/static/"
@@ -370,7 +372,7 @@ def generate_pov_video(
         pitch = PITCH_BASE_DEG + slope_here * PITCH_SLOPE_GAIN
         pitches.append(pitch)
 
-    # 4) path per overlay
+    # 4) Path per overlay
     path_param = _build_path_param(points)
 
     # 5) Scarichiamo SOLO n_unique frame da Mapbox
