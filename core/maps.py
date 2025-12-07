@@ -1,9 +1,9 @@
 # core/maps.py
-# Mappa & piste Telemark – versione FULL STABILE
-# - Snap dinamico
-# - Zoom iniziale vicino (15)
-# - Nessuna duplicazione nomi
-# - Sempre esporta pov_piste_points per POV 2D/3D
+# Mappa & piste Telemark – versione MIX (logica C)
+# - Nessuna pre-selezione “a freddo”
+# - Se cambi località (nuovo centro) seleziona la pista più vicina
+# - Mantiene la pista selezionata tra i refresh
+# - Esporta sempre pov_piste_points per POV 2D/3D
 
 from __future__ import annotations
 
@@ -16,7 +16,8 @@ import folium
 
 UA = {"User-Agent": "telemark-wax-pro/3.0"}
 
-BASE_SNAP = 300.0  # raggio snap quando sei vicino
+BASE_SNAP = 300.0  # raggio snap quando sei vicino (zoom alto)
+CENTER_MOVE_THRESHOLD_M = 500.0  # se il centro si sposta più di così → nuova località
 
 
 # ----------------------------------------------------------------------
@@ -36,10 +37,8 @@ def _dist_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     return R * c
 
 
-# ----------------------------------------------------------------------
-# Snap dinamico basato sullo zoom
-# ----------------------------------------------------------------------
 def _snap_radius(prev: Optional[Dict[str, Any]]) -> float:
+    """Snap dinamico basato sul livello di zoom della mappa Folium."""
     if not isinstance(prev, dict):
         return BASE_SNAP
     z = prev.get("zoom")
@@ -142,18 +141,43 @@ def _fetch_pistes(lat: float, lon: float, radius_km: float = 5.0):
 
 
 # ----------------------------------------------------------------------
+# Helper: pista più vicina a un punto
+# ----------------------------------------------------------------------
+def _nearest_piste_to_point(
+    polylines: List[List[Tuple[float, float]]],
+    names: List[Optional[str]],
+    lat: float,
+    lon: float,
+) -> Tuple[Optional[str], Optional[Tuple[float, float]]]:
+    best_nm: Optional[str] = None
+    best_pt: Optional[Tuple[float, float]] = None
+    best_d = float("inf")
+
+    for coords, nm in zip(polylines, names):
+        if not coords:
+            continue
+        for plat, plon in coords:
+            d = _dist_m(lat, lon, plat, plon)
+            if d < best_d:
+                best_d = d
+                best_nm = nm
+                best_pt = (plat, plon)
+
+    return best_nm, best_pt
+
+
+# ----------------------------------------------------------------------
 # RENDER MAPPA COMPLETA
 # ----------------------------------------------------------------------
 def render_map(T, ctx: Dict[str, Any]) -> Dict[str, Any]:
     map_id = str(ctx.get("map_context", "default"))
     map_key = f"map_{map_id}"
     sel_key = f"selected_piste_{map_id}"
-    init_key = f"map_initialized_{map_id}"
+    center_key = f"center_{map_id}"
 
     # Località base (centro piste)
     base_lat = float(ctx.get("base_lat", ctx.get("lat", 45.83333)))
     base_lon = float(ctx.get("base_lon", ctx.get("lon", 7.73333)))
-
     ctx["base_lat"] = base_lat
     ctx["base_lon"] = base_lon
 
@@ -161,13 +185,20 @@ def render_map(T, ctx: Dict[str, Any]) -> Dict[str, Any]:
     marker_lat = float(ctx.get("marker_lat", base_lat))
     marker_lon = float(ctx.get("marker_lon", base_lon))
 
-    # Primo load: nessuna pista selezionata.
-    initialized = bool(st.session_state.get(init_key, False))
-
-    if initialized:
-        selected = st.session_state.get(sel_key) or ctx.get("selected_piste_name") or None
-    else:
-        selected = None  # niente blob rosso al primo giro
+    # ---- movimento centro: usato per la logica C ----
+    prev_center = st.session_state.get(center_key)
+    center_changed = False
+    if isinstance(prev_center, dict):
+        try:
+            d_center = _dist_m(
+                base_lat,
+                base_lon,
+                float(prev_center.get("lat", base_lat)),
+                float(prev_center.get("lon", base_lon)),
+            )
+            center_changed = d_center > CENTER_MOVE_THRESHOLD_M
+        except Exception:
+            center_changed = False
 
     # Carica piste
     count, polylines, names = _fetch_pistes(base_lat, base_lon)
@@ -176,28 +207,49 @@ def render_map(T, ctx: Dict[str, Any]) -> Dict[str, Any]:
     named = [(c, n) for c, n in zip(polylines, names) if n]
     unique_names = sorted({n for _, n in named})
 
-    # Snap dinamico: usiamo lo stato FOLIUM salvato al giro precedente
+    # ---- selezione pista (logica C) ----
+    # 1) se esiste già in sessione → la manteniamo
+    selected: Optional[str] = st.session_state.get(sel_key)
+
+    # 2) se non c'è e il centro è cambiato parecchio (nuova località) → pista più vicina
+    if not selected and center_changed and polylines:
+        auto_nm, auto_pt = _nearest_piste_to_point(
+            polylines, names, base_lat, base_lon
+        )
+        if auto_nm and auto_pt:
+            selected = auto_nm
+            marker_lat, marker_lon = auto_pt
+
+    # 3) se ancora niente e ctx porta già un nome pista valido → usalo
+    if (
+        not selected
+        and isinstance(ctx.get("selected_piste_name"), str)
+        and ctx["selected_piste_name"] in unique_names
+    ):
+        selected = ctx["selected_piste_name"]
+
+    # Snap dinamico in base allo zoom
     prev = st.session_state.get(map_key)
     radius = _snap_radius(prev)
 
-    # Se c'è un click → snap
+    # Se c'è un click → snap sulla pista più vicina
     if isinstance(prev, dict) and polylines:
         click = prev.get("last_clicked")
         if click:
             c_lat = float(click["lat"])
             c_lon = float(click["lng"])
-            best_d = 1e12
-            best_nm = None
+            best_d = float("inf")
+            best_nm: Optional[str] = None
             best_lat = c_lat
             best_lon = c_lon
 
             for coords, nm in zip(polylines, names):
-                for lat, lon in coords:
-                    d = _dist_m(c_lat, c_lon, lat, lon)
+                for plat, plon in coords:
+                    d = _dist_m(c_lat, c_lon, plat, plon)
                     if d < best_d:
                         best_d = d
-                        best_lat = lat
-                        best_lon = lon
+                        best_lat = plat
+                        best_lon = plon
                         best_nm = nm
 
             if best_d <= radius:
@@ -205,7 +257,6 @@ def render_map(T, ctx: Dict[str, Any]) -> Dict[str, Any]:
                 marker_lon = best_lon
                 if best_nm:
                     selected = best_nm
-                    initialized = True
 
     # Zoom iniziale
     zoom = 15
@@ -264,10 +315,8 @@ def render_map(T, ctx: Dict[str, Any]) -> Dict[str, Any]:
         icon=folium.Icon(color="red", icon="flag"),
     ).add_to(m)
 
-    # Render mappa + salvataggio stato folium (per snap e zoom al giro dopo)
-    folium_state = st_folium(m, height=450, key=map_key)
-    st.session_state[map_key] = folium_state
-
+    # Render mappa
+    st_folium(m, height=450, key=map_key)
     st.caption(f"Piste trovate: {count} — Snap ≈ {int(radius)} m")
 
     # Selettore da lista piste
@@ -285,7 +334,6 @@ def render_map(T, ctx: Dict[str, Any]) -> Dict[str, Any]:
             )
         if chosen != selected:
             selected = chosen
-            initialized = True
             for coords, nm in named:
                 if nm == selected:
                     mid = coords[len(coords) // 2]
@@ -298,8 +346,9 @@ def render_map(T, ctx: Dict[str, Any]) -> Dict[str, Any]:
     ctx["lat"] = marker_lat
     ctx["lon"] = marker_lon
     ctx["selected_piste_name"] = selected
+
     st.session_state[sel_key] = selected
-    st.session_state[init_key] = initialized
+    st.session_state[center_key] = {"lat": base_lat, "lon": base_lon}
 
     st.markdown(f"**Pista selezionata:** {selected or 'Nessuna'}")
 
@@ -311,7 +360,8 @@ def render_map(T, ctx: Dict[str, Any]) -> Dict[str, Any]:
         for coords, nm in zip(polylines, names):
             if nm == selected:
                 pov_points = [
-                    {"lat": lat, "lon": lon, "elev": 0.0} for lat, lon in coords
+                    {"lat": plat, "lon": plon, "elev": 0.0}
+                    for plat, plon in coords
                 ]
                 break
 
