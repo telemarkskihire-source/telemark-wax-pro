@@ -2,7 +2,7 @@
 # Generatore POV 3D da traccia pista + Mapbox (Satellite + Terrain-RGB)
 #
 # - Input: GeoJSON LineString oppure lista di punti {lat, lon, [elev]}
-# - Output: MP4 1080p ~12s, 30 FPS, camera bassa (tipo sciatore)
+# - Output: MP4 ~12s, 30 FPS, camera bassa (tipo sciatore)
 # - Usa:
 #     · Static Images API per le immagini satellite prospettiche
 #     · Tiles Terrain-RGB per stimare la pendenza e dare più "fisicità" al POV
@@ -31,9 +31,10 @@ import streamlit as st
 # -----------------------------------------------------
 # Config generale POV
 # -----------------------------------------------------
+# ATTENZIONE: Mapbox Static Images API ha max 1280 px per lato.
+WIDTH = 1280
+HEIGHT = 720
 
-WIDTH = 1920          # 1080p
-HEIGHT = 1080
 DURATION_S = 12.0
 FPS = 30
 
@@ -44,11 +45,11 @@ LINE_OPACITY = 0.9
 
 # Terrain-RGB
 TERRAIN_TILESET = "mapbox.terrain-rgb"
-TERRAIN_ZOOM = 13  # zoom DEM (compromesso qualità/costi)
-SLOPE_WINDOW = 2   # numero di punti prima/dopo per stimare pendenza locale
+TERRAIN_ZOOM = 13   # zoom DEM (compromesso qualità/costi)
+SLOPE_WINDOW = 2    # numero di punti prima/dopo per stimare pendenza locale
 
 # camera
-PITCH_BASE_DEG = 60.0   # max pitch consentito dalla Static API (~60)
+PITCH_BASE_DEG = 60.0   # Static API regge ~60°
 PITCH_SLOPE_GAIN = 0.4  # quanto la pendenza influenza il pitch
 ZOOM_LEVEL = 16.3       # zoom "basso" (sensazione 20–30 m dal suolo)
 
@@ -59,7 +60,6 @@ ENABLE_SNOW_FILTER = False
 # -----------------------------------------------------
 # MAPBOX TOKEN
 # -----------------------------------------------------
-
 def _get_mapbox_token() -> str:
     """Legge la MAPBOX_API_KEY da st.secrets o ENV."""
     try:
@@ -80,7 +80,6 @@ def _get_mapbox_token() -> str:
 # -----------------------------------------------------
 # GEO & TERRAIN-RGB
 # -----------------------------------------------------
-
 def _haversine_m(a: Dict[str, float], b: Dict[str, float]) -> float:
     R = 6371000.0
     lat1 = math.radians(a["lat"])
@@ -122,7 +121,9 @@ def _latlon_to_tile(lat: float, lon: float, z: int) -> Tuple[int, int]:
     return x, y
 
 
-def _latlon_to_pixel(lat: float, lon: float, z: int, x_tile: int, y_tile: int) -> Tuple[int, int]:
+def _latlon_to_pixel(
+    lat: float, lon: float, z: int, x_tile: int, y_tile: int
+) -> Tuple[int, int]:
     """
     Converte lat/lon in coordinate pixel (0–255, 0–255) all'interno del tile.
     """
@@ -182,7 +183,6 @@ def _get_elevation_m(
     x_tile, y_tile = _latlon_to_tile(lat, lon, z)
     tile = _fetch_terrain_tile(token, z, x_tile, y_tile, cache)
     px, py = _latlon_to_pixel(lat, lon, z, x_tile, y_tile)
-    # clamp in [0,255]
     px = max(0, min(255, px))
     py = max(0, min(255, py))
     r, g, b = tile[py, px]
@@ -192,7 +192,6 @@ def _get_elevation_m(
 # -----------------------------------------------------
 # Normalizzazione traccia & resampling
 # -----------------------------------------------------
-
 def _as_points(track: Union[Dict[str, Any], Sequence[Dict[str, Any]]]) -> List[Dict[str, float]]:
     """
     Normalizza input a lista di dict con almeno lat/lon.
@@ -217,7 +216,10 @@ def _as_points(track: Union[Dict[str, Any], Sequence[Dict[str, Any]]]) -> List[D
     return pts
 
 
-def _resample_by_distance(points: List[Dict[str, float]], step_m: float = 20.0) -> List[Dict[str, float]]:
+def _resample_by_distance(
+    points: List[Dict[str, float]],
+    step_m: float = 20.0,
+) -> List[Dict[str, float]]:
     """
     Risampla la pista ogni ~step_m metri per avere movimento fluido e regolare.
     """
@@ -232,7 +234,6 @@ def _resample_by_distance(points: List[Dict[str, float]], step_m: float = 20.0) 
         b = points[i]
         d = _haversine_m(a, b)
         if d + acc >= step_m:
-            # inserisco punto interpolato
             need = step_m - acc
             frac = max(0.0, min(1.0, need / d)) if d > 0 else 0.0
             lat = a["lat"] + (b["lat"] - a["lat"]) * frac
@@ -251,14 +252,13 @@ def _resample_by_distance(points: List[Dict[str, float]], step_m: float = 20.0) 
 # -----------------------------------------------------
 # Path param per overlay (linea sottile, non blob rosso)
 # -----------------------------------------------------
-
 def _build_path_param(points: List[Dict[str, float]]) -> str:
     """
     Costruisce il parametro path-... per la Static API:
     path-<width>+<color>-<opacity>(lon,lat;lon,lat;...)
     """
-    # per non superare la lunghezza massima URL, limitiamo i punti
-    max_points = 120
+    # Limitiamo i punti per non superare la lunghezza massima URL
+    max_points = 80
     n = len(points)
     if n > max_points:
         step = max(1, n // max_points)
@@ -275,7 +275,6 @@ def _build_path_param(points: List[Dict[str, float]]) -> str:
 # -----------------------------------------------------
 # Frame singolo da Mapbox
 # -----------------------------------------------------
-
 def _fetch_frame(
     token: str,
     center: Dict[str, float],
@@ -325,7 +324,6 @@ def _apply_snow_filter(img: Image.Image) -> Image.Image:
 # -----------------------------------------------------
 # Profilo altimetrico & pendenze
 # -----------------------------------------------------
-
 def _build_elevation_profile(
     token: str,
     points: List[Dict[str, float]],
@@ -363,7 +361,6 @@ def _build_elevation_profile(
 # -----------------------------------------------------
 # Funzione principale usata da streamlit_app
 # -----------------------------------------------------
-
 def generate_pov_video(
     track: Union[Dict[str, Any], Sequence[Dict[str, Any]]],
     pista_name: str,
@@ -371,7 +368,7 @@ def generate_pov_video(
     fps: int = FPS,
 ) -> str:
     """
-    Genera un POV 3D ~duration_s secondi in MP4 1080p (30 FPS).
+    Genera un POV 3D ~duration_s secondi in MP4 1280x720 (30 FPS).
 
     track:
       - GeoJSON Feature LineString
@@ -431,7 +428,6 @@ def generate_pov_video(
 
     # 5) Generazione frame
     frames: List[np.ndarray] = []
-
     for center, brng, pitch in zip(centers, bearings, pitches):
         img = _fetch_frame(token, center, brng, pitch, path_param)
         img = _apply_snow_filter(img)
