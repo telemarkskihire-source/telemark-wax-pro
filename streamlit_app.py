@@ -364,6 +364,8 @@ if debug_mode:
             "lon": st.session_state.get("lon"),
             "place_label": st.session_state.get("place_label"),
             "race_selected_label": st.session_state.get("race_selected_label"),
+            "race_day_ctx": st.session_state.get("race_day_ctx"),
+            "meteo_pro_ctx": st.session_state.get("meteo_pro_ctx"),
         }
     )
 
@@ -778,8 +780,44 @@ if page == "Località & Mappa":
             )
             st.caption(dyn_loc.summary)
 
+        # ---------------- LINK A METEO PRO & RACE DAY PRO (LOCALITÀ) ----------------
+        st.markdown("## 7) 🔗 Dashboard avanzate per questa località")
+
+        col_pro1, col_pro2 = st.columns(2)
+        with col_pro1:
+            if st.button("🌡️ Apri Meteo PRO per questa località"):
+                st.session_state["meteo_pro_ctx"] = {
+                    "lat": float(ctx.get("lat", base_sel["lat"])),
+                    "lon": float(ctx.get("lon", base_sel["lon"])),
+                    "race_datetime": race_dt_free.isoformat(),
+                    "provider": "auto",
+                }
+                try:
+                    st.switch_page("core/pages/meteo_pro.py")
+                except Exception:
+                    st.success(
+                        "Contesto meteo salvato. Vai alla pagina **'Meteo PRO'** dalla sidebar."
+                    )
+
+        with col_pro2:
+            if st.button("🏁 Apri Race Day PRO (free ski)"):
+                st.session_state["race_day_ctx"] = {
+                    "lat": float(ctx.get("lat", base_sel["lat"])),
+                    "lon": float(ctx.get("lon", base_sel["lon"])),
+                    "race_datetime": race_dt_free.isoformat(),
+                    "discipline": disc_loc.name,
+                    "skier_level": chosen_dyn_level.name,
+                    "injected": bool(injected_loc),
+                }
+                try:
+                    st.switch_page("core/pages/race_day_pro.py")
+                except Exception:
+                    st.success(
+                        "Contesto gara salvato. Vai alla pagina **'Race Day PRO'** dalla sidebar."
+                    )
+
         # ---------------- SCIOLINE & TUNING DETTAGLIATO (LOCALITÀ) ----------------
-        st.markdown("## 7) ❄️ Scioline & tuning dettagliato (località)")
+        st.markdown("## 8) ❄️ Scioline & tuning dettagliato (località)")
         wax_mod.render_wax(T, ctx)
 
 # =====================================================
@@ -1203,3 +1241,44 @@ else:
                     f"- **Note edges**: {rec.notes}\n"
                 )
                 st.caption(dyn.summary)
+
+            # ---------- LINK A METEO PRO & RACE DAY PRO (GARA) ----------
+            st.markdown("### 🔗 Dashboard avanzate per questa gara")
+
+            col_pro_r1, col_pro_r2 = st.columns(2)
+            with col_pro_r1:
+                if st.button("🌡️ Apri Meteo PRO per questa gara"):
+                    st.session_state["meteo_pro_ctx"] = {
+                        "lat": float(ctx.get("lat", base_loc["lat"])),
+                        "lon": float(ctx.get("lon", base_loc["lon"])),
+                        "race_datetime": race_datetime.isoformat(),
+                        "provider": "auto",
+                    }
+                    try:
+                        st.switch_page("core/pages/meteo_pro.py")
+                    except Exception:
+                        st.success(
+                            "Contesto meteo salvato. Vai alla pagina **'Meteo PRO'** dalla sidebar."
+                        )
+
+            with col_pro_r2:
+                if st.button("🏁 Apri Race Day PRO per questa gara"):
+                    # disciplina: Enum -> name
+                    disc_name = selected_event.discipline.name if isinstance(
+                        selected_event.discipline, Discipline
+                    ) else str(selected_event.discipline or Discipline.GS.name)
+
+                    st.session_state["race_day_ctx"] = {
+                        "lat": float(ctx.get("lat", base_loc["lat"])),
+                        "lon": float(ctx.get("lon", base_loc["lon"])),
+                        "race_datetime": race_datetime.isoformat(),
+                        "discipline": disc_name,
+                        "skier_level": chosen_level.name,
+                        "injected": bool(injected_flag),
+                    }
+                    try:
+                        st.switch_page("core/pages/race_day_pro.py")
+                    except Exception:
+                        st.success(
+                            "Contesto gara salvato. Vai alla pagina **'Race Day PRO'** dalla sidebar."
+            )
