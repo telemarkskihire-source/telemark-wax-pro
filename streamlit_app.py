@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import os
 import sys
+import importlib
 from datetime import datetime, date as Date, time as dtime, timedelta
 from typing import Optional, Dict, Any
 from pathlib import Path
@@ -55,7 +56,6 @@ from core import pov_3d as pov3d_mod
 from core import pov_video as pov_video_mod  # POV video / GIF
 
 import core.search as search_mod  # debug / uso interno
-
 
 # ---------------------- THEME ----------------------
 PRIMARY = "#06b6d4"
@@ -331,6 +331,47 @@ def render_pov_video_section(T: Dict[str, Any], ctx: Dict[str, Any], key_suffix:
             pass
 
 
+# ---------------------- HELPER PAGINE PRO ----------------------
+def run_pro_page(module_name: str, T: Dict[str, Any], ctx: Optional[Dict[str, Any]] = None) -> None:
+    """
+    Carica una pagina PRO dal modulo core.pages.* e chiama:
+
+      render_page(T, ctx)  oppure
+      render_page(ctx)     oppure
+      render_page()
+
+    Se non trova nulla, mostra un messaggio di errore.
+    """
+    ctx = ctx or {}
+    try:
+        mod = importlib.import_module(module_name)
+    except Exception as e:
+        st.error(f"Impossibile caricare la pagina PRO '{module_name}': {e}")
+        return
+
+    render_fn = getattr(mod, "render_page", None) or getattr(mod, "render", None)
+    if render_fn is None:
+        st.error(
+            f"La pagina PRO '{module_name}' non espone una funzione "
+            "`render_page(...)` o `render(...)` da chiamare."
+        )
+        return
+
+    # Provo diverse firme in ordine di complessità
+    try:
+        return render_fn(T, ctx)
+    except TypeError:
+        try:
+            return render_fn(ctx)
+        except TypeError:
+            try:
+                return render_fn()
+            except TypeError as e:
+                st.error(
+                    f"Impossibile chiamare la funzione di render per '{module_name}': {e}"
+                )
+
+
 # ---------------------- SIDEBAR (lingua + debug) ----------------------
 st.sidebar.markdown("### ⚙️")
 
@@ -368,7 +409,14 @@ st.title("Telemark · Pro Wax & Tune")
 # Selezione macro-sezione in alto (non più in sidebar)
 page = st.radio(
     "Sezione",
-    ["Località & Mappa", "Racing / Calendari"],
+    [
+        "Località & Mappa",
+        "Racing / Calendari",
+        "Meteo PRO",
+        "Race Day PRO",
+        "Tuning PRO",
+        "Wax & Tuning PRO",
+    ],
     index=0,
     horizontal=True,
     key="main_page_selector",
@@ -378,9 +426,37 @@ ctx: Dict[str, Any] = {"lang": lang}
 today_utc = datetime.utcnow().date()
 
 # =====================================================
-# PAGINA 1: LOCALITÀ & MAPPA (+ TAB PRO)
+# PAGINE PRO (core/pages/*.py)
 # =====================================================
-if page == "Località & Mappa":
+if page == "Meteo PRO":
+    # usa il contesto salvato dalla dashboard base, se presente
+    pro_ctx = st.session_state.get("meteo_pro_ctx", {}) or {}
+    run_pro_page("core.pages.meteo_pro", T, pro_ctx)
+
+elif page == "Race Day PRO":
+    pro_ctx = st.session_state.get("race_day_ctx", {}) or {}
+    run_pro_page("core.pages.race_day_pro", T, pro_ctx)
+
+elif page == "Tuning PRO":
+    # per ora passiamo solo il livello/lingua dal contesto
+    pro_ctx = {
+        "dyn_level_tag": st.session_state.get("dyn_level_tag"),
+        "lang": lang,
+    }
+    run_pro_page("core.pages.tuning_pro", T, pro_ctx)
+
+elif page == "Wax & Tuning PRO":
+    # se la pagina PRO vuole, può leggere _meteo_res / ref_day da session_state
+    pro_ctx = {
+        "lang": lang,
+        "ref_day": st.session_state.get("ref_day"),
+    }
+    run_pro_page("core.pages.wax_tuning_pro", T, pro_ctx)
+
+# =====================================================
+# PAGINA 1: LOCALITÀ & MAPPA (+ TAB interni)
+# =====================================================
+elif page == "Località & Mappa":
     st.markdown("## 🌍 Località")
 
     # --- Selettore paese + località (resta in prima pagina) ---
@@ -800,9 +876,8 @@ if page == "Località & Mappa":
                         "race_datetime": race_dt_free.isoformat(),
                         "provider": "auto",
                     }
-                    # Per ora restiamo con il messaggio; a breve useremo una view dedicata
                     st.success(
-                        "Contesto meteo salvato. Apri la pagina 'Meteo PRO' (integrazione da completare)."
+                        "Contesto meteo salvato. Vai nella sezione 'Meteo PRO' in alto."
                     )
 
             with col_pro2:
@@ -816,12 +891,11 @@ if page == "Località & Mappa":
                         "injected": bool(injected_loc),
                     }
                     st.success(
-                        "Contesto gara salvato. Apri la pagina 'Race Day PRO' (integrazione da completare)."
+                        "Contesto gara salvato. Vai nella sezione 'Race Day PRO' in alto."
                     )
 
             st.caption(
-                "In questa sezione collegheremo Meteo PRO e Race Day PRO come dashboard complete "
-                "senza cambiare pagina Streamlit. Lo facciamo nei prossimi passi, quando riscriviamo i moduli."
+                "Le sezioni Meteo PRO / Race Day PRO leggono questo contesto dalla sessione."
             )
 
         # ---------- TAB SCIOLINE & TUNING DETTAGLIATO ----------
@@ -830,9 +904,9 @@ if page == "Località & Mappa":
             wax_mod.render_wax(T, ctx)
 
 # =====================================================
-# PAGINA 2: RACING / CALENDARI  (INVARIATA)
+# PAGINA 2: RACING / CALENDARI
 # =====================================================
-else:
+else:  # "Racing / Calendari"
     st.markdown("## 🏁 Racing / Calendari gare")
 
     base_loc = ensure_base_location()
@@ -1264,7 +1338,7 @@ else:
                         "provider": "auto",
                     }
                     st.success(
-                        "Contesto meteo salvato. Apri la pagina 'Meteo PRO' (integrazione da completare)."
+                        "Contesto meteo salvato. Vai nella sezione 'Meteo PRO' in alto."
                     )
 
             with col_pro_r2:
@@ -1284,5 +1358,5 @@ else:
                         "injected": bool(injected_flag),
                     }
                     st.success(
-                        "Contesto gara salvato. Apri la pagina 'Race Day PRO' (integrazione da completare)."
-                    )
+                        "Contesto gara salvato. Vai nella sezione 'Race Day PRO' in alto."
+            )
