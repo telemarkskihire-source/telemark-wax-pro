@@ -273,10 +273,6 @@ def render_pov_video_section(T: Dict[str, Any], ctx: Dict[str, Any], key_suffix:
       ctx["pov_piste_points"] = [
         {"lat": float, "lon": float, "elev": float}, ...
       ]
-
-    La funzione core.pov_video.generate_pov_video deve accettare
-    questa lista di punti e restituire il percorso del file generato
-    (.gif o .mp4).
     """
     points = ctx.get("pov_piste_points") or []
     if not points:
@@ -296,7 +292,6 @@ def render_pov_video_section(T: Dict[str, Any], ctx: Dict[str, Any], key_suffix:
     if st.button("Genera / aggiorna video POV", key=f"btn_pov_video_{key_suffix}"):
         with st.spinner("Genero il POV invernale della pista…"):
             try:
-                # generate_pov_video deve creare il file e restituire il path
                 video_path = pov_video_mod.generate_pov_video(points, pista_name)
                 st.success("Video POV generato.")
             except Exception as e:
@@ -308,7 +303,6 @@ def render_pov_video_section(T: Dict[str, Any], ctx: Dict[str, Any], key_suffix:
         safe_name = "".join(
             c if c.isalnum() or c in "-_" else "_" for c in str(pista_name).lower()
         )
-        # Provo entrambe le estensioni, gif e mp4
         candidate_gif = Path("videos") / f"{safe_name}_pov_12s.gif"
         candidate_mp4 = Path("videos") / f"{safe_name}_pov_12s.mp4"
         if candidate_gif.exists():
@@ -323,7 +317,6 @@ def render_pov_video_section(T: Dict[str, Any], ctx: Dict[str, Any], key_suffix:
         else:
             st.video(video_path)
 
-        # bottone download
         try:
             with open(video_path, "rb") as f:
                 mime = "image/gif" if video_path.lower().endswith(".gif") else "video/mp4"
@@ -372,7 +365,7 @@ if debug_mode:
 # ---------------------- MAIN -------------------------
 st.title("Telemark · Pro Wax & Tune")
 
-# Selezione pagina in alto (non più in sidebar)
+# Selezione macro-sezione in alto (non più in sidebar)
 page = st.radio(
     "Sezione",
     ["Località & Mappa", "Racing / Calendari"],
@@ -385,11 +378,12 @@ ctx: Dict[str, Any] = {"lang": lang}
 today_utc = datetime.utcnow().date()
 
 # =====================================================
-# PAGINA 1: LOCALITÀ & MAPPA
+# PAGINA 1: LOCALITÀ & MAPPA (+ TAB PRO)
 # =====================================================
 if page == "Località & Mappa":
     st.markdown("## 🌍 Località")
 
+    # --- Selettore paese + località (resta in prima pagina) ---
     iso2 = country_selectbox(T)
     location_searchbox(T, iso2)
 
@@ -423,21 +417,6 @@ if page == "Località & Mappa":
 
     st.markdown("## 3) Esposizione & pendenza")
     render_dem(T, ctx)
-
-    # ---------------- POV LOCALITÀ (2D + 3D + POV VIDEO) ----------------
-    st.markdown("### 🎥 POV pista (beta)")
-    try:
-        # 1) estraggo pista e attivo POV 2D
-        ctx = pov_mod.render_pov_extract(T, ctx) or ctx
-
-        # 2) se ho una pista, POV 3D integrato
-        if ctx.get("pov_piste_points"):
-            ctx = pov3d_mod.render_pov3d_view(T, ctx) or ctx
-    except Exception as e:
-        st.info(f"POV non disponibile per questa località: {e}")
-
-    # 3) Video/GIF POV 3D (12 s)
-    render_pov_video_section(T, ctx, key_suffix="local")
 
     # ---------------- METEO LOCALITÀ ----------------
     st.markdown("## 4) Meteo località & profilo giornata")
@@ -497,7 +476,7 @@ if page == "Località & Mappa":
         st.caption("Grafici riferiti all'intera giornata (00–24) per la località selezionata.")
         df_reset = df.reset_index()
 
-        # ---- prepara dati per modulo wax ----
+        # ---- prepara dati per modulo wax / altre pagine ----
         wax_df = df_reset.copy()
         wax_df["time_local"] = wax_df["time"]
         wax_df["T_surf"] = wax_df["snow_temp"]
@@ -523,6 +502,7 @@ if page == "Località & Mappa":
 
         wax_df["ptyp"] = wax_df.apply(_ptyp, axis=1)
 
+        # Salviamo il meteo in sessione per le altre "pagine"
         st.session_state["_meteo_res"] = wax_df[
             ["time_local", "T_surf", "RH", "wind", "liq_water_pct", "cloud", "ptyp"]
         ]
@@ -666,162 +646,191 @@ if page == "Località & Mappa":
             unsafe_allow_html=True,
         )
 
-        # ---------------- SCI IDEALE PER LA GIORNATA ----------------
-        st.markdown("## 5) Sci ideale per la giornata")
-
-        col_l, col_u = st.columns(2)
-        with col_l:
-            ski_level_label = st.selectbox(
-                "Livello sciatore (sci ideale)",
-                [
-                    ("Principiante", "beginner"),
-                    ("Intermedio", "intermediate"),
-                    ("Avanzato", "advanced"),
-                    ("Race / agonista", "race"),
-                ],
-                index=1,
-                format_func=lambda x: x[0],
-                key="ski_level_loc",
-            )
-        with col_u:
-            usage_pref = st.selectbox(
-                "Uso principale",
-                [
-                    "Pista allround",
-                    "SL / raggi stretti",
-                    "GS / raggi medi",
-                    "All-mountain",
-                    "Freeride",
-                    "Skialp / touring",
-                ],
-                index=0,
-                key="ski_usage_loc",
-            )
-
-        chosen_level_tag = ski_level_label[1]
-        skis = recommend_skis_for_day(
-            level_tag=chosen_level_tag,
-            usage_pref=usage_pref,
-            snow_label=snow_label,
-        )
-
-        if skis:
-            st.markdown("**Suggerimenti modelli (multi-marca):**")
-            for ski in skis:
-                st.markdown(
-                    f"<div class='card small'>"
-                    f"<b>{ski.brand} · {ski.model}</b><br>"
-                    f"Categoria: {ski.usage} · Focus neve: {ski.snow_focus}<br>"
-                    f"{ski.notes}"
-                    f"</div>",
-                    unsafe_allow_html=True,
-                )
-        else:
-            st.info("Nessun modello suggerito per questi filtri (lista interna vuota).")
-
-        # ---------------- TUNING DINAMICO LOCALITÀ ----------------
-        st.markdown("## 6) 🎯 Tuning dinamico (località)")
-
-        level_choice = st.selectbox(
-            "Livello sciatore per il tuning",
+        # =====================================================
+        #  TABS: POV / SCI IDEALE / TUNING / DASHBOARD / WAX
+        # =====================================================
+        tab_pov, tab_ski, tab_tuning, tab_dash, tab_wax = st.tabs(
             [
-                ("WC / Coppa del Mondo", TuneSkierLevel.WC),
-                ("FIS / Continental", TuneSkierLevel.FIS),
-                ("Esperto", TuneSkierLevel.EXPERT),
-                ("Turistico evoluto", TuneSkierLevel.TOURIST),
-            ],
-            format_func=lambda x: x[0],
-            key="dyn_level_loc",
-        )
-        chosen_dyn_level = level_choice[1]
-        st.session_state["dyn_level_tag"] = chosen_dyn_level.value
-
-        disc_loc = st.selectbox(
-            "Disciplina principale",
-            [d for d in Discipline],
-            index=1,  # GS
-            key="dyn_disc_loc",
+                "🎥 POV pista",
+                "🎿 Sci ideale",
+                "🎯 Tuning dinamico",
+                "📊 Dashboard avanzata",
+                "❄️ Scioline & tuning",
+            ]
         )
 
-        injected_loc = st.checkbox(
-            "Pista iniettata / ghiacciata",
-            value=False,
-            key="dyn_injected_loc",
-        )
+        # ---------- TAB POV ----------
+        with tab_pov:
+            st.markdown("### 🎥 POV pista (beta)")
+            try:
+                ctx["map_context"] = "local_pov"
+                ctx_pov = pov_mod.render_pov_extract(T, ctx) or ctx
+                if ctx_pov.get("pov_piste_points"):
+                    ctx_pov = pov3d_mod.render_pov3d_view(T, ctx_pov) or ctx_pov
+                render_pov_video_section(T, ctx_pov, key_suffix="local")
+            except Exception as e:
+                st.info(f"POV non disponibile per questa località: {e}")
 
-        dyn_loc = meteo_mod.build_dynamic_tuning_for_race(
-            profile=profile_local,
-            ctx=ctx,
-            discipline=disc_loc,
-            skier_level=chosen_dyn_level,
-            injected=injected_loc,
-        )
+        # ---------- TAB SCI IDEALE ----------
+        with tab_ski:
+            st.markdown("### 5) Sci ideale per la giornata")
 
-        if dyn_loc is None:
-            st.info("Non è stato possibile calcolare il tuning dinamico per questa località.")
-        else:
-            rec_loc = get_tuning_recommendation(dyn_loc.input_params)
-            side_angle = 90.0 - rec_loc.side_bevel_deg  # 87/88 ecc.
+            col_l, col_u = st.columns(2)
+            with col_l:
+                ski_level_label = st.selectbox(
+                    "Livello sciatore (sci ideale)",
+                    [
+                        ("Principiante", "beginner"),
+                        ("Intermedio", "intermediate"),
+                        ("Avanzato", "advanced"),
+                        ("Race / agonista", "race"),
+                    ],
+                    index=1,
+                    format_func=lambda x: x[0],
+                    key="ski_level_loc",
+                )
+            with col_u:
+                usage_pref = st.selectbox(
+                    "Uso principale",
+                    [
+                        "Pista allround",
+                        "SL / raggi stretti",
+                        "GS / raggi medi",
+                        "All-mountain",
+                        "Freeride",
+                        "Skialp / touring",
+                    ],
+                    index=0,
+                    key="ski_usage_loc",
+                )
 
-            c1t, c2t, c3t = st.columns(3)
-            c1t.metric("Angolo lamina (side)", f"{side_angle:.1f}°")
-            c2t.metric("Base bevel", f"{rec_loc.base_bevel_deg:.1f}°")
-            c3t.metric("Profilo", rec_loc.risk_level.capitalize())
-
-            st.markdown(
-                f"- **Neve stimata**: {dyn_loc.input_params.snow_temp_c:.1f} °C "
-                f"({dyn_loc.snow_type.value})\n"
-                f"- **Aria all'ora scelta**: {dyn_loc.input_params.air_temp_c:.1f} °C\n"
-                f"- **Struttura soletta suggerita**: {rec_loc.structure_pattern}\n"
-                f"- **Wax group suggerito**: {rec_loc.wax_group}\n"
-                f"- **VLT consigliata maschera/occhiale**: "
-                f"{dyn_loc.vlt_pct:.0f}% ({dyn_loc.vlt_label})\n"
-                f"- **Note edges**: {rec_loc.notes}\n"
+            chosen_level_tag = ski_level_label[1]
+            skis = recommend_skis_for_day(
+                level_tag=chosen_level_tag,
+                usage_pref=usage_pref,
+                snow_label=snow_label,
             )
-            st.caption(dyn_loc.summary)
 
-        # ---------------- LINK A METEO PRO & RACE DAY PRO (LOCALITÀ) ----------------
-        st.markdown("## 7) 🔗 Dashboard avanzate per questa località")
+            if skis:
+                st.markdown("**Suggerimenti modelli (multi-marca):**")
+                for ski in skis:
+                    st.markdown(
+                        f"<div class='card small'>"
+                        f"<b>{ski.brand} · {ski.model}</b><br>"
+                        f"Categoria: {ski.usage} · Focus neve: {ski.snow_focus}<br>"
+                        f"{ski.notes}"
+                        f"</div>",
+                        unsafe_allow_html=True,
+                    )
+            else:
+                st.info("Nessun modello suggerito per questi filtri (lista interna vuota).")
 
-        col_pro1, col_pro2 = st.columns(2)
-        with col_pro1:
-            if st.button("🌡️ Apri Meteo PRO per questa località"):
-                st.session_state["meteo_pro_ctx"] = {
-                    "lat": float(ctx.get("lat", base_sel["lat"])),
-                    "lon": float(ctx.get("lon", base_sel["lon"])),
-                    "race_datetime": race_dt_free.isoformat(),
-                    "provider": "auto",
-                }
-                try:
-                    st.switch_page("core/pages/meteo_pro.py")
-                except Exception:
+        # ---------- TAB TUNING DINAMICO ----------
+        with tab_tuning:
+            st.markdown("### 6) 🎯 Tuning dinamico (località)")
+
+            level_choice = st.selectbox(
+                "Livello sciatore per il tuning",
+                [
+                    ("WC / Coppa del Mondo", TuneSkierLevel.WC),
+                    ("FIS / Continental", TuneSkierLevel.FIS),
+                    ("Esperto", TuneSkierLevel.EXPERT),
+                    ("Turistico evoluto", TuneSkierLevel.TOURIST),
+                ],
+                format_func=lambda x: x[0],
+                key="dyn_level_loc",
+            )
+            chosen_dyn_level = level_choice[1]
+            st.session_state["dyn_level_tag"] = chosen_dyn_level.value
+
+            disc_loc = st.selectbox(
+                "Disciplina principale",
+                [d for d in Discipline],
+                index=1,  # GS
+                key="dyn_disc_loc",
+            )
+
+            injected_loc = st.checkbox(
+                "Pista iniettata / ghiacciata",
+                value=False,
+                key="dyn_injected_loc",
+            )
+
+            dyn_loc = meteo_mod.build_dynamic_tuning_for_race(
+                profile=profile_local,
+                ctx=ctx,
+                discipline=disc_loc,
+                skier_level=chosen_dyn_level,
+                injected=injected_loc,
+            )
+
+            if dyn_loc is None:
+                st.info("Non è stato possibile calcolare il tuning dinamico per questa località.")
+            else:
+                rec_loc = get_tuning_recommendation(dyn_loc.input_params)
+                side_angle = 90.0 - rec_loc.side_bevel_deg  # 87/88 ecc.
+
+                c1t, c2t, c3t = st.columns(3)
+                c1t.metric("Angolo lamina (side)", f"{side_angle:.1f}°")
+                c2t.metric("Base bevel", f"{rec_loc.base_bevel_deg:.1f}°")
+                c3t.metric("Profilo", rec_loc.risk_level.capitalize())
+
+                st.markdown(
+                    f"- **Neve stimata**: {dyn_loc.input_params.snow_temp_c:.1f} °C "
+                    f"({dyn_loc.snow_type.value})\n"
+                    f"- **Aria all'ora scelta**: {dyn_loc.input_params.air_temp_c:.1f} °C\n"
+                    f"- **Struttura soletta suggerita**: {rec_loc.structure_pattern}\n"
+                    f"- **Wax group suggerito**: {rec_loc.wax_group}\n"
+                    f"- **VLT consigliata maschera/occhiale**: "
+                    f"{dyn_loc.vlt_pct:.0f}% ({dyn_loc.vlt_label})\n"
+                    f"- **Note edges**: {rec_loc.notes}\n"
+                )
+                st.caption(dyn_loc.summary)
+
+        # ---------- TAB DASHBOARD AVANZATA ----------
+        with tab_dash:
+            st.markdown("### 7) 🔗 Dashboard avanzate per questa località")
+
+            col_pro1, col_pro2 = st.columns(2)
+            with col_pro1:
+                if st.button("🌡️ Apri Meteo PRO per questa località"):
+                    st.session_state["meteo_pro_ctx"] = {
+                        "lat": float(ctx.get("lat", base_sel["lat"])),
+                        "lon": float(ctx.get("lon", base_sel["lon"])),
+                        "race_datetime": race_dt_free.isoformat(),
+                        "provider": "auto",
+                    }
+                    # Per ora restiamo con il messaggio; a breve useremo una view dedicata
                     st.success(
-                        "Contesto meteo salvato. Vai alla pagina **'Meteo PRO'** dalla sidebar."
+                        "Contesto meteo salvato. Apri la pagina 'Meteo PRO' (integrazione da completare)."
                     )
 
-        with col_pro2:
-            if st.button("🏁 Apri Race Day PRO (free ski)"):
-                st.session_state["race_day_ctx"] = {
-                    "lat": float(ctx.get("lat", base_sel["lat"])),
-                    "lon": float(ctx.get("lon", base_sel["lon"])),
-                    "race_datetime": race_dt_free.isoformat(),
-                    "discipline": disc_loc.name,
-                    "skier_level": chosen_dyn_level.name,
-                    "injected": bool(injected_loc),
-                }
-                try:
-                    st.switch_page("core/pages/race_day_pro.py")
-                except Exception:
+            with col_pro2:
+                if st.button("🏁 Apri Race Day PRO (free ski)"):
+                    st.session_state["race_day_ctx"] = {
+                        "lat": float(ctx.get("lat", base_sel["lat"])),
+                        "lon": float(ctx.get("lon", base_sel["lon"])),
+                        "race_datetime": race_dt_free.isoformat(),
+                        "discipline": disc_loc.name,
+                        "skier_level": chosen_dyn_level.name,
+                        "injected": bool(injected_loc),
+                    }
                     st.success(
-                        "Contesto gara salvato. Vai alla pagina **'Race Day PRO'** dalla sidebar."
+                        "Contesto gara salvato. Apri la pagina 'Race Day PRO' (integrazione da completare)."
                     )
 
-        # ---------------- SCIOLINE & TUNING DETTAGLIATO (LOCALITÀ) ----------------
-        st.markdown("## 8) ❄️ Scioline & tuning dettagliato (località)")
-        wax_mod.render_wax(T, ctx)
+            st.caption(
+                "In questa sezione collegheremo Meteo PRO e Race Day PRO come dashboard complete "
+                "senza cambiare pagina Streamlit. Lo facciamo nei prossimi passi, quando riscriviamo i moduli."
+            )
+
+        # ---------- TAB SCIOLINE & TUNING DETTAGLIATO ----------
+        with tab_wax:
+            st.markdown("### 8) ❄️ Scioline & tuning dettagliato (località)")
+            wax_mod.render_wax(T, ctx)
 
 # =====================================================
-# PAGINA 2: RACING / CALENDARI
+# PAGINA 2: RACING / CALENDARI  (INVARIATA)
 # =====================================================
 else:
     st.markdown("## 🏁 Racing / Calendari gare")
@@ -1254,19 +1263,17 @@ else:
                         "race_datetime": race_datetime.isoformat(),
                         "provider": "auto",
                     }
-                    try:
-                        st.switch_page("core/pages/meteo_pro.py")
-                    except Exception:
-                        st.success(
-                            "Contesto meteo salvato. Vai alla pagina **'Meteo PRO'** dalla sidebar."
-                        )
+                    st.success(
+                        "Contesto meteo salvato. Apri la pagina 'Meteo PRO' (integrazione da completare)."
+                    )
 
             with col_pro_r2:
                 if st.button("🏁 Apri Race Day PRO per questa gara"):
-                    # disciplina: Enum -> name
-                    disc_name = selected_event.discipline.name if isinstance(
-                        selected_event.discipline, Discipline
-                    ) else str(selected_event.discipline or Discipline.GS.name)
+                    disc_name = (
+                        selected_event.discipline.name
+                        if isinstance(selected_event.discipline, Discipline)
+                        else str(selected_event.discipline or Discipline.GS.name)
+                    )
 
                     st.session_state["race_day_ctx"] = {
                         "lat": float(ctx.get("lat", base_loc["lat"])),
@@ -1276,9 +1283,6 @@ else:
                         "skier_level": chosen_level.name,
                         "injected": bool(injected_flag),
                     }
-                    try:
-                        st.switch_page("core/pages/race_day_pro.py")
-                    except Exception:
-                        st.success(
-                            "Contesto gara salvato. Vai alla pagina **'Race Day PRO'** dalla sidebar."
-            )
+                    st.success(
+                        "Contesto gara salvato. Apri la pagina 'Race Day PRO' (integrazione da completare)."
+                    )
